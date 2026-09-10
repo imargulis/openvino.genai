@@ -215,7 +215,9 @@ Sampled decoding retains each realized sparse proposal row and uses standard los
 
 DFlash v1 always uses its backbone without a selector, by design. For DFlash v2, omit
 `selector_model()` to use independent per-position backbone proposals.
-Backbone-only operation supports greedy decoding only.
+Backbone-only operation supports greedy and sampled decoding. The runtime records
+each draft distribution and uses rejection sampling to preserve the target sampling
+distribution.
 
 :::warning Runtime limits
 DFlash v1 and v2 use the Continuous Batching backend on CPU and GPU; NPU and
@@ -232,8 +234,7 @@ the Stateful backend are not supported.
   `SchedulerConfig.num_linear_attention_blocks` at `0` for automatic
   allocation, or explicitly provide enough rows for one committed state plus
   `num_assistant_tokens + 1` speculative checkpoint rows.
-- Selectorless operation is greedy-only. Sampled decoding requires the DFlash
-  v2 selector. Streaming is supported for greedy decoding only.
+- Streaming is supported for greedy decoding only.
 - VLM mode does not support visual-token pruning, `echo`, prompt logprobs, or
   Omni intermediate outputs.
 :::
