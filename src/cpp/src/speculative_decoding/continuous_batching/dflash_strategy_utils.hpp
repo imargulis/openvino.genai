@@ -165,21 +165,6 @@ inline std::vector<int64_t> build_placeholder_prompt_ids(size_t prompt_length, i
     return std::vector<int64_t>(prompt_length, placeholder_id);
 }
 
-inline size_t linear_attention_checkpoint_block_count(size_t num_assistant_tokens) {
-    OPENVINO_ASSERT(num_assistant_tokens <= std::numeric_limits<size_t>::max() - 2,
-                    "DFlash num_assistant_tokens is too large for linear attention checkpoint block count.");
-    return num_assistant_tokens + 2;
-}
-
-inline size_t adjusted_linear_attention_block_count(size_t current_block_count,
-                                                    size_t num_assistant_tokens,
-                                                    bool target_has_linear_attention) {
-    if (!target_has_linear_attention) {
-        return current_block_count;
-    }
-    return std::max(current_block_count, linear_attention_checkpoint_block_count(num_assistant_tokens));
-}
-
 inline ov::Tensor build_draft_input_ids(int64_t seed_token,
                                         int64_t mask_token_id,
                                         size_t candidate_count,
@@ -234,6 +219,27 @@ inline size_t validation_candidate_count(size_t draft_count, size_t generated_le
         return 0;
     }
     return std::min(draft_count, remaining - 1);
+}
+
+inline std::vector<size_t> greedy_selector_path(const ov::Tensor& edge_scores) {
+    OPENVINO_ASSERT(edge_scores && edge_scores.get_element_type() == ov::element::f32,
+                    "DFlash-2 selector edge_scores must be an FP32 tensor.");
+    const auto shape = edge_scores.get_shape();
+    OPENVINO_ASSERT(shape.size() == 4 && shape[0] == 1 && shape[2] > 0 && shape[2] == shape[3],
+                    "DFlash-2 selector edge_scores must have shape [1, S, K, K].");
+    const size_t sequence_length = shape[1];
+    const size_t top_k = shape[2];
+    const auto* data = edge_scores.data<const float>();
+
+    std::vector<size_t> path;
+    path.reserve(sequence_length);
+    size_t previous_index = 0;
+    for (size_t position = 0; position < sequence_length; ++position) {
+        const auto* row = data + (position * top_k + previous_index) * top_k;
+        previous_index = static_cast<size_t>(std::distance(row, std::max_element(row, row + top_k)));
+        path.push_back(previous_index);
+    }
+    return path;
 }
 
 struct ValidationAccounting {
