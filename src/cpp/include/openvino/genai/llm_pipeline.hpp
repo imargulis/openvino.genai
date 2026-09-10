@@ -390,6 +390,34 @@ inline std::pair<std::string, Any> draft_model(
     return draft_model(models_path, {}, ov::AnyMap{std::forward<Properties>(properties)...});
 }
 
+OPENVINO_GENAI_EXPORTS std::pair<std::string, Any> selector_model(
+    std::string& model_str,
+    ov::Tensor& weights_tensor,
+    const std::string& device = {},
+    const ov::AnyMap& properties = {});
+
+OPENVINO_GENAI_EXPORTS std::pair<std::string, Any> selector_model(
+    const std::filesystem::path& models_path,
+    const std::string& device = {},
+    const ov::AnyMap& properties = {});
+
+template <typename... Properties,
+          typename std::enable_if<ov::util::StringAny<Properties...>::value, bool>::type = true>
+inline std::pair<std::string, Any> selector_model(
+    const std::filesystem::path& models_path,
+    const std::string& device,
+    Properties&&... properties) {
+    return selector_model(models_path, device, ov::AnyMap{std::forward<Properties>(properties)...});
+}
+
+template <typename... Properties,
+          typename std::enable_if<ov::util::StringAny<Properties...>::value, bool>::type = true>
+inline std::pair<std::string, Any> selector_model(
+    const std::filesystem::path& models_path,
+    Properties&&... properties) {
+    return selector_model(models_path, {}, ov::AnyMap{std::forward<Properties>(properties)...});
+}
+
 /**
 * @brief scheduler_config property serves to activate continuous batching pipeline.
 * Create SchedulerConfig and fill it with suitable values. Copy or move it to plugin_config.

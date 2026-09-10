@@ -29,6 +29,16 @@
 #include "sampling/structured_output/structured_output_controller.hpp"
 
 namespace ov::genai {
+
+namespace detail {
+std::vector<float> materialize_sampling_probabilities(const Logits& logits, size_t vocab_size);
+float proposal_probability(const DraftProposal& proposal, int64_t token_id);
+bool accept_draft_token(float target_probability, float draft_probability, std::mt19937& rng_engine);
+Token sample_residual_distribution(const std::vector<float>& target_probabilities,
+                                   const DraftProposal& proposal,
+                                   std::mt19937& rng_engine);
+}  // namespace detail
+
 // Handle stop_token_ids
 inline bool is_stop_token_id_hit(int64_t generated_token, const std::set<int64_t> & stop_token_ids) {
     for (auto & stop_token_id : stop_token_ids) {
