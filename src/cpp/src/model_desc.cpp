@@ -22,5 +22,14 @@ ov::genai::ModelDesc extract_draft_model_from_config(ov::AnyMap& config) {
     }
     return draft_model;
 }
+
+ov::genai::ModelDesc extract_selector_model_from_config(ov::AnyMap& config) {
+    ov::genai::ModelDesc selector_model;
+    if (config.find(utils::SELECTOR_MODEL_ARG_NAME) != config.end()) {
+        selector_model = config.at(utils::SELECTOR_MODEL_ARG_NAME).as<ov::genai::ModelDesc>();
+        config.erase(utils::SELECTOR_MODEL_ARG_NAME);
+    }
+    return selector_model;
+}
 }  // namespace genai
 }  // namespace ov

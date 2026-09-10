@@ -14,6 +14,7 @@
 #include "openvino/op/assign.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
+#include "openvino/op/convert.hpp"
 #include "openvino/op/gather.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
@@ -22,6 +23,8 @@
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
+#include "openvino/op/tile.hpp"
+#include "openvino/op/topk.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/variable.hpp"
@@ -38,6 +41,7 @@ std::shared_ptr<ov::Model> make_annotated_stateful_sdpa_model() {
     input_ids->output(0).set_names({"input_ids"});
     auto embedding_weights =
         ov::op::v0::Constant::create(ov::element::f32, ov::Shape{16, 4}, std::vector<float>(16 * 4, 1.0f));
+    embedding_weights->set_friendly_name("model.embed_tokens.weight");
     auto embeddings =
         std::make_shared<ov::op::v8::Gather>(embedding_weights,
                                              input_ids,
@@ -128,6 +132,60 @@ std::shared_ptr<ov::Model> make_dflash_draft_hidden_states_model(const ov::Parti
     return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{hidden_states});
 }
 
+std::shared_ptr<ov::Model> make_dflash_selector_model() {
+    auto draft_logits =
+        std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, -1, 16});
+    draft_logits->output(0).set_names({"draft_logits"});
+    auto draft_hidden_states =
+        std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, -1, 4});
+    draft_hidden_states->output(0).set_names({"draft_hidden_states"});
+    auto anchor_token_ids =
+        std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{1});
+    anchor_token_ids->output(0).set_names({"anchor_token_ids"});
+
+    auto top_k = std::make_shared<ov::op::v11::TopK>(
+        draft_logits,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {2}),
+        -1,
+        ov::op::v11::TopK::Mode::MAX,
+        ov::op::v11::TopK::SortType::SORT_VALUES);
+    auto candidate_ids = std::make_shared<ov::op::v0::Convert>(top_k->output(1), ov::element::i64);
+    candidate_ids->output(0).set_names({"candidate_ids"});
+    auto unsqueeze = std::make_shared<ov::op::v0::Unsqueeze>(
+        top_k->output(0),
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {2}));
+    auto edge_scores = std::make_shared<ov::op::v0::Tile>(
+        unsqueeze,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {1, 1, 2, 1}));
+    auto edge_scores_result = std::make_shared<ov::op::v0::Result>(edge_scores);
+    edge_scores_result->output(0).set_names({"edge_scores"});
+    auto candidate_ids_result = std::make_shared<ov::op::v0::Result>(candidate_ids);
+    auto model = std::make_shared<ov::Model>(
+        ov::ResultVector{edge_scores_result, candidate_ids_result},
+        ov::ParameterVector{draft_logits, draft_hidden_states, anchor_token_ids});
+    model->set_rt_info(true, "dflash_selector_mode");
+    model->set_rt_info(std::string("2"), {"dflash_selector", "dflash_version"});
+    model->set_rt_info(std::string("topk_lattice_v1"), {"dflash_selector", "interface"});
+    model->set_rt_info(std::string("unary_inclusive"), {"dflash_selector", "score_semantics"});
+    model->set_rt_info(std::string("2"), {"dflash_selector", "top_k"});
+    model->set_rt_info(std::string("4"), {"dflash_selector", "hidden_size"});
+    model->set_rt_info(std::string("16"), {"dflash_selector", "vocab_size"});
+    return model;
+}
+
+std::shared_ptr<ov::Model> make_dflash_export_backbone_model() {
+    auto inputs_embeds =
+        std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, -1, 4});
+    inputs_embeds->output(0).set_names({"inputs_embeds"});
+    auto identity = std::make_shared<ov::op::v1::Add>(
+        inputs_embeds,
+        ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {0.0f}));
+    auto result = std::make_shared<ov::op::v0::Result>(identity);
+    result->set_friendly_name("last_hidden_state");
+    result->output(0).set_names({"last_hidden_state"});
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{inputs_embeds});
+}
+
 ov::Tensor make_token_major_hidden_delta(size_t seq_len, size_t hidden_size, float start = 0.0f) {
     ov::Tensor tensor(ov::element::f32, ov::Shape{seq_len, 1, hidden_size});
     std::iota(tensor.data<float>(), tensor.data<float>() + tensor.get_size(), start);
@@ -197,6 +255,10 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     model->set_rt_info(true, "dflash_mode");
     model->set_rt_info(std::string("151669"), {"dflash", "mask_token_id"});
     model->set_rt_info(std::string("1,12,23,34,45"), {"dflash", "target_layer_ids"});
+    model->set_rt_info(std::string("2"), {"dflash", "version"});
+    model->set_rt_info(std::string("1.25"), {"dflash", "input_embedding_scale"});
+    model->set_rt_info(std::string("0.75"), {"dflash", "output_multiplier"});
+    model->set_rt_info(std::string("8.0"), {"dflash", "final_logit_softcapping"});
 
     // Verify default legacy candidate_position_offset when omitted
     ov::AnyMap properties;
@@ -209,9 +271,13 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
 
     auto rt_info = ov::genai::utils::dflash::extract_dflash_info_from_config(properties);
     ASSERT_TRUE(rt_info.dflash_mode);
+    ASSERT_EQ(rt_info.dflash_version, 2);
     ASSERT_EQ(rt_info.mask_token_id, 151669);
     ASSERT_EQ(rt_info.target_layer_ids, (std::vector<int32_t>{1, 12, 23, 34, 45}));
     ASSERT_EQ(rt_info.candidate_position_offset, 1);
+    ASSERT_FLOAT_EQ(rt_info.input_embedding_scale, 1.25f);
+    ASSERT_FLOAT_EQ(rt_info.output_multiplier, 0.75f);
+    ASSERT_FLOAT_EQ(rt_info.final_logit_softcapping, 8.0f);
     ASSERT_TRUE(properties.empty());
 
     // Verify explicit candidate_position_offset
@@ -229,6 +295,97 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     properties["dflash_target_layer_ids"] = std::vector<int32_t>{1, 12, 23, 34, 45};
     properties["dflash_candidate_position_offset"] = size_t(2);
     EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(properties), ov::Exception);
+}
+
+TEST(DFlashModelTransforms, RejectsUnsupportedDraftVersion) {
+    ov::AnyMap properties;
+    properties["dflash_mode"] = true;
+    properties["dflash_version"] = int64_t{3};
+    properties["dflash_mask_token_id"] = int64_t{1};
+    properties["dflash_target_layer_ids"] = std::vector<int32_t>{0};
+
+    EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(properties), ov::Exception);
+}
+
+TEST(DFlashModelTransforms, AppliesExtractsAndValidatesSelectorRtInfo) {
+    auto model = make_dflash_selector_model();
+    ov::AnyMap properties;
+    ov::genai::utils::dflash::apply_dflash_selector_rt_info(model, properties);
+    auto info = ov::genai::utils::dflash::extract_dflash_selector_info_from_config(properties);
+
+    ASSERT_TRUE(info.selector_mode);
+    ASSERT_EQ(info.dflash_version, 2);
+    ASSERT_EQ(info.interface, "topk_lattice_v1");
+    ASSERT_EQ(info.score_semantics, "unary_inclusive");
+    ASSERT_EQ(info.top_k, 2);
+    ASSERT_EQ(info.hidden_size, 4);
+    ASSERT_EQ(info.vocab_size, 16);
+    ASSERT_TRUE(properties.empty());
+    EXPECT_NO_THROW(ov::genai::utils::dflash::validate_dflash_selector_model(model, info));
+}
+
+TEST(DFlashModelTransforms, RejectsSelectorWithInvalidScoreSemantics) {
+    auto model = make_dflash_selector_model();
+    ov::AnyMap properties;
+    ov::genai::utils::dflash::apply_dflash_selector_rt_info(model, properties);
+    auto info = ov::genai::utils::dflash::extract_dflash_selector_info_from_config(properties);
+    info.score_semantics = "correction_only";
+    EXPECT_THROW(ov::genai::utils::dflash::validate_dflash_selector_model(model, info), ov::Exception);
+}
+
+TEST(DFlashModelTransforms, RejectsStatefulSelector) {
+    auto model = make_annotated_stateful_sdpa_model();
+    ov::genai::utils::dflash::DFlashSelectorRTInfo info{
+        true,
+        2,
+        "topk_lattice_v1",
+        "unary_inclusive",
+        2,
+        4,
+        16,
+    };
+
+    EXPECT_THROW(ov::genai::utils::dflash::validate_dflash_selector_model(model, info), ov::Exception);
+}
+
+TEST(DFlashModelTransforms, KeepsDraftHiddenStateWhenGraftingSelectorLogits) {
+    auto target = make_annotated_stateful_sdpa_model();
+    auto draft = make_dflash_export_backbone_model();
+
+    ov::genai::utils::dflash::attach_target_lm_head_to_draft(target, draft, true);
+
+    ASSERT_EQ(count_outputs_with_name(draft, "last_hidden_state"), 1);
+    ASSERT_EQ(count_outputs_with_name(draft, "logits"), 1);
+}
+
+TEST(DFlashModelTransforms, AppliesDraftEmbeddingScale) {
+    auto target = make_annotated_stateful_sdpa_model();
+    auto draft = make_dflash_export_backbone_model();
+
+    ov::genai::utils::dflash::attach_target_embedding_to_draft(target, draft, 1.25f);
+
+    ASSERT_TRUE(ov::genai::utils::has_input(draft, "input_ids"));
+    ASSERT_FALSE(ov::genai::utils::has_input(draft, "inputs_embeds"));
+    const auto ordered_ops = draft->get_ordered_ops();
+    ASSERT_TRUE(std::any_of(ordered_ops.begin(),
+                            ordered_ops.end(),
+                            [](const std::shared_ptr<ov::Node>& node) {
+                                return node->get_friendly_name() == "dflash_draft_embedding_scale";
+                            }));
+}
+
+TEST(DFlashModelTransforms, AppliesExternalDraftEmbeddingScale) {
+    auto draft = make_dflash_export_backbone_model();
+
+    ov::genai::utils::dflash::scale_draft_inputs_embeds(draft, 1.25f);
+
+    ASSERT_TRUE(ov::genai::utils::has_input(draft, "inputs_embeds"));
+    const auto ordered_ops = draft->get_ordered_ops();
+    ASSERT_TRUE(std::any_of(ordered_ops.begin(),
+                            ordered_ops.end(),
+                            [](const std::shared_ptr<ov::Node>& node) {
+                                return node->get_friendly_name() == "dflash_draft_embedding_scale";
+                            }));
 }
 
 TEST(DFlashModelTransforms, FallsBackToEagle3LayerPatternWithoutAnnotations) {
@@ -515,32 +672,6 @@ TEST(DFlashCBGenerationConfig, RejectsUnsupportedVlmOptions) {
     }
 }
 
-TEST(DFlashCBLinearAttentionCheckpointing, ComputesRequiredBlockCount) {
-    ASSERT_EQ(ov::genai::dflash_cb::linear_attention_checkpoint_block_count(5), 7);
-    ASSERT_EQ(
-        ov::genai::dflash_cb::linear_attention_checkpoint_block_count(
-            ov::genai::dflash_cb::DEFAULT_NUM_ASSISTANT_TOKENS),
-        ov::genai::dflash_cb::DEFAULT_NUM_ASSISTANT_TOKENS + 2);
-}
-
-TEST(DFlashCBLinearAttentionCheckpointing, AdjustsBlockCountOnlyForLinearAttentionTargets) {
-    ASSERT_EQ(ov::genai::dflash_cb::adjusted_linear_attention_block_count(
-                  /*current_block_count=*/0,
-                  /*num_assistant_tokens=*/5,
-                  /*target_has_linear_attention=*/false),
-              0);
-    ASSERT_EQ(ov::genai::dflash_cb::adjusted_linear_attention_block_count(
-                  /*current_block_count=*/0,
-                  /*num_assistant_tokens=*/5,
-                  /*target_has_linear_attention=*/true),
-              7);
-    ASSERT_EQ(ov::genai::dflash_cb::adjusted_linear_attention_block_count(
-                  /*current_block_count=*/9,
-                  /*num_assistant_tokens=*/5,
-                  /*target_has_linear_attention=*/true),
-              9);
-}
-
 TEST(DFlashCBCandidatePlanning, KeepsDraftWindowStableUntilGenerationEnds) {
     ASSERT_EQ(ov::genai::dflash_cb::draft_candidate_count(3, 0, 10), 3);
     ASSERT_EQ(ov::genai::dflash_cb::draft_candidate_count(3, 8, 10), 3);
@@ -583,4 +714,18 @@ TEST(DFlashCBValidationAccounting, ComputesAcceptedAndRejected) {
     ASSERT_FALSE(no_target_extension.target_extended);
     ASSERT_EQ(no_target_extension.accepted, 0);
     ASSERT_EQ(no_target_extension.rejected, 0);
+}
+
+TEST(DFlash2Selector, WalksGreedyPathThroughPreviousCandidateRows) {
+    ov::Tensor edge_scores(ov::element::f32, ov::Shape{1, 2, 2, 2});
+    const std::vector<float> values = {
+        0.0f, 2.0f,
+        5.0f, 0.0f,
+        9.0f, 0.0f,
+        3.0f, 1.0f,
+    };
+    std::copy(values.begin(), values.end(), edge_scores.data<float>());
+
+    ASSERT_EQ(ov::genai::dflash_cb::greedy_selector_path(edge_scores),
+              (std::vector<size_t>{1, 0}));
 }

@@ -16,7 +16,9 @@ class ContinuousBatchingPipeline::DFlashDecodingImpl : public ContinuousBatching
 public:
     DFlashDecodingImpl(const ov::genai::ModelDesc& main_model_desc,
                        const ov::genai::ModelDesc& draft_model_desc,
-                       const ov::genai::utils::dflash::DFlashRTInfo& rt_info);
+                       const ov::genai::utils::dflash::DFlashRTInfo& rt_info,
+                       const ov::genai::ModelDesc& selector_model_desc = {},
+                       const ov::genai::utils::dflash::DFlashSelectorRTInfo& selector_rt_info = {});
 
     GenerationHandle add_request(uint64_t request_id,
                                  const ov::Tensor& input_ids,
@@ -28,7 +30,6 @@ public:
                                  const std::string& prompt,
                                  const ov::genai::GenerationConfig& sampling_params) override;
 
-    bool has_non_finished_requests() override;
     void step() override;
 
     std::vector<EncodedGenerationResult>
@@ -66,6 +67,7 @@ private:
 
     std::shared_ptr<DFlashCBDraftRunner> m_draft;
     ov::genai::utils::dflash::DFlashRTInfo m_rt_info;
+    bool m_selector_enabled = false;
     std::map<uint64_t, RequestState> m_request_states;
 };
 
