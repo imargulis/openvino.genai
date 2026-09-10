@@ -62,5 +62,7 @@ ov::genai::ModelDesc get_draft_model_from_config(const ov::AnyMap& config);
 
 ov::genai::ModelDesc extract_draft_model_from_config(ov::AnyMap& config);
 
+ov::genai::ModelDesc extract_selector_model_from_config(ov::AnyMap& config);
+
 }  // namespace genai
 }  // namespace ov

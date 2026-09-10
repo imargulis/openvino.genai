@@ -272,4 +272,14 @@ void init_llm_pipeline(py::module_& m) {
         },
         py::arg("models_path"), "folder with openvino_model.xml and openvino_tokenizer[detokenizer].xml files",
         py::arg("device") = "", "device on which inference will be performed");
+
+    m.def("selector_model", [](
+            const std::filesystem::path& models_path,
+            const std::string& device,
+            const py::kwargs& kwargs
+        ) {
+            return ov::genai::selector_model(models_path, device, pyutils::kwargs_to_any_map(kwargs)).second;
+        },
+        py::arg("models_path"), "folder with openvino_selector_model.xml or a selector IR path",
+        py::arg("device") = "", "device on which selector inference will be performed");
 }
