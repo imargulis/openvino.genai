@@ -13,11 +13,18 @@ namespace ov::genai {
 struct TreeMetaData;
 
 struct DraftProposal {
+    // An empty proposal denotes no probability distribution. A non-empty row
+    // is sparse when token_ids is populated, or dense when probabilities has
+    // one entry for every vocabulary token.
     std::vector<int64_t> token_ids;
     std::vector<float> probabilities;
 
     bool empty() const {
-        return token_ids.empty();
+        return probabilities.empty();
+    }
+
+    bool is_dense() const {
+        return token_ids.empty() && !probabilities.empty();
     }
 };
 
@@ -33,8 +40,7 @@ struct GeneratedSequence {
     // If not using eagle speculative decoding, this field may remain empty.
     ov::Tensor hidden_states;
     std::shared_ptr<const TreeMetaData> tree_metadata;
-    // Optional sparse proposal distributions aligned 1:1 with token_ids.
-    // Empty rows preserve the legacy scalar-log-probability behavior.
+    // Optional complete proposal distributions aligned 1:1 with token_ids.
     std::vector<DraftProposal> draft_proposals;
     GeneratedSequence(const std::vector<int64_t>& generated_token_ids,
                       const std::vector<float>& generated_log_probs,

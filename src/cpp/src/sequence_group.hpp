@@ -309,12 +309,21 @@ public:
         return (*m_draft_proposals)[idx];
     }
 
+    const std::vector<DraftProposal>& get_draft_proposals() const {
+        static const std::vector<DraftProposal> empty_proposals;
+        return m_draft_proposals ? *m_draft_proposals : empty_proposals;
+    }
+
     void clear_draft_proposal(size_t idx) {
         if (!m_draft_proposals) {
             return;
         }
         OPENVINO_ASSERT(idx < m_draft_proposals->size());
         (*m_draft_proposals)[idx] = {};
+    }
+
+    void clear_draft_proposals() {
+        m_draft_proposals.reset();
     }
 
     float get_beam_search_score(const ov::genai::GenerationConfig& sampling_params) const {

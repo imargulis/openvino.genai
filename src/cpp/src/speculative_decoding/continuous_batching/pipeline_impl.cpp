@@ -15,7 +15,8 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::Contin
     const SchedulerConfig& scheduler_config,
     const std::string& device,
     const ov::AnyMap& plugin_config,
-    bool is_validation_mode_enabled) {
+    bool is_validation_mode_enabled,
+    bool collect_draft_proposals) {
     m_tokenizer = tokenizer;
     m_generation_config = generation_config;
     if (m_generation_config.assistant_confidence_threshold == 0.f) {
@@ -24,6 +25,7 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::Contin
         }
     }
     m_is_validation_mode_enabled = is_validation_mode_enabled;
+    m_collect_draft_proposals = collect_draft_proposals;
     initialize_pipeline(model, scheduler_config, device, plugin_config);
 }
 
@@ -35,14 +37,16 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::Contin
     const SchedulerConfig& scheduler_config,
     const std::string& device,
     const ov::AnyMap& plugin_config,
-    bool is_validation_mode_enabled)
+    bool is_validation_mode_enabled,
+    bool collect_draft_proposals)
     : ContinuousBatchingForSpeculativeDecodingImpl(model,
                                                    tokenizer,
                                                    generation_config,
                                                    scheduler_config,
                                                    device,
                                                    plugin_config,
-                                                   is_validation_mode_enabled) {
+                                                   is_validation_mode_enabled,
+                                                   collect_draft_proposals) {
     m_inputs_embedder = inputs_embedder;
     // Note: set_inputs_embedder also sets the embedding model internally.
     m_model_runner->set_inputs_embedder(inputs_embedder);
@@ -106,7 +110,8 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::get_ge
                                         sequence->get_generated_log_probs(),
                                         num_processed_tokens,
                                         hidden_state ? hidden_state : ov::Tensor(ov::element::f32, ov::Shape{0, 1, 0}),
-                                        std::move(tree_metadata_snapshot)}}});
+                                        std::move(tree_metadata_snapshot),
+                                        sequence->get_draft_proposals()}}});
         }
     }
     return result;
@@ -527,6 +532,11 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
                     TreeMetaData merged = *candidate_sequence.tree_metadata;
                     merged.validated_indices = running_sequence->get_tree_metadata().validated_indices;
                     running_sequence->set_tree_metadata(std::move(merged));
+                }
+                if (is_update_logit_processor) {
+                    // Main-model synchronization commits every retained draft
+                    // token; proposal distributions are only needed until then.
+                    running_sequence->clear_draft_proposals();
                 }
             }
             // we should update a logit processor just for draft model to generate the same tokens

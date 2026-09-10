@@ -38,7 +38,8 @@ public:
                                                  const SchedulerConfig& scheduler_config,
                                                  const std::string& device,
                                                  const ov::AnyMap& plugin_config,
-                                                 bool is_validation_mode_enabled);
+                                                 bool is_validation_mode_enabled,
+                                                 bool collect_draft_proposals = false);
 
     ContinuousBatchingForSpeculativeDecodingImpl(const std::shared_ptr<ov::Model>& model,
                                                  std::shared_ptr<InputsEmbedder> inputs_embedder,
@@ -47,7 +48,8 @@ public:
                                                  const SchedulerConfig& scheduler_config,
                                                  const std::string& device,
                                                  const ov::AnyMap& plugin_config,
-                                                 bool is_validation_mode_enabled);
+                                                 bool is_validation_mode_enabled,
+                                                 bool collect_draft_proposals = false);
 
     void multistep();
 

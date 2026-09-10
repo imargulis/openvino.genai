@@ -193,19 +193,25 @@ public:
         return outputs;
     }
 
-    std::vector<DraftCandidateToken> sample_candidates(const ov::Tensor& logits, size_t candidate_count) {
-        std::vector<DraftCandidateToken> candidates;
-        candidates.reserve(candidate_count);
+    DFlashProposalResult sample_candidates(const ov::Tensor& logits, size_t candidate_count) {
+        DFlashProposalResult result;
+        result.candidates.reserve(candidate_count);
+        result.proposals.reserve(candidate_count);
         const auto shape = logits.get_shape();
         for (size_t idx = 0; idx < candidate_count; ++idx) {
             ov::Tensor one_position(logits,
                                     ov::Coordinate{0, idx, 0},
                                     ov::Coordinate{1, idx + 1, shape[2]});
-            auto sampled = sample_one_candidate(one_position);
-            candidates.insert(candidates.end(), sampled.begin(), sampled.end());
+            auto sampled = sample_one_candidate(apply_backbone_logit_transform(one_position));
+            result.candidates.insert(result.candidates.end(),
+                                     std::make_move_iterator(sampled.candidates.begin()),
+                                     std::make_move_iterator(sampled.candidates.end()));
+            result.proposals.insert(result.proposals.end(),
+                                    std::make_move_iterator(sampled.proposals.begin()),
+                                    std::make_move_iterator(sampled.proposals.end()));
         }
-        m_raw_perf_metrics.m_batch_sizes.emplace_back(candidates.size());
-        return candidates;
+        m_raw_perf_metrics.m_batch_sizes.emplace_back(result.candidates.size());
+        return result;
     }
 
     DFlashProposalResult select_candidates(const DFlashDraftOutputs& outputs,
@@ -349,7 +355,7 @@ private:
         // Sampler state is keyed by request_id; we reuse request_id=1, so clear per-request context.
         m_sampler.clear_request_info(1);
         m_sequence_group = std::make_shared<SequenceGroup>(1, prompt_ids, config);
-        m_selector_rng.seed(dflash_cb::selector_rng_seed(config.rng_seed));
+        m_selector_rng.seed(detail::proposal_rng_seed(config.rng_seed));
         m_sequence_group->update_processed_tokens_num(m_prompt_length);
         m_committed_context_length = 0;
         m_request.reset_state();
@@ -419,13 +425,32 @@ private:
         return dflash_cb::build_draft_attention_mask(m_committed_context_length, hidden_delta_length, candidate_count);
     }
 
-    std::vector<DraftCandidateToken> sample_one_candidate(const ov::Tensor& logits) {
+    ov::Tensor apply_backbone_logit_transform(const ov::Tensor& logits) const {
+        if (m_output_multiplier == 1.0f && m_final_logit_softcapping == 0.0f) {
+            return logits;
+        }
+        OPENVINO_ASSERT(logits.get_element_type() == ov::element::f32,
+                        "DFlash backbone sampling requires FP32 logits.");
+        ov::Tensor transformed_logits(logits.get_element_type(), logits.get_shape());
+        const auto* source = logits.data<const float>();
+        auto* destination = transformed_logits.data<float>();
+        for (size_t index = 0; index < logits.get_size(); ++index) {
+            float value = source[index] * m_output_multiplier;
+            if (m_final_logit_softcapping > 0.0f) {
+                value = std::tanh(value / m_final_logit_softcapping) * m_final_logit_softcapping;
+            }
+            destination[index] = value;
+        }
+        return transformed_logits;
+    }
+
+    DFlashProposalResult sample_one_candidate(const ov::Tensor& logits) {
         const auto sequence = (*m_sequence_group)[0];
         const size_t generated_before = sequence->get_generated_len();
         m_sequence_group->schedule_tokens(1);
         m_sequence_group->set_output_seq_len(1);
         m_sequence_group->set_num_validated_tokens(0);
-        m_sampler.sample({m_sequence_group}, logits, false);
+        m_sampler.sample({m_sequence_group}, logits, false, true);
         m_sequence_group->finish_iteration();
 
         const auto& generated = sequence->get_generated_ids();
@@ -434,12 +459,17 @@ private:
         }
         const auto& log_probs = sequence->get_generated_log_probs();
         OPENVINO_ASSERT(log_probs.size() >= generated.size(), "Generated token log-probs are out of sync.");
-        std::vector<DraftCandidateToken> candidates;
-        candidates.reserve(generated.size() - generated_before);
+        DFlashProposalResult result;
+        result.candidates.reserve(generated.size() - generated_before);
+        result.proposals.reserve(generated.size() - generated_before);
         for (size_t idx = generated_before; idx < generated.size(); ++idx) {
-            candidates.push_back({generated[idx], log_probs[idx]});
+            const auto& proposal = sequence->get_draft_proposal(idx);
+            OPENVINO_ASSERT(!proposal.empty(),
+                            "DFlash backbone sampler did not record a proposal distribution.");
+            result.candidates.push_back({generated[idx], log_probs[idx]});
+            result.proposals.push_back(proposal);
         }
-        return candidates;
+        return result;
     }
 
     uint64_t execute_inference() {
@@ -709,9 +739,8 @@ GenerationHandle ContinuousBatchingPipeline::DFlashDecodingImpl::add_request(
     std::optional<std::unordered_map<std::string, ov::Tensor>> lm_extra_inputs) {
     std::lock_guard<std::mutex> lock(m_draft_generations_mutex);
     const bool is_vlm_dflash = m_model_input_type == ModelInputType::EMBEDDINGS;
-    OPENVINO_ASSERT(sampling_params.is_greedy_decoding() ||
-                        (m_selector_enabled && sampling_params.is_multinomial()),
-                    "Sampled DFlash decoding requires the DFlash-2 selector.");
+    OPENVINO_ASSERT(sampling_params.is_greedy_decoding() || sampling_params.is_multinomial(),
+                    "DFlash supports greedy or multinomial sampling only.");
     OPENVINO_ASSERT(sampling_params.num_beams == 1, "DFlash CB/PA does not support beam search.");
     OPENVINO_ASSERT(sampling_params.num_return_sequences == 1, "DFlash CB/PA supports one sequence per request.");
     OPENVINO_ASSERT(!sampling_params.adapters.has_value(),
@@ -837,7 +866,9 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
             candidates = std::move(proposal_result.candidates);
             draft_proposals = std::move(proposal_result.proposals);
         } else {
-            candidates = m_draft->sample_candidates(draft_outputs.logits, validation_count);
+            auto proposal_result = m_draft->sample_candidates(draft_outputs.logits, validation_count);
+            candidates = std::move(proposal_result.candidates);
+            draft_proposals = std::move(proposal_result.proposals);
         }
 
         state.generated_before_draft = state.generated_tokens.size();
@@ -863,7 +894,7 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
                                      std::make_move_iterator(draft_proposals.begin()),
                                      std::make_move_iterator(draft_proposals.end()));
             OPENVINO_ASSERT(aligned_proposals.size() == candidate_tokens.size(),
-                            "DFlash-2 sparse proposal rows must align with candidate tokens.");
+                            "DFlash proposal rows must align with candidate tokens.");
         }
         OPENVINO_ASSERT(candidate_tokens.size() == candidate_log_probs.size(),
                         "DFlash draft candidate tokens and log-probs must stay aligned.");

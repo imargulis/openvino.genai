@@ -4,11 +4,9 @@
 #pragma once
 
 #include <algorithm>
-#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <numeric>
-#include <random>
 #include <vector>
 
 #include <openvino/core/except.hpp>
@@ -19,11 +17,6 @@
 namespace ov::genai::dflash_cb {
 
 inline constexpr size_t DEFAULT_NUM_ASSISTANT_TOKENS = 5;
-inline constexpr uint32_t SELECTOR_RNG_SEED_SALT = 0x9E3779B9U;
-
-inline std::mt19937::result_type selector_rng_seed(size_t generation_seed) {
-    return static_cast<std::mt19937::result_type>(generation_seed) ^ SELECTOR_RNG_SEED_SALT;
-}
 
 inline void copy_tensor_bytes(const ov::Tensor& src, ov::Tensor& dst) {
     OPENVINO_ASSERT(src.get_element_type() == dst.get_element_type(),
