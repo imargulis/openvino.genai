@@ -16,6 +16,7 @@
 #include "openvino/genai/generation_config.hpp"
 #include "generation_stream.hpp"
 #include "logger.hpp"
+#include "speculative_decoding/continuous_batching/update_request_structs.hpp"
 
 namespace ov::genai {
 enum class SequenceStatus {
@@ -58,6 +59,7 @@ class Sequence {
 
     TokenIds m_generated_ids;
     LogProbs m_generated_log_probs;
+    std::optional<std::vector<DraftProposal>> m_draft_proposals;
     uint64_t m_grouped_id;
     uint64_t m_id = _get_next_global_sequence_id();
     ov::Tensor m_hidden_state = ov::Tensor();
@@ -93,6 +95,7 @@ class Sequence {
     Sequence(const Sequence& seq, const uint64_t id) :
         m_generated_ids(seq.m_generated_ids),
         m_generated_log_probs(seq.m_generated_log_probs),
+        m_draft_proposals(seq.m_draft_proposals),
         m_grouped_id(id),
         m_hidden_state(seq.m_hidden_state),
         m_accumulate_hidden_states(seq.m_accumulate_hidden_states),
@@ -168,6 +171,9 @@ public:
         m_cumulative_log_prob += log_prob;
         m_generated_log_probs.push_back(log_prob);
         m_generated_ids.push_back(token_id);
+        if (m_draft_proposals) {
+            m_draft_proposals->emplace_back();
+        }
     }
 
     void update_hidden_state(const ov::Tensor& tensor) {
@@ -223,6 +229,9 @@ public:
             m_cumulative_log_prob -= m_generated_log_probs.back();
             m_generated_log_probs.pop_back();
             m_generated_ids.pop_back();
+            if (m_draft_proposals) {
+                m_draft_proposals->pop_back();
+            }
         }
         if (m_type == SequenceGroupType::EMBEDDINGS) {
             const size_t tokens_to_remove = static_cast<size_t>(n);
@@ -279,7 +288,33 @@ public:
 
     void update_generated_log_prob(size_t idx, float log_prob) {
         OPENVINO_ASSERT(idx < m_generated_log_probs.size());
+        m_cumulative_log_prob += log_prob - m_generated_log_probs[idx];
         m_generated_log_probs[idx] = log_prob;
+    }
+
+    void set_draft_proposal(size_t idx, DraftProposal proposal) {
+        if (!m_draft_proposals) {
+            m_draft_proposals.emplace(m_generated_ids.size());
+        }
+        OPENVINO_ASSERT(idx < m_draft_proposals->size());
+        (*m_draft_proposals)[idx] = std::move(proposal);
+    }
+
+    const DraftProposal& get_draft_proposal(size_t idx) const {
+        static const DraftProposal empty_proposal;
+        if (!m_draft_proposals) {
+            return empty_proposal;
+        }
+        OPENVINO_ASSERT(idx < m_draft_proposals->size());
+        return (*m_draft_proposals)[idx];
+    }
+
+    void clear_draft_proposal(size_t idx) {
+        if (!m_draft_proposals) {
+            return;
+        }
+        OPENVINO_ASSERT(idx < m_draft_proposals->size());
+        (*m_draft_proposals)[idx] = {};
     }
 
     float get_beam_search_score(const ov::genai::GenerationConfig& sampling_params) const {

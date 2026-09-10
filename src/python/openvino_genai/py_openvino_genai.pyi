@@ -6665,6 +6665,10 @@ def draft_model(models_path: os.PathLike | str | bytes, device: str = '', **kwar
     """
     device on which inference will be performed
     """
+def selector_model(models_path: os.PathLike | str | bytes, device: str = '', **kwargs) -> openvino._pyopenvino.OVAny:
+    """
+    Load a DFlash-2 selector model for speculative decoding.
+    """
 def get_version() -> str:
     """
     OpenVINO GenAI version

@@ -15,17 +15,19 @@ Tokens that the target would have produced anyway are accepted; the first diverg
 Because validation is parallel over the candidate length, each accepted draft token replaces a sequential decode step of the target model with (a fraction of) one batched step.
 When acceptance is high, this yields end-to-end speedups on memory-bandwidth-bound decoding without changing the model output distribution in theory (the standard verification scheme is statistically equivalent to sampling from the target).
 
-OpenVINO GenAI implements three drafting strategies. They differ only in *how candidates are produced* — the target-side validation step is shared.
+OpenVINO GenAI implements four drafting strategies. They differ only in *how candidates are produced* — the target-side validation step is shared.
 
 | Strategy | Drafter | Best For | Continuous Batching (CPU/GPU) | Stateful (NPU) |
 |---|---|---|---|---|
 | [Speculative Decoding (Fast Draft)](#speculative-decoding-fast-draft) | Smaller off-the-shelf LLM | General-purpose, robust speedup without retraining | ✓ | ✓ |
+| [DFlash v1 and v2](#dflash-v1-and-v2) | Parallel block drafter; v2 adds an optional candidate selector | Low-latency parallel drafting for supported target checkpoints | ✓ | ✗ |
 | [Prompt Lookup Decoding](#prompt-lookup-decoding) | N-gram match against the prompt | Output copies large spans of the input (RAG, summarization, code editing) | ✓ | ✗ |
 | [EAGLE3](#eagle3) | Custom draft head trained on the target's hidden states | Highest acceptance rate; also supports [tree drafting](#tree-drafting) | ✓ | ✓ |
 
 :::info
-All three strategies are available through the `LLMPipeline` Python and C++ APIs.
-Prompt Lookup Decoding and EAGLE3 are additionally supported in `VLMPipeline` (e.g. Qwen3-VL).
+All four strategies are available through the `LLMPipeline` Python and C++ APIs.
+DFlash, Prompt Lookup Decoding, and EAGLE3 are additionally supported through
+`VLMPipeline` for supported decomposed vision-language models.
 
 The Continuous Batching backend supports multi-request batching; the Stateful backend is single-request.
 :::
@@ -121,6 +123,119 @@ For NPU deployments, the recommended configuration places both the target and th
 
 :::tip
 Check out [Python](https://github.com/openvinotoolkit/openvino.genai/blob/master/samples/python/text_generation/speculative_decoding_lm.py) and [C++](https://github.com/openvinotoolkit/openvino.genai/blob/master/samples/cpp/text_generation/speculative_decoding_lm.cpp) speculative decoding samples.
+:::
+
+## DFlash v1 and v2
+
+DFlash predicts an anchor-plus-mask block in one draft-backbone inference,
+conditioning the draft on selected hidden states from its paired target model.
+DFlash v1 produces independent candidate proposals. DFlash v2 adds an optional
+selector: the target LM head supplies unary Top-K candidates for every draft
+position, and the selector scores transitions between adjacent candidate sets
+before the runtime constructs a proposal path.
+
+Export the target and matching draft separately. The draft package contains:
+
+- DFlash v1: `openvino_model.xml`, the stateful draft backbone.
+- DFlash v2: `openvino_model.xml` plus the optional stateless
+  `openvino_selector_model.xml`.
+
+At load time, OpenVINO GenAI reuses target embedding and LM-head weights rather
+than duplicating them in the draft package. Use `LLMPipeline` for text targets
+and `VLMPipeline` for supported decomposed VLM targets.
+
+The implementation is intentionally hybrid: the target runs through Continuous
+Batching with Paged Attention (CB/PA), while the draft remains a dedicated
+stateful SDPA request. DFlash proposal-block attention is non-causal, so the
+draft cannot be converted to Paged Attention. For VLMs, the target's embedding
+pipeline supplies the draft's external `inputs_embeds`; text-only targets graft
+the target token embedding into the draft at load time.
+
+### Selector-enabled mode
+
+Supplying `selector_model()` with a DFlash v2 backbone enables candidate
+selection automatically.
+A structurally incompatible selector is reported as an error instead of
+silently falling back.
+The example below uses a VLM target; replace `VLMPipeline` with `LLMPipeline`
+for a text-only target.
+
+<LanguageTabs>
+    <TabItemPython>
+        ```python showLineNumbers
+        import openvino_genai as ov_genai
+
+        target_dir = "Qwen3.8-27B-ov"
+        draft_dir = "Qwen3.8-27B-DFlash2-ov"
+
+        scheduler = ov_genai.SchedulerConfig()
+        scheduler.enable_prefix_caching = False
+
+        pipe = ov_genai.VLMPipeline(
+            target_dir,
+            "GPU",
+            scheduler_config=scheduler,
+            draft_model=ov_genai.draft_model(draft_dir, "GPU"),
+            selector_model=ov_genai.selector_model(draft_dir, "GPU"),
+        )
+
+        config = ov_genai.GenerationConfig()
+        config.max_new_tokens = 100
+        config.num_assistant_tokens = 7
+        result = pipe.generate("The Sun is yellow because", config)
+        ```
+    </TabItemPython>
+    <TabItemCpp>
+        ```cpp showLineNumbers
+        #include "openvino/genai/llm_pipeline.hpp"
+        #include "openvino/genai/visual_language/pipeline.hpp"
+
+        ov::genai::SchedulerConfig scheduler;
+        scheduler.enable_prefix_caching = false;
+
+        ov::genai::VLMPipeline pipe(
+            "Qwen3.8-27B-ov",
+            "GPU",
+            ov::genai::scheduler_config(scheduler),
+            ov::genai::draft_model("Qwen3.8-27B-DFlash2-ov", "GPU"),
+            ov::genai::selector_model("Qwen3.8-27B-DFlash2-ov", "GPU"));
+
+        ov::genai::GenerationConfig config;
+        config.max_new_tokens = 100;
+        config.num_assistant_tokens = 7;
+        pipe.generate("The Sun is yellow because", config);
+        ```
+    </TabItemCpp>
+</LanguageTabs>
+
+Greedy decoding follows the highest-scoring selector path.
+Sampled decoding retains each realized sparse proposal row and uses standard lossless rejection sampling: acceptance probability `min(1, p / q)`, with rejected tokens resampled from normalized `max(0, p - q)`.
+
+### Selectorless mode
+
+DFlash v1 always uses its backbone without a selector, by design. For DFlash v2, omit
+`selector_model()` to use independent per-position backbone proposals.
+Backbone-only operation supports greedy decoding only.
+
+:::warning Runtime limits
+DFlash v1 and v2 use the Continuous Batching backend on CPU and GPU; NPU and
+the Stateful backend are not supported.
+
+- One active request, one input batch element, and one return sequence are
+  supported.
+- Beam search, adapters, prefix caching, prompt lookup, and
+  `assistant_confidence_threshold` are not supported.
+- Set `num_assistant_tokens` to use DFlash (it defaults to `5` when omitted).
+  If `SchedulerConfig.max_num_batched_tokens` is limited, it must be at least
+  `num_assistant_tokens + 1`.
+- For a linear-attention target, leave
+  `SchedulerConfig.num_linear_attention_blocks` at `0` for automatic
+  allocation, or explicitly provide enough rows for one committed state plus
+  `num_assistant_tokens + 1` speculative checkpoint rows.
+- Selectorless operation is greedy-only. Sampled decoding requires the DFlash
+  v2 selector. Streaming is supported for greedy decoding only.
+- VLM mode does not support visual-token pruning, `echo`, prompt logprobs, or
+  Omni intermediate outputs.
 :::
 
 ## Prompt Lookup Decoding

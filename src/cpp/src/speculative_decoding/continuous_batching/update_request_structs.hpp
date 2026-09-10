@@ -12,6 +12,15 @@
 namespace ov::genai {
 struct TreeMetaData;
 
+struct DraftProposal {
+    std::vector<int64_t> token_ids;
+    std::vector<float> probabilities;
+
+    bool empty() const {
+        return token_ids.empty();
+    }
+};
+
 struct GeneratedSequence {
     std::vector<int64_t> token_ids;
     std::vector<float> log_probs;
@@ -24,16 +33,21 @@ struct GeneratedSequence {
     // If not using eagle speculative decoding, this field may remain empty.
     ov::Tensor hidden_states;
     std::shared_ptr<const TreeMetaData> tree_metadata;
+    // Optional sparse proposal distributions aligned 1:1 with token_ids.
+    // Empty rows preserve the legacy scalar-log-probability behavior.
+    std::vector<DraftProposal> draft_proposals;
     GeneratedSequence(const std::vector<int64_t>& generated_token_ids,
                       const std::vector<float>& generated_log_probs,
                       size_t num_processed_tokens = 0,
                       const ov::Tensor& generated_hidden_states = {},
-                      std::shared_ptr<const TreeMetaData> metadata = nullptr)
+                      std::shared_ptr<const TreeMetaData> metadata = nullptr,
+                      std::vector<DraftProposal> proposals = {})
         : token_ids(generated_token_ids),
           log_probs(generated_log_probs),
           num_processed_tokens(num_processed_tokens),
           hidden_states(generated_hidden_states),
-          tree_metadata(std::move(metadata)) {};
+          tree_metadata(std::move(metadata)),
+          draft_proposals(std::move(proposals)) {};
 };
 
 struct UpdateRequestResult {

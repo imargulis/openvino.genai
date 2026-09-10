@@ -15,6 +15,7 @@
 #include "openvino/runtime/properties.hpp"
 #include "sampling/sampler.hpp"
 #include "utils.hpp"
+#include "model_desc.hpp"
 #include "visual_language/continuous_batching_adapter.hpp"
 #include "visual_language/embedding_model.hpp"
 #include "visual_language/inputs_embedder.hpp"
@@ -27,6 +28,16 @@
 using namespace ov::genai;
 
 namespace {
+bool is_dflash_draft(const ov::AnyMap& properties) {
+    auto it = properties.find(ov::genai::utils::DRAFT_MODEL_ARG_NAME);
+    if (it == properties.end()) {
+        return false;
+    }
+    const auto& draft = it->second.as<ov::genai::ModelDesc>();
+    auto dflash_mode = draft.properties.find("dflash_mode");
+    return dflash_mode != draft.properties.end() && dflash_mode->second.as<bool>();
+}
+
 void update_npu_properties(const std::filesystem::path& models_dir, ov::AnyMap& properties) {
     auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(models_dir, "config.json");
     switch (vlm_config.model_type) {
@@ -940,6 +951,9 @@ VLMPipeline::VLMPipeline(
     utils::clear_false_prompt_lookup_from_config(properties);
     utils::validate_vlm_model_properties(properties);
     if (device == "NPU") {
+        OPENVINO_ASSERT(!is_dflash_draft(properties),
+                        "DFlash speculative decoding requires the Continuous Batching/Paged Attention backend on CPU or GPU; "
+                        "NPU is not supported.");
         auto it = properties.find("scheduler_config");
         OPENVINO_ASSERT(it == properties.end(), "scheduler_config should be removed for VLMPipeline initialization");
         m_pimpl = std::make_shared<VLMPipelineImpl>(models_dir, device, properties);
@@ -992,6 +1006,9 @@ VLMPipeline::VLMPipeline(
     utils::clear_false_prompt_lookup_from_config(properties);
     utils::validate_vlm_model_properties(properties);
     if (device == "NPU") {
+        OPENVINO_ASSERT(!is_dflash_draft(properties),
+                        "DFlash speculative decoding requires the Continuous Batching/Paged Attention backend on CPU or GPU; "
+                        "NPU is not supported.");
         auto it = properties.find("scheduler_config");
         OPENVINO_ASSERT(it == properties.end(), "scheduler_config should be removed for VLMPipeline initialization");
         m_pimpl = std::make_shared<VLMPipelineImpl>(models_map, tokenizer, config_dir_path, device, properties, generation_config);

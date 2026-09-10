@@ -31,11 +31,27 @@ std::shared_ptr<ov::Model> peek_draft_model(const ov::AnyMap& properties) {
     return it->second.as<ov::genai::ModelDesc>().model;
 }
 
+bool is_dflash_draft(const ov::AnyMap& properties) {
+    auto it = properties.find(ov::genai::utils::DRAFT_MODEL_ARG_NAME);
+    if (it == properties.end()) {
+        return false;
+    }
+    const auto& draft = it->second.as<ov::genai::ModelDesc>();
+    auto dflash_mode = draft.properties.find("dflash_mode");
+    return dflash_mode != draft.properties.end() && dflash_mode->second.as<bool>();
+}
+
 bool should_use_stateful_pipeline(bool is_npu_requested,
                                   bool has_draft_model,
                                   const std::string& attention_backend,
                                   const std::shared_ptr<ov::Model>& main_model,
                                   const ov::AnyMap& properties) {
+    if (has_draft_model && is_dflash_draft(properties)) {
+        const auto& draft = properties.at(ov::genai::utils::DRAFT_MODEL_ARG_NAME).as<ov::genai::ModelDesc>();
+        OPENVINO_ASSERT(!is_npu_requested && !ov::genai::utils::is_npu_requested(draft.device, draft.properties),
+                        "DFlash speculative decoding requires the Continuous Batching/Paged Attention backend on CPU or GPU; "
+                        "NPU is not supported.");
+    }
     if (is_npu_requested) {
         return true;
     }
@@ -153,6 +169,32 @@ std::pair<std::string, Any> draft_model(
     utils::mtp::apply_mtp_rt_info(model, plugin_config);
     utils::eagle3::apply_eagle3_rt_info(model, plugin_config);
     return { utils::DRAFT_MODEL_ARG_NAME, Any::make<ModelDesc>(model, tokenizer, device, plugin_config, scheduler_config, generation_config) };
+}
+
+std::pair<std::string, Any> selector_model(
+    const std::filesystem::path& models_path,
+    const std::string& device,
+    const ov::AnyMap& properties) {
+    auto [plugin_config, scheduler_config] = utils::extract_scheduler_config(properties);
+    const auto model_path = std::filesystem::is_directory(models_path)
+                                ? models_path / "openvino_selector_model.xml"
+                                : models_path;
+    auto model = utils::singleton_core().read_model(model_path, {}, plugin_config);
+    utils::dflash::apply_dflash_selector_rt_info(model, plugin_config);
+    return {utils::SELECTOR_MODEL_ARG_NAME,
+            Any::make<ModelDesc>(model, Tokenizer{}, device, plugin_config, scheduler_config)};
+}
+
+std::pair<std::string, Any> selector_model(
+    std::string& model_str,
+    ov::Tensor& weights_tensor,
+    const std::string& device,
+    const ov::AnyMap& properties) {
+    auto [plugin_config, scheduler_config] = utils::extract_scheduler_config(properties);
+    auto model = utils::singleton_core().read_model(model_str, weights_tensor);
+    utils::dflash::apply_dflash_selector_rt_info(model, plugin_config);
+    return {utils::SELECTOR_MODEL_ARG_NAME,
+            Any::make<ModelDesc>(model, Tokenizer{}, device, plugin_config, scheduler_config)};
 }
 
 class StatefulPipeline {
