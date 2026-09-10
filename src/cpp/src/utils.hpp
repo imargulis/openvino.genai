@@ -101,6 +101,7 @@ const std::string STREAMER_ARG_NAME = "streamer";
 const std::string AUDIO_STREAMER_ARG_NAME = "audio_streamer";
 const std::string CONFIG_ARG_NAME = "generation_config";
 const std::string DRAFT_MODEL_ARG_NAME = "draft_model";
+const std::string SELECTOR_MODEL_ARG_NAME = "selector_model";
 const std::string EXTENSIONS_ARG_NAME = "extensions";
 const std::string IMAGES_BATCHES_ARG_NAME = "images_batches";
 const std::string VIDEOS_BATCHES_ARG_NAME = "videos_batches";

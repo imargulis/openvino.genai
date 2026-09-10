@@ -268,11 +268,17 @@ insert_tokens_to_sequence(Sequence::Ptr& sequence,
                           const std::vector<int64_t>& token_ids,
                           const std::vector<float>& token_log_probs,
                           LogitProcessor& logit_proccessor,
-                          bool is_update_sampler) {
+                          bool is_update_sampler,
+                          const std::vector<DraftProposal>* draft_proposals = nullptr) {
     size_t generated_len = sequence->get_generated_len(), candidate_len = token_ids.size();
     OPENVINO_ASSERT(generated_len <= candidate_len);
+    OPENVINO_ASSERT(!draft_proposals || draft_proposals->empty() || draft_proposals->size() == candidate_len,
+                    "Draft proposal rows must be empty or aligned with candidate token IDs.");
     for (size_t i = generated_len; i < candidate_len; ++i) {
         sequence->append_token(token_ids[i], token_log_probs[i]);
+        if (draft_proposals && !draft_proposals->empty() && !(*draft_proposals)[i].empty()) {
+            sequence->set_draft_proposal(sequence->get_generated_len() - 1, (*draft_proposals)[i]);
+        }
         if (is_update_sampler) {
             logit_proccessor.register_new_generated_token(token_ids[i]);
         }
@@ -319,11 +325,19 @@ init_request(
         }
         auto token_ids = candidate_sequence.second.token_ids;
         auto log_probs = candidate_sequence.second.log_probs;
+        OPENVINO_ASSERT(candidate_sequence.second.draft_proposals.empty() ||
+                            candidate_sequence.second.draft_proposals.size() == token_ids.size(),
+                        "Draft proposal rows must be empty or aligned with candidate token IDs.");
         token_ids.resize(min_candidate_len);
         log_probs.resize(min_candidate_len);
 
         for (size_t i = 0; i < min_candidate_len; ++i) {
             sequence->append_token(token_ids[i], log_probs[i]);
+            if (!candidate_sequence.second.draft_proposals.empty() &&
+                !candidate_sequence.second.draft_proposals[i].empty()) {
+                sequence->set_draft_proposal(sequence->get_generated_len() - 1,
+                                             candidate_sequence.second.draft_proposals[i]);
+            }
             if (is_update_logit_processor) {
                 logit_processor.register_new_generated_token(token_ids[i]);
                 logit_processor.update_generated_len(sequence->get_generated_len());
@@ -433,9 +447,18 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
                 auto candidate_sequence = *candidate_ptr;
                 std::vector<int64_t> candidate_token_ids = candidate_sequence.token_ids;
                 std::vector<float> candidate_token_log_probs = candidate_sequence.log_probs;
+                std::vector<DraftProposal> candidate_draft_proposals = candidate_sequence.draft_proposals;
                 candidate_token_ids.resize(min_candidate_len);
                 candidate_token_log_probs.resize(min_candidate_len);
-                result.inserted_tokens_cnt = insert_tokens_to_sequence(running_sequence, candidate_token_ids, candidate_token_log_probs, logit_processor, is_update_logit_processor);
+                if (!candidate_draft_proposals.empty()) {
+                    candidate_draft_proposals.resize(min_candidate_len);
+                }
+                result.inserted_tokens_cnt = insert_tokens_to_sequence(running_sequence,
+                                                                       candidate_token_ids,
+                                                                       candidate_token_log_probs,
+                                                                       logit_processor,
+                                                                       is_update_logit_processor,
+                                                                       &candidate_draft_proposals);
                 // handle hidden states for eagle mode
                 if (eagle_mode_enabled && !m_is_validation_mode_enabled && result.inserted_tokens_cnt > 0) {
                     // Eagle mode hidden state management currently supports only single sequence

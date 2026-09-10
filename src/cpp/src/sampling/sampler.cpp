@@ -1436,6 +1436,86 @@ bool Sampler::validate_candidate(
     return true;
 }
 
+std::vector<float> detail::materialize_sampling_probabilities(const Logits& logits, size_t vocab_size) {
+    std::vector<float> probabilities(vocab_size, 0.0f);
+    float total = 0.0f;
+    if (logits.m_defer_expf) {
+        OPENVINO_ASSERT(logits.is_vector_initialized(), "Deferred sampling logits must use indexed storage.");
+        float max_logit = -std::numeric_limits<float>::infinity();
+        for (const auto& token : logits.m_vector) {
+            max_logit = std::max(max_logit, token.m_log_prob);
+        }
+        for (const auto& token : logits.m_vector) {
+            const float probability = std::exp(token.m_log_prob - max_logit);
+            probabilities.at(static_cast<size_t>(token.m_index)) = probability;
+            total += probability;
+        }
+    } else if (logits.is_vector_initialized()) {
+        for (const auto& token : logits.m_vector) {
+            probabilities.at(static_cast<size_t>(token.m_index)) = token.m_log_prob;
+            total += token.m_log_prob;
+        }
+    } else {
+        OPENVINO_ASSERT(logits.m_size == vocab_size, "Dense sampling probability size mismatch.");
+        for (size_t token = 0; token < vocab_size; ++token) {
+            probabilities[token] = logits.m_data[token];
+            total += logits.m_data[token];
+        }
+    }
+    OPENVINO_ASSERT(total > 0.0f && std::isfinite(total), "Target sampling distribution is invalid.");
+    for (auto& probability : probabilities) {
+        probability /= total;
+    }
+    return probabilities;
+}
+
+float detail::proposal_probability(const DraftProposal& proposal, int64_t token_id) {
+    OPENVINO_ASSERT(proposal.token_ids.size() == proposal.probabilities.size(),
+                    "Draft proposal IDs and probabilities must stay aligned.");
+    for (size_t index = 0; index < proposal.token_ids.size(); ++index) {
+        if (proposal.token_ids[index] == token_id) {
+            return proposal.probabilities[index];
+        }
+    }
+    return 0.0f;
+}
+
+bool detail::accept_draft_token(float target_probability,
+                                float draft_probability,
+                                std::mt19937& rng_engine) {
+    OPENVINO_ASSERT(draft_probability > 0.0f,
+                    "Draft probability must be positive for rejection sampling.");
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+    return uniform(rng_engine) * draft_probability <= target_probability;
+}
+
+Token detail::sample_residual_distribution(const std::vector<float>& target_probabilities,
+                                           const DraftProposal& proposal,
+                                           std::mt19937& rng_engine) {
+    std::vector<float> residual = target_probabilities;
+    for (size_t index = 0; index < proposal.token_ids.size(); ++index) {
+        const size_t token_id = static_cast<size_t>(proposal.token_ids[index]);
+        residual.at(token_id) = std::max(0.0f, residual.at(token_id) - proposal.probabilities[index]);
+    }
+    float residual_sum = std::accumulate(residual.begin(), residual.end(), 0.0f);
+    OPENVINO_ASSERT(residual_sum > 0.0f && std::isfinite(residual_sum),
+                    "Residual speculative sampling distribution is invalid.");
+    std::uniform_real_distribution<float> uniform(0.0f, residual_sum);
+    const float sample = uniform(rng_engine);
+    float cumulative = 0.0f;
+    size_t selected_token = residual.size() - 1;
+    for (size_t token = 0; token < residual.size(); ++token) {
+        cumulative += residual[token];
+        if (sample < cumulative) {
+            selected_token = token;
+            break;
+        }
+    }
+    const float target_probability = target_probabilities[selected_token];
+    return Token(std::log(std::max(target_probability, std::numeric_limits<float>::min())),
+                 static_cast<int64_t>(selected_token));
+}
+
 float get_p_prime(Sequence::Ptr& running_sequence,
                   const Token& sampled_token,
                   size_t token_offset) {
@@ -1531,7 +1611,70 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
 
                 auto logit_vector = _get_logit_vector(sequence_group_logits, running_sequence_id, logit_token_offset);
                 logit_processor.apply(logit_vector);
-                
+
+                if (is_validation_mode_enabled && sampling_params.do_sample &&
+                    generated_seq_token_offset > 0) {
+                    const size_t candidate_index =
+                        running_sequence->get_generated_len() - generated_seq_token_offset;
+                    const auto& sparse_proposal = running_sequence->get_draft_proposal(candidate_index);
+                    if (!sparse_proposal.empty()) {
+                        const auto target_probabilities =
+                            detail::materialize_sampling_probabilities(logit_vector,
+                                                                       sequence_group_logits.get_shape()[2]);
+                        const int64_t draft_token = running_sequence->get_generated_ids()[candidate_index];
+                        const float draft_probability = detail::proposal_probability(sparse_proposal, draft_token);
+                        OPENVINO_ASSERT(draft_probability > 0.0f,
+                                        "Selected draft token is absent from its proposal distribution.");
+                        const float target_probability = target_probabilities.at(static_cast<size_t>(draft_token));
+                        const bool accepted =
+                            detail::accept_draft_token(target_probability, draft_probability, rng_engine);
+                        if (accepted) {
+                            Token accepted_token(
+                                std::log(std::max(target_probability, std::numeric_limits<float>::min())),
+                                draft_token);
+                            running_sequence->update_generated_log_prob(candidate_index, accepted_token.m_log_prob);
+                            running_sequence->clear_draft_proposal(candidate_index);
+                            register_new_token(accepted_token,
+                                               running_sequence,
+                                               logit_processor,
+                                               false,
+                                               is_validation_mode_enabled);
+                            if (is_stop_token_id_hit(draft_token, sampling_params.stop_token_ids) &&
+                                !sampling_params.ignore_eos) {
+                                const size_t trailing_draft_tokens = generated_seq_token_offset - 1;
+                                if (trailing_draft_tokens > 0) {
+                                    running_sequence->remove_last_tokens(trailing_draft_tokens);
+                                    assisting_pipeline_info.max_removed_tokens_per_request =
+                                        std::max(assisting_pipeline_info.max_removed_tokens_per_request,
+                                                 trailing_draft_tokens);
+                                }
+                                running_sequence->set_status(SequenceStatus::FINISHED);
+                                running_sequence->set_finish_reason(GenerationFinishReason::STOP);
+                                sg_sampling_info.sampler_output.m_dropped_sequences.push_back(
+                                    running_sequence->get_id());
+                                break;
+                            }
+                            continue;
+                        }
+
+                        Token residual_token =
+                            detail::sample_residual_distribution(target_probabilities,
+                                                                 sparse_proposal,
+                                                                 rng_engine);
+                        running_sequence->remove_last_tokens(generated_seq_token_offset);
+                        assisting_pipeline_info.max_removed_tokens_per_request =
+                            std::max(assisting_pipeline_info.max_removed_tokens_per_request,
+                                     generated_seq_token_offset);
+                        register_new_token(residual_token,
+                                           running_sequence,
+                                           logit_processor,
+                                           true,
+                                           is_validation_mode_enabled);
+                        is_validation_passed = false;
+                        break;
+                    }
+                }
+
                 Token sampled_token;
                 bool is_generate_n_tokens = false;
                 if (sampling_params.is_greedy_decoding()) {
