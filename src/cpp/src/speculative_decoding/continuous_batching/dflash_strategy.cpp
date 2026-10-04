@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 #include <iterator>
 #include <limits>
 #include <numeric>
@@ -13,6 +15,7 @@
 #include <vector>
 
 #include <openvino/pass/sdpa_to_paged_attention.hpp>
+#include <openvino/runtime/properties.hpp>
 
 #include "continuous_batching/paged_attention_transformations.hpp"
 #include "sampling/sampler.hpp"
@@ -42,6 +45,16 @@ struct DFlashProposalResult {
 
 constexpr const char* ACTIVATIONS_SCALE_FACTOR_PROPERTY = "ACTIVATIONS_SCALE_FACTOR";
 constexpr float DFLASH2_GPU_MIN_ACTIVATIONS_SCALE_FACTOR = 32.0f;
+
+bool dflash_timing_profile_enabled() {
+    const char* value = std::getenv("OPENVINO_DFLASH_TIMING_PROFILE");
+    return value != nullptr && std::string(value) != "0";
+}
+
+bool dflash_device_profile_enabled() {
+    const char* value = std::getenv("OPENVINO_DFLASH_DEVICE_PROFILE");
+    return value != nullptr && std::string(value) != "0";
+}
 
 std::vector<float> zero_log_probs(size_t count) {
     return std::vector<float>(count, 0.0f);
@@ -109,11 +122,16 @@ public:
           m_mask_token_id(rt_info.mask_token_id),
           m_candidate_position_offset(rt_info.candidate_position_offset),
           m_selector_enabled(selector_enabled),
-          m_selector_info(selector_rt_info) {
+          m_selector_info(selector_rt_info),
+          m_timing_profile_enabled(dflash_timing_profile_enabled() || dflash_device_profile_enabled()),
+          m_device_profile_enabled(dflash_device_profile_enabled()) {
         if (m_selector_enabled) {
             auto selector_desc = selector_model_desc;
             if (selector_desc.device.empty()) {
                 selector_desc.device = model_desc.device;
+            }
+            if (m_device_profile_enabled) {
+                selector_desc.properties[ov::enable_profiling.name()] = true;
             }
             m_selector_request = utils::singleton_core()
                                      .compile_model(selector_desc.model,
@@ -193,6 +211,7 @@ public:
     }
 
     std::vector<DraftCandidateToken> sample_candidates(const ov::Tensor& logits, size_t candidate_count) {
+        const auto start = std::chrono::steady_clock::now();
         std::vector<DraftCandidateToken> candidates;
         candidates.reserve(candidate_count);
         const auto shape = logits.get_shape();
@@ -204,6 +223,7 @@ public:
             candidates.insert(candidates.end(), sampled.begin(), sampled.end());
         }
         m_raw_perf_metrics.m_batch_sizes.emplace_back(candidates.size());
+        record_path_duration(start);
         return candidates;
     }
 
@@ -247,6 +267,7 @@ public:
         m_selector_request->set_tensor("anchor_token_ids", anchor_ids);
         update_inference_time(execute_selector_inference());
 
+        const auto path_start = std::chrono::steady_clock::now();
         const auto edge_scores = m_selector_request->get_tensor("edge_scores");
         const auto candidate_ids = m_selector_request->get_tensor("candidate_ids");
         OPENVINO_ASSERT(edge_scores.get_element_type() == ov::element::f32,
@@ -302,11 +323,65 @@ public:
             }
         }
         m_raw_perf_metrics.m_batch_sizes.emplace_back(result.candidates.size());
+        record_path_duration(path_start);
         return result;
     }
 
     ov::genai::RawPerfMetrics& get_raw_perf_metrics() {
         return m_raw_perf_metrics;
+    }
+
+    void print_timing_profile() const {
+        if (!m_timing_profile_enabled || m_draft_inference_us.empty()) {
+            return;
+        }
+
+        const auto mean_us = [](const std::vector<uint64_t>& values, size_t skip = 0) {
+            const auto begin = values.begin() + std::min(skip, values.size() - 1);
+            return static_cast<double>(std::accumulate(begin, values.end(), uint64_t{0})) /
+                   std::distance(begin, values.end());
+        };
+        const auto draft_mean = mean_us(m_draft_inference_us);
+        const auto selector_mean =
+            m_selector_inference_us.empty() ? 0.0 : mean_us(m_selector_inference_us);
+        const auto path_mean = m_path_selection_us.empty() ? 0.0 : mean_us(m_path_selection_us);
+        const auto steady_draft_mean = mean_us(m_draft_inference_us, 2);
+        const auto steady_selector_mean =
+            m_selector_inference_us.empty() ? 0.0 : mean_us(m_selector_inference_us, 2);
+        const auto steady_path_mean =
+            m_path_selection_us.empty() ? 0.0 : mean_us(m_path_selection_us, 2);
+        const auto backbone_mean =
+            m_backbone_profile_us.empty() ? 0.0 : mean_us(m_backbone_profile_us);
+        const auto lm_head_mean =
+            m_lm_head_profile_us.empty() ? 0.0 : mean_us(m_lm_head_profile_us);
+
+        std::cout << "DFlash timing profile (mean per proposal stage, ms): draft infer="
+                  << draft_mean / 1000.0
+                  << ", selector=" << selector_mean / 1000.0
+                  << ", host candidate/path=" << path_mean / 1000.0
+                  << ", total before verification=" << (draft_mean + selector_mean + path_mean) / 1000.0
+                  << "\n";
+        std::cout << "DFlash timing profile (steady state after first two proposal stages, ms): draft infer="
+                  << steady_draft_mean / 1000.0
+                  << ", selector=" << steady_selector_mean / 1000.0
+                  << ", host candidate/path=" << steady_path_mean / 1000.0
+                  << ", total before verification="
+                  << (steady_draft_mean + steady_selector_mean + steady_path_mean) / 1000.0
+                  << "\n";
+        if (!m_backbone_profile_us.empty()) {
+            const auto steady_backbone_mean = mean_us(m_backbone_profile_us, 2);
+            const auto steady_lm_head_mean = mean_us(m_lm_head_profile_us, 2);
+            std::cout << "DFlash device profile (mean per draft infer, ms): backbone="
+                      << backbone_mean / 1000.0
+                      << ", grafted lm_head=" << lm_head_mean / 1000.0
+                      << ", profile sum=" << (backbone_mean + lm_head_mean) / 1000.0
+                      << "\n";
+            std::cout << "DFlash device profile (steady state after first two draft infers, ms): backbone="
+                      << steady_backbone_mean / 1000.0
+                      << ", grafted lm_head=" << steady_lm_head_mean / 1000.0
+                      << ", profile sum=" << (steady_backbone_mean + steady_lm_head_mean) / 1000.0
+                      << "\n";
+        }
     }
 
     size_t get_consumed_hidden_states() const {
@@ -329,6 +404,11 @@ private:
         m_raw_perf_metrics.m_inference_durations = {MicroSeconds(0.0f)};
         m_raw_perf_metrics.m_durations.clear();
         m_raw_perf_metrics.m_batch_sizes.clear();
+        m_draft_inference_us.clear();
+        m_selector_inference_us.clear();
+        m_path_selection_us.clear();
+        m_backbone_profile_us.clear();
+        m_lm_head_profile_us.clear();
     }
 
     static ov::InferRequest create_draft_infer_request(const ov::genai::ModelDesc& model_desc,
@@ -366,6 +446,9 @@ private:
             // Legacy values below the validated safe minimum are clamped.
             compile_properties[ACTIVATIONS_SCALE_FACTOR_PROPERTY] =
                 get_dflash2_gpu_activations_scale_factor(model_desc.model);
+        }
+        if (dflash_device_profile_enabled()) {
+            compile_properties[ov::enable_profiling.name()] = true;
         }
         if (model_desc.device == "NPU") {
             auto kv_axes_pos = utils::get_kv_axes_pos(model_desc.model);
@@ -418,15 +501,54 @@ private:
     uint64_t execute_inference() {
         auto start = std::chrono::steady_clock::now();
         m_request.infer();
-        return static_cast<uint64_t>(
+        const auto duration_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+        record_draft_profile(duration_us);
+        return duration_us;
     }
 
     uint64_t execute_selector_inference() {
         auto start = std::chrono::steady_clock::now();
         m_selector_request->infer();
-        return static_cast<uint64_t>(
+        const auto duration_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+        if (m_timing_profile_enabled) {
+            m_selector_inference_us.push_back(duration_us);
+        }
+        return duration_us;
+    }
+
+    void record_draft_profile(uint64_t wall_duration_us) {
+        if (!m_timing_profile_enabled) {
+            return;
+        }
+        m_draft_inference_us.push_back(wall_duration_us);
+
+        if (!m_device_profile_enabled) {
+            return;
+        }
+
+        uint64_t profile_total_us = 0;
+        uint64_t lm_head_us = 0;
+        for (const auto& info : m_request.get_profiling_info()) {
+            const auto duration_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(info.real_time).count());
+            profile_total_us += duration_us;
+            // The GPU plugin may report the grafted MatMul under an internal
+            // name/type rather than dflash_grafted_lm_head. It is still the
+            // uniquely longest draft kernel: [B, S, hidden] x [hidden, vocab].
+            lm_head_us = std::max(lm_head_us, duration_us);
+        }
+        m_backbone_profile_us.push_back(profile_total_us - lm_head_us);
+        m_lm_head_profile_us.push_back(lm_head_us);
+    }
+
+    void record_path_duration(std::chrono::steady_clock::time_point start) {
+        if (!m_timing_profile_enabled) {
+            return;
+        }
+        m_path_selection_us.push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
     }
 
     void update_inference_time(uint64_t inference_time_us) {
@@ -451,6 +573,13 @@ private:
     ov::genai::utils::dflash::DFlashSelectorRTInfo m_selector_info;
     std::optional<ov::InferRequest> m_selector_request;
     std::mt19937 m_selector_rng;
+    bool m_timing_profile_enabled = false;
+    bool m_device_profile_enabled = false;
+    std::vector<uint64_t> m_draft_inference_us;
+    std::vector<uint64_t> m_selector_inference_us;
+    std::vector<uint64_t> m_path_selection_us;
+    std::vector<uint64_t> m_backbone_profile_us;
+    std::vector<uint64_t> m_lm_head_profile_us;
 };
 
 ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
@@ -960,6 +1089,7 @@ ov::genai::RawPerfMetrics ContinuousBatchingPipeline::DFlashDecodingImpl::collec
         return raw_metrics;
     }
 
+    m_draft->print_timing_profile();
     const auto& draft_metrics = m_draft->get_raw_perf_metrics();
     const size_t inferences_per_stage = m_selector_enabled ? 2 : 1;
     OPENVINO_ASSERT(draft_metrics.m_durations.size() ==
