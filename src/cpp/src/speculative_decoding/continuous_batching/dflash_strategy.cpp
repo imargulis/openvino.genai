@@ -14,6 +14,9 @@
 #include <string>
 #include <vector>
 
+#include <openvino/op/matmul.hpp>
+#include <openvino/op/parameter.hpp>
+#include <openvino/op/result.hpp>
 #include <openvino/pass/sdpa_to_paged_attention.hpp>
 #include <openvino/runtime/properties.hpp>
 
@@ -91,6 +94,25 @@ bool model_has_output(const std::shared_ptr<ov::Model>& model, const std::string
     }) != outputs.end();
 }
 
+std::shared_ptr<ov::Model> build_lm_head_probe_model(const std::shared_ptr<ov::Model>& main_model) {
+    auto target_head = std::get<0>(utils::find_llm_matmul(main_model));
+    auto target_matmul = ov::as_type_ptr<ov::op::v0::MatMul>(target_head);
+    OPENVINO_ASSERT(target_matmul, "DFlash component probe could not locate the target lm_head MatMul.");
+
+    auto hidden = std::make_shared<ov::op::v0::Parameter>(ov::element::f32,
+                                                           target_matmul->input_value(0).get_partial_shape());
+    hidden->set_friendly_name("dflash_component_probe_hidden");
+    hidden->output(0).set_names({"dflash_component_probe_hidden"});
+    auto lm_head = std::make_shared<ov::op::v0::MatMul>(hidden,
+                                                        target_matmul->input_value(1),
+                                                        target_matmul->get_transpose_a(),
+                                                        target_matmul->get_transpose_b());
+    lm_head->set_friendly_name("dflash_component_probe_lm_head");
+    auto result = std::make_shared<ov::op::v0::Result>(lm_head);
+    result->output(0).set_names({"logits"});
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{hidden});
+}
+
 void validate_target_has_no_unmanaged_state(const std::shared_ptr<ov::Model>& model) {
     OPENVINO_ASSERT(model, "DFlash target model cannot be null.");
     std::vector<std::string> unmanaged_state_ops;
@@ -117,7 +139,8 @@ public:
                         const ov::genai::utils::dflash::DFlashSelectorRTInfo& selector_rt_info,
                         bool selector_enabled,
                         EmbeddingsModel::Ptr embedding_model = nullptr,
-                        std::optional<ov::genai::ModelDesc> backbone_probe_model_desc = std::nullopt)
+                        std::optional<ov::genai::ModelDesc> backbone_probe_model_desc = std::nullopt,
+                        std::optional<ov::genai::ModelDesc> lm_head_probe_model_desc = std::nullopt)
         : m_tokenizer(tokenizer),
           m_embedding_model(std::move(embedding_model)),
           m_request(create_draft_infer_request(model_desc,
@@ -139,6 +162,9 @@ public:
                                                                       rt_info.dflash_version);
             m_backbone_probe_has_beam_idx =
                 has_compiled_input(m_backbone_probe_request->get_compiled_model(), "beam_idx");
+        }
+        if (m_component_profile_enabled && lm_head_probe_model_desc.has_value()) {
+            m_lm_head_probe_request = create_lm_head_probe_request(*lm_head_probe_model_desc);
         }
         if (m_selector_enabled) {
             auto selector_desc = selector_model_desc;
@@ -431,16 +457,18 @@ public:
         }
         const auto measured_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
-        const auto probe_us =
+        const auto backbone_probe_us =
             m_backbone_probe_inference_us.empty() ? uint64_t{0} : m_backbone_probe_inference_us.back();
-        OPENVINO_ASSERT(measured_us >= probe_us,
+        const auto lm_head_probe_us =
+            m_lm_head_probe_inference_us.empty() ? uint64_t{0} : m_lm_head_probe_inference_us.back();
+        OPENVINO_ASSERT(measured_us >= backbone_probe_us + lm_head_probe_us,
                         "DFlash component probe duration exceeds the enclosing proposal duration.");
-        m_proposal_envelope_us.push_back(measured_us - probe_us);
+        m_proposal_envelope_us.push_back(measured_us - backbone_probe_us - lm_head_probe_us);
     }
 
     void print_component_profile() const {
         if (!m_component_profile_enabled || m_draft_inference_us.empty() ||
-            m_backbone_probe_inference_us.empty()) {
+            m_backbone_probe_inference_us.empty() || m_lm_head_probe_inference_us.empty()) {
             return;
         }
 
@@ -451,7 +479,8 @@ public:
         };
         const auto full_draft_us = mean_us(m_draft_inference_us, 2);
         const auto backbone_us = mean_us(m_backbone_probe_inference_us, 2);
-        const auto head_increment_us = std::max(0.0, full_draft_us - backbone_us);
+        const auto lm_head_probe_us = mean_us(m_lm_head_probe_inference_us, 2);
+        const auto integration_us = full_draft_us - backbone_us - lm_head_probe_us;
         const auto hidden_materialization_us =
             m_hidden_materialization_us.empty() ? 0.0 : mean_us(m_hidden_materialization_us, 2);
         const auto input_preparation_us =
@@ -471,7 +500,8 @@ public:
                   << "hidden materialization=" << hidden_materialization_us / 1000.0
                   << ", draft input preparation=" << input_preparation_us / 1000.0
                   << ", backbone-only mirror=" << backbone_us / 1000.0
-                  << ", grafted lm_head incremental=" << head_increment_us / 1000.0
+                  << ", standalone lm_head mirror=" << lm_head_probe_us / 1000.0
+                  << ", graph integration delta=" << integration_us / 1000.0
                   << ", full draft infer=" << full_draft_us / 1000.0
                   << ", output materialization=" << output_materialization_us / 1000.0
                   << ", selector=" << selector_us / 1000.0
@@ -513,6 +543,7 @@ private:
         m_backbone_profile_us.clear();
         m_lm_head_profile_us.clear();
         m_backbone_probe_inference_us.clear();
+        m_lm_head_probe_inference_us.clear();
         m_input_preparation_us.clear();
         m_output_materialization_us.clear();
         m_hidden_materialization_us.clear();
@@ -565,6 +596,17 @@ private:
         }
         return utils::singleton_core()
             .compile_model(model_desc.model, model_desc.device, compile_properties)
+            .create_infer_request();
+    }
+
+    static ov::InferRequest create_lm_head_probe_request(const ov::genai::ModelDesc& model_desc) {
+        OPENVINO_ASSERT(model_desc.model, "DFlash lm_head probe model cannot be null.");
+        OPENVINO_ASSERT(utils::has_input(model_desc.model, "dflash_component_probe_hidden"),
+                        "DFlash lm_head probe has an invalid hidden-state input.");
+        OPENVINO_ASSERT(model_has_output(model_desc.model, "logits"),
+                        "DFlash lm_head probe must expose logits.");
+        return utils::singleton_core()
+            .compile_model(model_desc.model, model_desc.device, model_desc.properties)
             .create_infer_request();
     }
 
@@ -655,6 +697,17 @@ private:
             m_backbone_probe_inference_us.push_back(static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
         }
+        if (m_lm_head_probe_request) {
+            m_lm_head_probe_request->set_tensor("dflash_component_probe_hidden",
+                                                m_backbone_probe_request->get_tensor("last_hidden_state"));
+            const auto lm_head_start = std::chrono::steady_clock::now();
+            m_lm_head_probe_request->infer();
+            if (m_component_profile_enabled) {
+                m_lm_head_probe_inference_us.push_back(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - lm_head_start).count()));
+            }
+        }
     }
 
     uint64_t execute_selector_inference() {
@@ -744,12 +797,14 @@ private:
     bool m_component_profile_enabled = false;
     std::optional<ov::InferRequest> m_backbone_probe_request;
     bool m_backbone_probe_has_beam_idx = false;
+    std::optional<ov::InferRequest> m_lm_head_probe_request;
     std::vector<uint64_t> m_draft_inference_us;
     std::vector<uint64_t> m_selector_inference_us;
     std::vector<uint64_t> m_path_selection_us;
     std::vector<uint64_t> m_backbone_profile_us;
     std::vector<uint64_t> m_lm_head_profile_us;
     std::vector<uint64_t> m_backbone_probe_inference_us;
+    std::vector<uint64_t> m_lm_head_probe_inference_us;
     std::vector<uint64_t> m_input_preparation_us;
     std::vector<uint64_t> m_output_materialization_us;
     std::vector<uint64_t> m_hidden_materialization_us;
@@ -830,13 +885,15 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                                                         m_rt_info.input_embedding_scale);
     }
     std::shared_ptr<ov::Model> backbone_probe_model;
+    std::shared_ptr<ov::Model> lm_head_probe_model;
     if (dflash_component_profile_enabled()) {
         backbone_probe_model = draft_model_desc_for_runner.model->clone();
+        lm_head_probe_model = build_lm_head_probe_model(main_model);
     }
     if (needs_lm_head_graft) {
         utils::dflash::attach_target_lm_head_to_draft(main_model,
                                                       draft_model_desc_for_runner.model,
-                                                      m_selector_enabled);
+                                                      m_selector_enabled || dflash_component_profile_enabled());
     }
 
     const bool target_has_linear_attention = utils::get_cache_types(*main_model).has_linear();
@@ -887,6 +944,11 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
         backbone_probe_model_desc = draft_model_desc_for_runner;
         backbone_probe_model_desc->model = backbone_probe_model;
     }
+    std::optional<ov::genai::ModelDesc> lm_head_probe_model_desc;
+    if (lm_head_probe_model) {
+        lm_head_probe_model_desc = draft_model_desc_for_runner;
+        lm_head_probe_model_desc->model = lm_head_probe_model;
+    }
 
     m_draft = std::make_shared<DFlashCBDraftRunner>(draft_model_desc_for_runner,
                                                     m_tokenizer,
@@ -895,7 +957,8 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                                                     selector_rt_info,
                                                     m_selector_enabled,
                                                     draft_embedding_model,
-                                                    std::move(backbone_probe_model_desc));
+                                                    std::move(backbone_probe_model_desc),
+                                                    std::move(lm_head_probe_model_desc));
 
     if (is_vlm_dflash) {
         m_main_pipeline = std::make_shared<ContinuousBatchingForSpeculativeDecodingImpl>(
