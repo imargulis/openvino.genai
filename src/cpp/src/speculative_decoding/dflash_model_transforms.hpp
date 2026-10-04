@@ -35,6 +35,7 @@ struct DFlashRTInfo {
 struct DFlashSelectorRTInfo {
     bool selector_mode = false;
     int64_t dflash_version = 0;
+    std::string interface;
     std::string score_semantics;
     size_t top_k = 0;
     size_t hidden_size = 0;
