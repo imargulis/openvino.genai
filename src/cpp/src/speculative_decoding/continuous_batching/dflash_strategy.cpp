@@ -56,6 +56,11 @@ bool dflash_device_profile_enabled() {
     return value != nullptr && std::string(value) != "0";
 }
 
+bool dflash_component_profile_enabled() {
+    const char* value = std::getenv("OPENVINO_DFLASH_COMPONENT_PROFILE");
+    return value != nullptr && std::string(value) != "0";
+}
+
 std::vector<float> zero_log_probs(size_t count) {
     return std::vector<float>(count, 0.0f);
 }
@@ -111,7 +116,8 @@ public:
                         const ov::genai::ModelDesc& selector_model_desc,
                         const ov::genai::utils::dflash::DFlashSelectorRTInfo& selector_rt_info,
                         bool selector_enabled,
-                        EmbeddingsModel::Ptr embedding_model = nullptr)
+                        EmbeddingsModel::Ptr embedding_model = nullptr,
+                        std::optional<ov::genai::ModelDesc> backbone_probe_model_desc = std::nullopt)
         : m_tokenizer(tokenizer),
           m_embedding_model(std::move(embedding_model)),
           m_request(create_draft_infer_request(model_desc,
@@ -123,8 +129,17 @@ public:
           m_candidate_position_offset(rt_info.candidate_position_offset),
           m_selector_enabled(selector_enabled),
           m_selector_info(selector_rt_info),
-          m_timing_profile_enabled(dflash_timing_profile_enabled() || dflash_device_profile_enabled()),
-          m_device_profile_enabled(dflash_device_profile_enabled()) {
+          m_timing_profile_enabled(dflash_timing_profile_enabled() || dflash_device_profile_enabled() ||
+                                   dflash_component_profile_enabled()),
+          m_device_profile_enabled(dflash_device_profile_enabled()),
+          m_component_profile_enabled(dflash_component_profile_enabled()) {
+        if (m_component_profile_enabled && backbone_probe_model_desc.has_value()) {
+            m_backbone_probe_request = create_backbone_probe_request(*backbone_probe_model_desc,
+                                                                      static_cast<bool>(m_embedding_model),
+                                                                      rt_info.dflash_version);
+            m_backbone_probe_has_beam_idx =
+                has_compiled_input(m_backbone_probe_request->get_compiled_model(), "beam_idx");
+        }
         if (m_selector_enabled) {
             auto selector_desc = selector_model_desc;
             if (selector_desc.device.empty()) {
@@ -177,6 +192,7 @@ public:
     }
 
     DFlashDraftOutputs infer(int64_t seed_token, const ov::Tensor& hidden_delta, size_t candidate_count) {
+        const auto preparation_start = std::chrono::steady_clock::now();
         OPENVINO_ASSERT(hidden_delta && hidden_delta.get_size() > 0, "DFlash hidden delta must be provided.");
         const auto hidden_delta_shape = hidden_delta.get_shape();
         OPENVINO_ASSERT(hidden_delta_shape.size() == 3 && hidden_delta_shape[1] == BATCH_SIZE,
@@ -189,24 +205,41 @@ public:
         m_request.set_tensor("hidden_states", hidden_delta);
         m_request.set_tensor("position_ids", position_ids);
         m_request.set_tensor("attention_mask", attention_mask);
+        if (m_backbone_probe_request) {
+            m_backbone_probe_request->set_tensor("hidden_states", hidden_delta);
+            m_backbone_probe_request->set_tensor("position_ids", position_ids);
+            m_backbone_probe_request->set_tensor("attention_mask", attention_mask);
+        }
         if (m_embedding_model) {
             CircularBufferQueueElementGuard<EmbeddingsRequest> embeddings_request_guard(
                 m_embedding_model->get_request_queue().get());
             ov::Tensor input_embeds = m_embedding_model->infer(embeddings_request_guard.get(), input_ids);
             m_request.set_tensor("inputs_embeds", input_embeds);
+            if (m_backbone_probe_request) {
+                m_backbone_probe_request->set_tensor("inputs_embeds", input_embeds);
+            }
             // The embeddings request owns input_embeds. Keep it reserved until
             // synchronous draft inference has consumed that tensor.
+            record_input_preparation(preparation_start);
             update_inference_time(execute_inference());
+            execute_backbone_probe();
         } else {
             m_request.set_tensor("input_ids", input_ids);
+            if (m_backbone_probe_request) {
+                m_backbone_probe_request->set_tensor("input_ids", input_ids);
+            }
+            record_input_preparation(preparation_start);
             update_inference_time(execute_inference());
+            execute_backbone_probe();
         }
         m_committed_context_length += hidden_delta_length;
+        const auto output_materialization_start = std::chrono::steady_clock::now();
         DFlashDraftOutputs outputs;
         outputs.logits = m_request.get_tensor("logits");
         if (m_selector_enabled) {
             outputs.hidden_states = m_request.get_tensor("last_hidden_state");
         }
+        record_output_materialization(output_materialization_start);
         return outputs;
     }
 
@@ -384,6 +417,70 @@ public:
         }
     }
 
+    void record_hidden_materialization(std::chrono::steady_clock::time_point start) {
+        if (!m_component_profile_enabled) {
+            return;
+        }
+        m_hidden_materialization_us.push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
+    }
+
+    void record_proposal_envelope(std::chrono::steady_clock::time_point start) {
+        if (!m_component_profile_enabled) {
+            return;
+        }
+        const auto measured_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+        const auto probe_us =
+            m_backbone_probe_inference_us.empty() ? uint64_t{0} : m_backbone_probe_inference_us.back();
+        OPENVINO_ASSERT(measured_us >= probe_us,
+                        "DFlash component probe duration exceeds the enclosing proposal duration.");
+        m_proposal_envelope_us.push_back(measured_us - probe_us);
+    }
+
+    void print_component_profile() const {
+        if (!m_component_profile_enabled || m_draft_inference_us.empty() ||
+            m_backbone_probe_inference_us.empty()) {
+            return;
+        }
+
+        const auto mean_us = [](const std::vector<uint64_t>& values, size_t skip = 0) {
+            const auto begin = values.begin() + std::min(skip, values.size() - 1);
+            return static_cast<double>(std::accumulate(begin, values.end(), uint64_t{0})) /
+                   std::distance(begin, values.end());
+        };
+        const auto full_draft_us = mean_us(m_draft_inference_us, 2);
+        const auto backbone_us = mean_us(m_backbone_probe_inference_us, 2);
+        const auto head_increment_us = std::max(0.0, full_draft_us - backbone_us);
+        const auto hidden_materialization_us =
+            m_hidden_materialization_us.empty() ? 0.0 : mean_us(m_hidden_materialization_us, 2);
+        const auto input_preparation_us =
+            m_input_preparation_us.empty() ? 0.0 : mean_us(m_input_preparation_us, 2);
+        const auto output_materialization_us =
+            m_output_materialization_us.empty() ? 0.0 : mean_us(m_output_materialization_us, 2);
+        const auto selector_us =
+            m_selector_inference_us.empty() ? 0.0 : mean_us(m_selector_inference_us, 2);
+        const auto path_us =
+            m_path_selection_us.empty() ? 0.0 : mean_us(m_path_selection_us, 2);
+        const auto total_us = hidden_materialization_us + input_preparation_us + full_draft_us +
+                              output_materialization_us + selector_us + path_us;
+        const auto proposal_envelope_us =
+            m_proposal_envelope_us.empty() ? 0.0 : mean_us(m_proposal_envelope_us, 2);
+
+        std::cout << "DFlash component wall profile (steady state after first two proposal stages, ms): "
+                  << "hidden materialization=" << hidden_materialization_us / 1000.0
+                  << ", draft input preparation=" << input_preparation_us / 1000.0
+                  << ", backbone-only mirror=" << backbone_us / 1000.0
+                  << ", grafted lm_head incremental=" << head_increment_us / 1000.0
+                  << ", full draft infer=" << full_draft_us / 1000.0
+                  << ", output materialization=" << output_materialization_us / 1000.0
+                  << ", selector=" << selector_us / 1000.0
+                  << ", host candidate/path=" << path_us / 1000.0
+                  << ", total before verification=" << total_us / 1000.0
+                  << ", measured proposal envelope=" << proposal_envelope_us / 1000.0
+                  << "\n";
+    }
+
     size_t get_consumed_hidden_states() const {
         return m_committed_context_length;
     }
@@ -401,6 +498,12 @@ private:
         if (m_has_beam_idx) {
             m_request.set_tensor("beam_idx", m_beam_idx);
         }
+        if (m_backbone_probe_request) {
+            m_backbone_probe_request->reset_state();
+            if (m_backbone_probe_has_beam_idx) {
+                m_backbone_probe_request->set_tensor("beam_idx", m_beam_idx);
+            }
+        }
         m_raw_perf_metrics.m_inference_durations = {MicroSeconds(0.0f)};
         m_raw_perf_metrics.m_durations.clear();
         m_raw_perf_metrics.m_batch_sizes.clear();
@@ -409,6 +512,11 @@ private:
         m_path_selection_us.clear();
         m_backbone_profile_us.clear();
         m_lm_head_profile_us.clear();
+        m_backbone_probe_inference_us.clear();
+        m_input_preparation_us.clear();
+        m_output_materialization_us.clear();
+        m_hidden_materialization_us.clear();
+        m_proposal_envelope_us.clear();
     }
 
     static ov::InferRequest create_draft_infer_request(const ov::genai::ModelDesc& model_desc,
@@ -454,6 +562,36 @@ private:
             auto kv_axes_pos = utils::get_kv_axes_pos(model_desc.model);
             auto npu_compile_result = utils::compile_decoder_for_npu(model_desc.model, compile_properties, kv_axes_pos);
             return npu_compile_result.first.create_infer_request();
+        }
+        return utils::singleton_core()
+            .compile_model(model_desc.model, model_desc.device, compile_properties)
+            .create_infer_request();
+    }
+
+    static ov::InferRequest create_backbone_probe_request(const ov::genai::ModelDesc& model_desc,
+                                                          bool use_external_embeddings,
+                                                          int64_t dflash_version) {
+        OPENVINO_ASSERT(model_desc.model, "DFlash backbone probe model cannot be null.");
+        OPENVINO_ASSERT(utils::has_input(model_desc.model, "hidden_states"),
+                        "DFlash backbone probe must have a 'hidden_states' input.");
+        OPENVINO_ASSERT(utils::has_input(model_desc.model, "position_ids") &&
+                            utils::has_input(model_desc.model, "attention_mask"),
+                        "DFlash backbone probe must have position_ids and attention_mask inputs.");
+        OPENVINO_ASSERT(model_has_output(model_desc.model, "last_hidden_state"),
+                        "DFlash backbone probe must expose 'last_hidden_state'.");
+        if (use_external_embeddings) {
+            OPENVINO_ASSERT(utils::has_input(model_desc.model, "inputs_embeds"),
+                            "DFlash VLM backbone probe must have an 'inputs_embeds' input.");
+        } else {
+            OPENVINO_ASSERT(utils::has_input(model_desc.model, "input_ids"),
+                            "DFlash backbone probe must have an 'input_ids' input.");
+        }
+
+        auto compile_properties = model_desc.properties;
+        if (dflash_version == 2 && model_desc.device.find("GPU") != std::string::npos &&
+            compile_properties.count(ACTIVATIONS_SCALE_FACTOR_PROPERTY) == 0) {
+            compile_properties[ACTIVATIONS_SCALE_FACTOR_PROPERTY] =
+                get_dflash2_gpu_activations_scale_factor(model_desc.model);
         }
         return utils::singleton_core()
             .compile_model(model_desc.model, model_desc.device, compile_properties)
@@ -507,6 +645,18 @@ private:
         return duration_us;
     }
 
+    void execute_backbone_probe() {
+        if (!m_backbone_probe_request) {
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        m_backbone_probe_request->infer();
+        if (m_component_profile_enabled) {
+            m_backbone_probe_inference_us.push_back(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
+        }
+    }
+
     uint64_t execute_selector_inference() {
         auto start = std::chrono::steady_clock::now();
         m_selector_request->infer();
@@ -543,6 +693,22 @@ private:
         m_lm_head_profile_us.push_back(lm_head_us);
     }
 
+    void record_input_preparation(std::chrono::steady_clock::time_point start) {
+        if (!m_component_profile_enabled) {
+            return;
+        }
+        m_input_preparation_us.push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
+    }
+
+    void record_output_materialization(std::chrono::steady_clock::time_point start) {
+        if (!m_component_profile_enabled) {
+            return;
+        }
+        m_output_materialization_us.push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
+    }
+
     void record_path_duration(std::chrono::steady_clock::time_point start) {
         if (!m_timing_profile_enabled) {
             return;
@@ -575,11 +741,19 @@ private:
     std::mt19937 m_selector_rng;
     bool m_timing_profile_enabled = false;
     bool m_device_profile_enabled = false;
+    bool m_component_profile_enabled = false;
+    std::optional<ov::InferRequest> m_backbone_probe_request;
+    bool m_backbone_probe_has_beam_idx = false;
     std::vector<uint64_t> m_draft_inference_us;
     std::vector<uint64_t> m_selector_inference_us;
     std::vector<uint64_t> m_path_selection_us;
     std::vector<uint64_t> m_backbone_profile_us;
     std::vector<uint64_t> m_lm_head_profile_us;
+    std::vector<uint64_t> m_backbone_probe_inference_us;
+    std::vector<uint64_t> m_input_preparation_us;
+    std::vector<uint64_t> m_output_materialization_us;
+    std::vector<uint64_t> m_hidden_materialization_us;
+    std::vector<uint64_t> m_proposal_envelope_us;
 };
 
 ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
@@ -655,6 +829,10 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                                                         draft_model_desc_for_runner.model,
                                                         m_rt_info.input_embedding_scale);
     }
+    std::shared_ptr<ov::Model> backbone_probe_model;
+    if (dflash_component_profile_enabled()) {
+        backbone_probe_model = draft_model_desc_for_runner.model->clone();
+    }
     if (needs_lm_head_graft) {
         utils::dflash::attach_target_lm_head_to_draft(main_model,
                                                       draft_model_desc_for_runner.model,
@@ -700,6 +878,15 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
         draft_model_desc_for_runner.device = main_model_desc.device;
     }
     utils::dflash::reshape_draft_hidden_states_input_for_cb(draft_model_desc_for_runner.model);
+    if (backbone_probe_model) {
+        utils::dflash::reshape_draft_hidden_states_input_for_cb(backbone_probe_model);
+    }
+
+    std::optional<ov::genai::ModelDesc> backbone_probe_model_desc;
+    if (backbone_probe_model) {
+        backbone_probe_model_desc = draft_model_desc_for_runner;
+        backbone_probe_model_desc->model = backbone_probe_model;
+    }
 
     m_draft = std::make_shared<DFlashCBDraftRunner>(draft_model_desc_for_runner,
                                                     m_tokenizer,
@@ -707,7 +894,8 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                                                     selector_model_desc,
                                                     selector_rt_info,
                                                     m_selector_enabled,
-                                                    draft_embedding_model);
+                                                    draft_embedding_model,
+                                                    std::move(backbone_probe_model_desc));
 
     if (is_vlm_dflash) {
         m_main_pipeline = std::make_shared<ContinuousBatchingForSpeculativeDecodingImpl>(
@@ -933,7 +1121,10 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
 
         const int64_t seed_token = state.generated_tokens.back();
         validate_hidden_prefix_length(state);
+        const auto proposal_start = std::chrono::steady_clock::now();
+        const auto hidden_materialization_start = std::chrono::steady_clock::now();
         auto hidden_delta = materialize_pending_hidden_delta(state);
+        m_draft->record_hidden_materialization(hidden_materialization_start);
         auto draft_outputs = m_draft->infer(seed_token, hidden_delta, draft_count);
         clear_pending_hidden_delta(state);
         std::vector<DraftCandidateToken> candidates;
@@ -981,6 +1172,7 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
                                                       {},
                                                       nullptr,
                                                       std::move(aligned_proposals)));
+        m_draft->record_proposal_envelope(proposal_start);
         m_main_pipeline->update_request(request_id, candidate_sequences, false);
     }
     const auto draft_end = std::chrono::steady_clock::now();
@@ -1090,6 +1282,7 @@ ov::genai::RawPerfMetrics ContinuousBatchingPipeline::DFlashDecodingImpl::collec
     }
 
     m_draft->print_timing_profile();
+    m_draft->print_component_profile();
     const auto& draft_metrics = m_draft->get_raw_perf_metrics();
     const size_t inferences_per_stage = m_selector_enabled ? 2 : 1;
     OPENVINO_ASSERT(draft_metrics.m_durations.size() ==
