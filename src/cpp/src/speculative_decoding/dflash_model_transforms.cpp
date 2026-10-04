@@ -358,6 +358,9 @@ void apply_dflash_selector_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap
     if (auto version = get_rt_info_value<std::string>(model, {"dflash_selector", "dflash_version"})) {
         properties["dflash_selector_version"] = static_cast<int64_t>(std::stoll(*version));
     }
+    if (auto interface = get_rt_info_value<std::string>(model, {"dflash_selector", "interface"})) {
+        properties["dflash_selector_interface"] = *interface;
+    }
     if (auto semantics = get_rt_info_value<std::string>(model, {"dflash_selector", "score_semantics"})) {
         properties["dflash_selector_score_semantics"] = *semantics;
     }
@@ -392,6 +395,7 @@ DFlashSelectorRTInfo extract_dflash_selector_info_from_config(ov::AnyMap& config
         return value;
     };
     info.dflash_version = extract_required("dflash_selector_version").as<int64_t>();
+    info.interface = extract_required("dflash_selector_interface").as<std::string>();
     info.score_semantics = extract_required("dflash_selector_score_semantics").as<std::string>();
     info.top_k = extract_required("dflash_selector_top_k").as<size_t>();
     info.hidden_size = extract_required("dflash_selector_hidden_size").as<size_t>();
@@ -404,6 +408,10 @@ void validate_dflash_selector_model(const std::shared_ptr<ov::Model>& model,
     OPENVINO_ASSERT(model, "DFlash-2 selector model cannot be null.");
     OPENVINO_ASSERT(info.selector_mode, "DFlash-2 selector RT info must enable selector_mode.");
     OPENVINO_ASSERT(info.dflash_version == 2, "DFlash-2 selector version must be 2.");
+    OPENVINO_ASSERT(info.interface == "topk_lattice_v1",
+                    "Unsupported DFlash-2 selector interface: ",
+                    info.interface,
+                    ".");
     OPENVINO_ASSERT(info.score_semantics == "unary_inclusive",
                     "DFlash-2 selector score_semantics must be 'unary_inclusive'.");
     OPENVINO_ASSERT(info.top_k > 0 && info.hidden_size > 0 && info.vocab_size > 0,
@@ -432,33 +440,37 @@ void validate_dflash_selector_model(const std::shared_ptr<ov::Model>& model,
                         "DFlash-2 selector input '", name, "' has an incompatible rank.");
         return shape;
     };
-    const auto candidate_shape = validate_input("candidate_ids", ov::element::i64, 3);
-    const auto unary_shape = validate_input("unary_logits", ov::element::f32, 3);
+    const auto logits_shape = validate_input("draft_logits", ov::element::f32, 3);
     const auto hidden_shape = validate_input("draft_hidden_states", ov::element::f32, 3);
     validate_input("anchor_token_ids", ov::element::i64, 1);
-    for (const auto& shape : {candidate_shape, unary_shape}) {
-        OPENVINO_ASSERT(shape[2].is_dynamic() ||
-                            static_cast<size_t>(shape[2].get_length()) == info.top_k,
-                        "DFlash-2 selector candidate K dimension does not match metadata.");
-    }
+    OPENVINO_ASSERT(logits_shape[2].is_dynamic() ||
+                        static_cast<size_t>(logits_shape[2].get_length()) == info.vocab_size,
+                    "DFlash-2 selector logits vocabulary size does not match metadata.");
     OPENVINO_ASSERT(hidden_shape[2].is_dynamic() ||
                         static_cast<size_t>(hidden_shape[2].get_length()) == info.hidden_size,
                     "DFlash-2 selector hidden size does not match metadata.");
-    OPENVINO_ASSERT(model->outputs().size() == 1,
-                    "DFlash-2 selector must expose exactly one output.");
-    const auto output = model->output();
-    OPENVINO_ASSERT(output.get_names().count("edge_scores") != 0,
-                    "DFlash-2 selector output must be named 'edge_scores'.");
-    OPENVINO_ASSERT(output.get_element_type() == ov::element::f32,
+    OPENVINO_ASSERT(model->outputs().size() == 2,
+                    "DFlash-2 selector must expose edge_scores and candidate_ids outputs.");
+    const auto edge_scores = model->output("edge_scores");
+    OPENVINO_ASSERT(edge_scores.get_element_type() == ov::element::f32,
                     "DFlash-2 selector edge_scores must be FP32.");
-    const auto output_shape = output.get_partial_shape();
-    OPENVINO_ASSERT(output_shape.rank().is_static() && output_shape.rank().get_length() == 4,
+    const auto edge_scores_shape = edge_scores.get_partial_shape();
+    OPENVINO_ASSERT(edge_scores_shape.rank().is_static() && edge_scores_shape.rank().get_length() == 4,
                     "DFlash-2 selector edge_scores must have rank 4.");
     for (size_t axis : {2, 3}) {
-        OPENVINO_ASSERT(output_shape[axis].is_dynamic() ||
-                            static_cast<size_t>(output_shape[axis].get_length()) == info.top_k,
+        OPENVINO_ASSERT(edge_scores_shape[axis].is_dynamic() ||
+                            static_cast<size_t>(edge_scores_shape[axis].get_length()) == info.top_k,
                         "DFlash-2 selector edge-score K dimensions do not match metadata.");
     }
+    const auto candidate_ids = model->output("candidate_ids");
+    OPENVINO_ASSERT(candidate_ids.get_element_type() == ov::element::i64,
+                    "DFlash-2 selector candidate_ids must be I64.");
+    const auto candidate_shape = candidate_ids.get_partial_shape();
+    OPENVINO_ASSERT(candidate_shape.rank().is_static() && candidate_shape.rank().get_length() == 3,
+                    "DFlash-2 selector candidate_ids must have rank 3.");
+    OPENVINO_ASSERT(candidate_shape[2].is_dynamic() ||
+                        static_cast<size_t>(candidate_shape[2].get_length()) == info.top_k,
+                    "DFlash-2 selector candidate_ids K dimension does not match metadata.");
 }
 
 void reshape_draft_hidden_states_input_for_cb(std::shared_ptr<ov::Model>& model) {
