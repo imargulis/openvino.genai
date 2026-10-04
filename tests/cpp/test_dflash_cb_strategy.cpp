@@ -12,9 +12,9 @@
 
 #include "openvino/op/add.hpp"
 #include "openvino/op/assign.hpp"
-#include "openvino/op/broadcast.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
+#include "openvino/op/convert.hpp"
 #include "openvino/op/gather.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
@@ -23,6 +23,8 @@
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
+#include "openvino/op/tile.hpp"
+#include "openvino/op/topk.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/variable.hpp"
@@ -131,12 +133,9 @@ std::shared_ptr<ov::Model> make_dflash_draft_hidden_states_model(const ov::Parti
 }
 
 std::shared_ptr<ov::Model> make_dflash_selector_model() {
-    auto candidate_ids =
-        std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{1, -1, 2});
-    candidate_ids->output(0).set_names({"candidate_ids"});
-    auto unary_logits =
-        std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, -1, 2});
-    unary_logits->output(0).set_names({"unary_logits"});
+    auto draft_logits =
+        std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, -1, 16});
+    draft_logits->output(0).set_names({"draft_logits"});
     auto draft_hidden_states =
         std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, -1, 4});
     draft_hidden_states->output(0).set_names({"draft_hidden_states"});
@@ -144,19 +143,29 @@ std::shared_ptr<ov::Model> make_dflash_selector_model() {
         std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{1});
     anchor_token_ids->output(0).set_names({"anchor_token_ids"});
 
+    auto top_k = std::make_shared<ov::op::v11::TopK>(
+        draft_logits,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {2}),
+        -1,
+        ov::op::v11::TopK::Mode::MAX,
+        ov::op::v11::TopK::SortType::SORT_VALUES);
+    auto candidate_ids = std::make_shared<ov::op::v0::Convert>(top_k->output(1), ov::element::i64);
+    candidate_ids->output(0).set_names({"candidate_ids"});
     auto unsqueeze = std::make_shared<ov::op::v0::Unsqueeze>(
-        unary_logits,
+        top_k->output(0),
         ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {2}));
-    auto broadcast = std::make_shared<ov::op::v3::Broadcast>(
+    auto edge_scores = std::make_shared<ov::op::v0::Tile>(
         unsqueeze,
-        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {1, 2, 2, 2}));
-    auto result = std::make_shared<ov::op::v0::Result>(broadcast);
-    result->output(0).set_names({"edge_scores"});
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {1, 1, 2, 1}));
+    auto edge_scores_result = std::make_shared<ov::op::v0::Result>(edge_scores);
+    edge_scores_result->output(0).set_names({"edge_scores"});
+    auto candidate_ids_result = std::make_shared<ov::op::v0::Result>(candidate_ids);
     auto model = std::make_shared<ov::Model>(
-        ov::ResultVector{result},
-        ov::ParameterVector{candidate_ids, unary_logits, draft_hidden_states, anchor_token_ids});
+        ov::ResultVector{edge_scores_result, candidate_ids_result},
+        ov::ParameterVector{draft_logits, draft_hidden_states, anchor_token_ids});
     model->set_rt_info(true, "dflash_selector_mode");
     model->set_rt_info(std::string("2"), {"dflash_selector", "dflash_version"});
+    model->set_rt_info(std::string("topk_lattice_v1"), {"dflash_selector", "interface"});
     model->set_rt_info(std::string("unary_inclusive"), {"dflash_selector", "score_semantics"});
     model->set_rt_info(std::string("2"), {"dflash_selector", "top_k"});
     model->set_rt_info(std::string("4"), {"dflash_selector", "hidden_size"});
@@ -306,6 +315,7 @@ TEST(DFlashModelTransforms, AppliesExtractsAndValidatesSelectorRtInfo) {
 
     ASSERT_TRUE(info.selector_mode);
     ASSERT_EQ(info.dflash_version, 2);
+    ASSERT_EQ(info.interface, "topk_lattice_v1");
     ASSERT_EQ(info.score_semantics, "unary_inclusive");
     ASSERT_EQ(info.top_k, 2);
     ASSERT_EQ(info.hidden_size, 4);
@@ -328,6 +338,7 @@ TEST(DFlashModelTransforms, RejectsStatefulSelector) {
     ov::genai::utils::dflash::DFlashSelectorRTInfo info{
         true,
         2,
+        "topk_lattice_v1",
         "unary_inclusive",
         2,
         4,

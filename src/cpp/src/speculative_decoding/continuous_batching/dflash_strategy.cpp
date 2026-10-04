@@ -7,7 +7,7 @@
 #include <cmath>
 #include <iterator>
 #include <limits>
-#include <queue>
+#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
@@ -241,61 +241,32 @@ public:
                         "DFlash-2 draft hidden size does not match selector metadata.");
 
         const size_t top_k = m_selector_info.top_k;
-        ov::Tensor candidate_ids(ov::element::i64, {BATCH_SIZE, candidate_count, top_k});
-        ov::Tensor unary_logits(ov::element::f32, {BATCH_SIZE, candidate_count, top_k});
-        auto* candidate_data = candidate_ids.data<int64_t>();
-        auto* unary_data = unary_logits.data<float>();
-        const auto* logits_data = outputs.logits.data<const float>();
-        const size_t vocab_size = logits_shape[2];
-
-        using RankedCandidate = std::pair<float, int64_t>;
-        for (size_t position = 0; position < candidate_count; ++position) {
-            std::priority_queue<RankedCandidate,
-                                std::vector<RankedCandidate>,
-                                std::greater<RankedCandidate>>
-                heap;
-            const auto* position_logits = logits_data + position * vocab_size;
-            for (size_t token = 0; token < vocab_size; ++token) {
-                const RankedCandidate candidate{position_logits[token], static_cast<int64_t>(token)};
-                if (heap.size() < top_k) {
-                    heap.push(candidate);
-                } else if (candidate > heap.top()) {
-                    heap.pop();
-                    heap.push(candidate);
-                }
-            }
-            std::vector<RankedCandidate> ranked(top_k);
-            for (size_t index = top_k; index-- > 0;) {
-                ranked[index] = heap.top();
-                heap.pop();
-            }
-            for (size_t index = 0; index < top_k; ++index) {
-                float value = ranked[index].first * m_output_multiplier;
-                if (m_final_logit_softcapping > 0.0f) {
-                    value = std::tanh(value / m_final_logit_softcapping) * m_final_logit_softcapping;
-                }
-                candidate_data[position * top_k + index] = ranked[index].second;
-                unary_data[position * top_k + index] = value;
-            }
-        }
+        ov::Tensor draft_logits(outputs.logits,
+                                ov::Coordinate{0, 0, 0},
+                                ov::Coordinate{BATCH_SIZE, candidate_count, logits_shape[2]});
 
         ov::Tensor hidden_states(outputs.hidden_states,
                                  ov::Coordinate{0, 0, 0},
                                  ov::Coordinate{1, candidate_count, hidden_shape[2]});
         ov::Tensor anchor_ids(ov::element::i64, {BATCH_SIZE});
         anchor_ids.data<int64_t>()[0] = anchor_token;
-        m_selector_request->set_tensor("candidate_ids", candidate_ids);
-        m_selector_request->set_tensor("unary_logits", unary_logits);
+        m_selector_request->set_tensor("draft_logits", draft_logits);
         m_selector_request->set_tensor("draft_hidden_states", hidden_states);
         m_selector_request->set_tensor("anchor_token_ids", anchor_ids);
         update_inference_time(execute_selector_inference());
 
         const auto edge_scores = m_selector_request->get_tensor("edge_scores");
+        const auto candidate_ids = m_selector_request->get_tensor("candidate_ids");
         OPENVINO_ASSERT(edge_scores.get_element_type() == ov::element::f32,
                         "DFlash-2 selector edge_scores must be FP32.");
+        OPENVINO_ASSERT(candidate_ids.get_element_type() == ov::element::i64,
+                        "DFlash-2 selector candidate_ids must be I64.");
         const auto edge_shape = edge_scores.get_shape();
         OPENVINO_ASSERT(edge_shape == ov::Shape({BATCH_SIZE, candidate_count, top_k, top_k}),
                         "DFlash-2 selector edge_scores shape does not match [1, S, K, K].");
+        OPENVINO_ASSERT(candidate_ids.get_shape() == ov::Shape({BATCH_SIZE, candidate_count, top_k}),
+                        "DFlash-2 selector candidate_ids shape does not match [1, S, K].");
+        const auto* candidate_data = candidate_ids.data<const int64_t>();
         DFlashProposalResult result;
         result.candidates.reserve(candidate_count);
         const auto& sampling_params = m_sequence_group->get_sampling_parameters();
@@ -1029,17 +1000,26 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::drop_requests() {
 ov::genai::RawPerfMetrics ContinuousBatchingPipeline::DFlashDecodingImpl::collect_draft_raw_metrics() {
     ov::genai::RawPerfMetrics raw_metrics;
     raw_metrics.m_inference_durations = {MicroSeconds(0.0f)};
-    if (m_draft) {
-        auto& draft_metrics = m_draft->get_raw_perf_metrics();
-        raw_metrics.m_durations.insert(raw_metrics.m_durations.end(),
-                                       draft_metrics.m_durations.begin(),
-                                       draft_metrics.m_durations.end());
-        raw_metrics.m_batch_sizes.insert(raw_metrics.m_batch_sizes.end(),
-                                         draft_metrics.m_batch_sizes.begin(),
-                                         draft_metrics.m_batch_sizes.end());
-        if (!draft_metrics.m_inference_durations.empty()) {
-            raw_metrics.m_inference_durations[0] += draft_metrics.m_inference_durations[0];
-        }
+    if (!m_draft) {
+        return raw_metrics;
+    }
+
+    const auto& draft_metrics = m_draft->get_raw_perf_metrics();
+    const size_t inferences_per_stage = m_selector_enabled ? 2 : 1;
+    OPENVINO_ASSERT(draft_metrics.m_durations.size() ==
+                        draft_metrics.m_batch_sizes.size() * inferences_per_stage,
+                    "DFlash inference timings must contain one backbone inference and, when enabled, "
+                    "one selector inference per proposal stage.");
+
+    for (size_t stage = 0; stage < draft_metrics.m_batch_sizes.size(); ++stage) {
+        const auto first_inference = draft_metrics.m_durations.begin() + stage * inferences_per_stage;
+        const auto stage_duration =
+            std::accumulate(first_inference,
+                            first_inference + inferences_per_stage,
+                            MicroSeconds(0.0f));
+        raw_metrics.m_durations.push_back(stage_duration);
+        raw_metrics.m_batch_sizes.push_back(draft_metrics.m_batch_sizes[stage]);
+        raw_metrics.m_inference_durations[0] += stage_duration;
     }
     return raw_metrics;
 }
