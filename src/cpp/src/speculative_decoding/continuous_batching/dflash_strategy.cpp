@@ -565,6 +565,7 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                                                       m_selector_enabled);
     }
 
+    const bool target_has_linear_attention = utils::get_cache_types(*main_model).has_linear();
     const bool allow_score_aggregation = true;
     const bool allow_cache_rotation = false;
     const bool allow_xattention = false;
@@ -595,6 +596,10 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                     "to one active request and one running sequence.");
     m_generation_config = main_generation_config;
     auto target_scheduler_config = main_model_desc.scheduler_config;
+    target_scheduler_config.num_linear_attention_blocks =
+        dflash_cb::adjusted_linear_attention_block_count(target_scheduler_config.num_linear_attention_blocks,
+                                                          main_generation_config.num_assistant_tokens.value(),
+                                                          target_has_linear_attention);
     if (draft_model_desc_for_runner.device.empty()) {
         draft_model_desc_for_runner.device = main_model_desc.device;
     }
