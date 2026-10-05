@@ -254,6 +254,20 @@ TEST(DFlashCBHiddenDeltaBuffer, MergesChunksInOrder) {
     ASSERT_EQ(tensor_values(materialized), (std::vector<float>{0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f}));
 }
 
+TEST(DFlashCBHiddenDeltaBuffer, OwnsViewedChunksBeforeTheirSourceIsOverwritten) {
+    ov::genai::dflash_cb::HiddenDeltaBuffer buffer;
+    auto viewed = make_token_major_hidden_delta(2, 2, 0.0f);
+    auto copied = make_token_major_hidden_delta(1, 2, 4.0f);
+
+    buffer.append(viewed);
+    buffer.append(copied, /*copy_data=*/true);
+    std::fill_n(copied.data<float>(), copied.get_size(), -1.0f);
+    buffer.own_data();
+    std::fill_n(viewed.data<float>(), viewed.get_size(), -1.0f);
+
+    ASSERT_EQ(tensor_values(buffer.materialize()), (std::vector<float>{0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f}));
+}
+
 TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     auto model = make_annotated_stateful_sdpa_model();
     model->set_rt_info(true, "dflash_mode");
@@ -302,6 +316,38 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     properties["dflash_target_layer_ids"] = std::vector<int32_t>{1, 12, 23, 34, 45};
     properties["dflash_candidate_position_offset"] = size_t(2);
     EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(properties), ov::Exception);
+}
+
+TEST(DFlashModelTransforms, DetectsPerRowDraftFromLayoutMetadata) {
+    using namespace ov::genai::utils::dflash;
+    auto legacy_draft = make_dflash_export_backbone_model();
+    auto per_row_draft = make_dflash_export_backbone_model();
+    auto token_type_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{1, -1});
+    token_type_ids->output(0).set_names({"token_type_ids"});
+    per_row_draft->add_parameters({token_type_ids});
+    per_row_draft->set_rt_info(true, "dflash_mode");
+    per_row_draft->set_rt_info(std::string("151669"), {"dflash", "mask_token_id"});
+    per_row_draft->set_rt_info(std::string("1,2"), {"dflash", "target_layer_ids"});
+    per_row_draft->set_rt_info(std::string(PER_ROW_INPUT_LAYOUT), {"dflash", "input_layout"});
+
+    const DFlashRTInfo legacy_info;
+    ASSERT_FALSE(is_per_row_draft(legacy_draft, legacy_info));
+    // token_type_ids alone does not tell the layout apart from a newer export
+    EXPECT_THROW(is_per_row_draft(per_row_draft, legacy_info), ov::Exception);
+
+    ov::AnyMap properties;
+    apply_dflash_rt_info(per_row_draft, properties);
+    const auto per_row_info = extract_dflash_info_from_config(properties);
+    ASSERT_EQ(per_row_info.input_layout, PER_ROW_INPUT_LAYOUT);
+    ASSERT_TRUE(properties.empty());
+    ASSERT_TRUE(is_per_row_draft(per_row_draft, per_row_info));
+    EXPECT_THROW(is_per_row_draft(legacy_draft, per_row_info), ov::Exception);
+
+    properties["dflash_mode"] = true;
+    properties["dflash_mask_token_id"] = int64_t{151669};
+    properties["dflash_target_layer_ids"] = std::vector<int32_t>{1, 2};
+    properties["dflash_input_layout"] = std::string("sequence");
+    EXPECT_THROW(extract_dflash_info_from_config(properties), ov::Exception);
 }
 
 TEST(DFlashModelTransforms, RequiresDFlash2GpuActivationScaleMetadata) {
@@ -615,6 +661,24 @@ TEST(DFlashCBDraftInputs, BuildsAttentionMaskForFullDraftContext) {
     ASSERT_EQ(attention_mask_deepspec.get_shape(), ov::Shape({1, 10}));
     ASSERT_EQ(int64_tensor_values(attention_mask_deepspec),
               (std::vector<int64_t>{1, 1, 1, 1, 1, 1, 1, 1, 1, 1}));
+}
+
+TEST(DFlashCBDraftInputs, BuildsPerRowContextFollowedByBlock) {
+    auto block_input_ids = ov::genai::dflash_cb::build_draft_input_ids(42, 99, 2);
+
+    auto input_ids = ov::genai::dflash_cb::build_draft_row_input_ids(block_input_ids, 99, 2);
+    ASSERT_EQ(input_ids.get_shape(), ov::Shape({1, 5}));
+    ASSERT_EQ(int64_tensor_values(input_ids), (std::vector<int64_t>{99, 99, 42, 99, 99}));
+
+    auto hidden_states =
+        ov::genai::dflash_cb::build_draft_row_hidden_states(make_token_major_hidden_delta(2, 2, 1.0f), 3);
+    ASSERT_EQ(hidden_states.get_shape(), ov::Shape({5, 1, 2}));
+    ASSERT_EQ(tensor_values(hidden_states),
+              (std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}));
+
+    auto token_type_ids = ov::genai::dflash_cb::build_draft_token_type_ids(2, 3);
+    ASSERT_EQ(token_type_ids.get_shape(), ov::Shape({1, 5}));
+    ASSERT_EQ(int64_tensor_values(token_type_ids), (std::vector<int64_t>{0, 0, 1, 1, 1}));
 }
 
 TEST(DFlashCBVlmPromptIds, BuildsPlaceholderPromptIds) {
