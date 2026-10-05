@@ -40,23 +40,8 @@ struct DFlashProposalResult {
     std::vector<DraftProposal> proposals;
 };
 
-constexpr const char* ACTIVATIONS_SCALE_FACTOR_PROPERTY = "ACTIVATIONS_SCALE_FACTOR";
-constexpr float DFLASH2_GPU_MIN_ACTIVATIONS_SCALE_FACTOR = 32.0f;
-
 std::vector<float> zero_log_probs(size_t count) {
     return std::vector<float>(count, 0.0f);
-}
-
-float get_dflash2_gpu_activations_scale_factor(const std::shared_ptr<ov::Model>& model) {
-    const std::vector<std::string> rt_info_path = {"runtime_options", ACTIVATIONS_SCALE_FACTOR_PROPERTY};
-    float scale_factor = DFLASH2_GPU_MIN_ACTIVATIONS_SCALE_FACTOR;
-    if (model->has_rt_info(rt_info_path)) {
-        const float ir_scale_factor = model->get_rt_info<float>(rt_info_path);
-        OPENVINO_ASSERT(std::isfinite(ir_scale_factor) && ir_scale_factor > 0.0f,
-                        "DFlash-2 IR ACTIVATIONS_SCALE_FACTOR must be a finite positive number.");
-        scale_factor = std::max(ir_scale_factor, DFLASH2_GPU_MIN_ACTIVATIONS_SCALE_FACTOR);
-    }
-    return scale_factor;
 }
 
 bool has_compiled_input(const ov::CompiledModel& model, const std::string& name) {
@@ -104,7 +89,7 @@ public:
           m_request(create_draft_infer_request(model_desc,
                                                static_cast<bool>(m_embedding_model),
                                                selector_enabled,
-                                               rt_info.dflash_version)),
+                                               rt_info)),
           m_sampler(tokenizer),
           m_mask_token_id(rt_info.mask_token_id),
           m_candidate_position_offset(rt_info.candidate_position_offset),
@@ -334,7 +319,7 @@ private:
     static ov::InferRequest create_draft_infer_request(const ov::genai::ModelDesc& model_desc,
                                                         bool use_external_embeddings,
                                                         bool selector_enabled,
-                                                        int64_t dflash_version) {
+                                                        const ov::genai::utils::dflash::DFlashRTInfo& rt_info) {
         OPENVINO_ASSERT(model_desc.model, "DFlash draft model cannot be null.");
         OPENVINO_ASSERT(utils::has_input(model_desc.model, "hidden_states"),
                         "DFlash CB/PA draft model must have 'hidden_states' input.");
@@ -358,15 +343,7 @@ private:
                             "DFlash-2 selector mode requires draft 'last_hidden_state'.");
         }
         auto compile_properties = model_desc.properties;
-        if (dflash_version == 2 && model_desc.device.find("GPU") != std::string::npos &&
-            compile_properties.count(ACTIVATIONS_SCALE_FACTOR_PROPERTY) == 0) {
-            // Explicit compile properties take precedence. Otherwise promote
-            // the model's IR recommendation because the GPU plugin may classify
-            // the grafted stateful draft as an LLM and skip this RT-info hint.
-            // Legacy values below the validated safe minimum are clamped.
-            compile_properties[ACTIVATIONS_SCALE_FACTOR_PROPERTY] =
-                get_dflash2_gpu_activations_scale_factor(model_desc.model);
-        }
+        utils::dflash::apply_dflash_gpu_compile_properties(rt_info, model_desc.device, compile_properties);
         if (model_desc.device == "NPU") {
             auto kv_axes_pos = utils::get_kv_axes_pos(model_desc.model);
             auto npu_compile_result = utils::compile_decoder_for_npu(model_desc.model, compile_properties, kv_axes_pos);
