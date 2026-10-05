@@ -27,6 +27,7 @@ struct DFlashRTInfo {
     int64_t mask_token_id = -1;
     std::vector<int32_t> target_layer_ids;
     size_t candidate_position_offset = 1;
+    float gpu_min_activations_scale_factor = 0.0f;
     float input_embedding_scale = 1.0f;
     float output_multiplier = 1.0f;
     float final_logit_softcapping = 0.0f;
@@ -60,6 +61,17 @@ void apply_dflash_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap& propert
  * @brief Extracts and removes DFlash configuration from a properties map.
  */
 DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config);
+
+/**
+ * @brief Promotes DFlash-specific GPU requirements to explicit OpenVINO compile properties.
+ *
+ * The GPU plugin intentionally ignores generic activation-scale RT info for LLM graphs. DFlash-2
+ * therefore stores a GPU minimum in its own metadata, which GenAI applies explicitly when compiling
+ * the draft. A user-provided value above the minimum is preserved; a lower value is promoted.
+ */
+void apply_dflash_gpu_compile_properties(const DFlashRTInfo& info,
+                                         const std::string& device,
+                                         ov::AnyMap& compile_properties);
 
 void apply_dflash_selector_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap& properties);
 
