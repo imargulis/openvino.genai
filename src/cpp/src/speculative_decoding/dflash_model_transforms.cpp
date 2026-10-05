@@ -3,6 +3,9 @@
 
 #include "dflash_model_transforms.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <exception>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -20,6 +23,7 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/runtime/properties.hpp"
 
 #include "eagle3_model_transforms.hpp"
 #include "utils.hpp"
@@ -33,6 +37,19 @@ namespace {
 
 constexpr const char* DFLASH_HIDDEN_STATES_RT_INFO_KEY = "hidden_states_decoder_layers";
 constexpr const char* LAST_HIDDEN_STATE_OUTPUT_NAME = "last_hidden_state";
+constexpr const char* DFLASH_GPU_MIN_ACTIVATIONS_SCALE_FACTOR = "dflash_gpu_min_activations_scale_factor";
+
+float parse_dflash_gpu_min_activations_scale_factor(const std::string& value) {
+    try {
+        size_t parsed_characters = 0;
+        const float scale_factor = std::stof(value, &parsed_characters);
+        OPENVINO_ASSERT(parsed_characters == value.size() && std::isfinite(scale_factor) && scale_factor > 0.0f,
+                        "DFlash-2 gpu_min_activations_scale_factor must be a finite positive number.");
+        return scale_factor;
+    } catch (const std::exception&) {
+        OPENVINO_THROW("DFlash-2 gpu_min_activations_scale_factor must be a finite positive number.");
+    }
+}
 
 void add_dflash_hidden_state_result(std::shared_ptr<ov::Model>& model,
                                     const std::vector<ov::Output<ov::Node>>& hidden_state_outputs) {
@@ -278,6 +295,12 @@ void apply_dflash_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap& propert
     if (auto offset = get_rt_info_value<std::string>(model, {"dflash", "candidate_position_offset"})) {
         properties["dflash_candidate_position_offset"] = static_cast<size_t>(std::stoul(*offset));
     }
+    if (auto gpu_min_scale = get_rt_info_value<std::string>(
+            model,
+            {"dflash", "gpu_min_activations_scale_factor"})) {
+        properties[DFLASH_GPU_MIN_ACTIVATIONS_SCALE_FACTOR] =
+            parse_dflash_gpu_min_activations_scale_factor(*gpu_min_scale);
+    }
     if (auto input_scale = get_rt_info_value<std::string>(model, {"dflash", "input_embedding_scale"})) {
         properties["dflash_input_embedding_scale"] = std::stof(*input_scale);
     }
@@ -333,6 +356,16 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config) {
     } else {
         info.candidate_position_offset = 1;
     }
+    if (info.dflash_version == 2) {
+        auto gpu_min_scale_it = config.find(DFLASH_GPU_MIN_ACTIVATIONS_SCALE_FACTOR);
+        OPENVINO_ASSERT(gpu_min_scale_it != config.end(),
+                        "DFlash v2 draft model is missing dflash/gpu_min_activations_scale_factor metadata.");
+        info.gpu_min_activations_scale_factor = gpu_min_scale_it->second.as<float>();
+        OPENVINO_ASSERT(std::isfinite(info.gpu_min_activations_scale_factor) &&
+                            info.gpu_min_activations_scale_factor > 0.0f,
+                        "DFlash v2 gpu_min_activations_scale_factor must be a finite positive number.");
+        config.erase(gpu_min_scale_it);
+    }
     if (auto input_scale_it = config.find("dflash_input_embedding_scale"); input_scale_it != config.end()) {
         info.input_embedding_scale = input_scale_it->second.as<float>();
         config.erase(input_scale_it);
@@ -347,6 +380,27 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config) {
     }
 
     return info;
+}
+
+void apply_dflash_gpu_compile_properties(const DFlashRTInfo& info,
+                                         const std::string& device,
+                                         ov::AnyMap& compile_properties) {
+    if (!info.dflash_mode || info.dflash_version != 2 || device.find("GPU") == std::string::npos) {
+        return;
+    }
+
+    OPENVINO_ASSERT(std::isfinite(info.gpu_min_activations_scale_factor) &&
+                        info.gpu_min_activations_scale_factor > 0.0f,
+                    "DFlash v2 gpu_min_activations_scale_factor must be a finite positive number.");
+
+    const auto property_name = ov::hint::activations_scale_factor.name();
+    float requested_scale_factor = info.gpu_min_activations_scale_factor;
+    if (auto requested_it = compile_properties.find(property_name); requested_it != compile_properties.end()) {
+        requested_scale_factor = requested_it->second.as<float>();
+        OPENVINO_ASSERT(std::isfinite(requested_scale_factor),
+                        "ACTIVATIONS_SCALE_FACTOR must be finite when compiling a DFlash-2 GPU draft.");
+    }
+    compile_properties[property_name] = std::max(requested_scale_factor, info.gpu_min_activations_scale_factor);
 }
 
 void apply_dflash_selector_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap& properties) {
