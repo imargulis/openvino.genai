@@ -77,14 +77,19 @@ public:
             return;
         }
 
-        if (copy_data) {
-            ov::Tensor owned(hidden_delta.get_element_type(), shape);
-            copy_tensor_bytes(hidden_delta, owned);
-            m_chunks.push_back(owned);
-        } else {
-            m_chunks.push_back(hidden_delta);
-        }
+        m_chunks.push_back(copy_data ? owned_copy(hidden_delta) : hidden_delta);
+        m_owned.push_back(copy_data);
         m_token_count += token_count;
+    }
+
+    // Chunks appended without copy view a target output, which the next target inference overwrites.
+    void own_data() {
+        for (size_t idx = 0; idx < m_chunks.size(); ++idx) {
+            if (!m_owned[idx]) {
+                m_chunks[idx] = owned_copy(m_chunks[idx]);
+                m_owned[idx] = true;
+            }
+        }
     }
 
     bool empty() const {
@@ -129,11 +134,19 @@ public:
 
     void clear() {
         m_chunks.clear();
+        m_owned.clear();
         m_token_count = 0;
     }
 
 private:
+    static ov::Tensor owned_copy(const ov::Tensor& chunk) {
+        ov::Tensor owned(chunk.get_element_type(), chunk.get_shape());
+        copy_tensor_bytes(chunk, owned);
+        return owned;
+    }
+
     std::vector<ov::Tensor> m_chunks;
+    std::vector<bool> m_owned;
     size_t m_token_count = 0;
 };
 
@@ -215,6 +228,43 @@ inline ov::Tensor build_draft_attention_mask(size_t committed_context_length,
     ov::Tensor attention_mask(ov::element::i64, {1, attention_mask_length});
     std::fill_n(attention_mask.data<int64_t>(), attention_mask.get_size(), 1);
     return attention_mask;
+}
+
+// Per-row drafts take every per-token input over the new rows [context delta ; block]: input_ids is read in
+// the block rows and hidden_states in the context rows.
+inline ov::Tensor build_draft_row_input_ids(const ov::Tensor& block_input_ids,
+                                            int64_t mask_token_id,
+                                            size_t hidden_delta_length) {
+    const size_t block_length = block_input_ids.get_size();
+    ov::Tensor input_ids(ov::element::i64, {1, hidden_delta_length + block_length});
+    auto* data = input_ids.data<int64_t>();
+    // context rows read the target hidden states; their embedding is never used
+    std::fill_n(data, hidden_delta_length, mask_token_id);
+    std::copy_n(block_input_ids.data<const int64_t>(), block_length, data + hidden_delta_length);
+    return input_ids;
+}
+
+inline ov::Tensor build_draft_row_hidden_states(const ov::Tensor& hidden_delta, size_t block_length) {
+    const auto shape = hidden_delta.get_shape();
+    OPENVINO_ASSERT(shape.size() == 3 && shape[1] == 1,
+                    "DFlash hidden delta must have shape [seq_len, 1, hidden].");
+    ov::Tensor hidden_states(hidden_delta.get_element_type(), {shape[0] + block_length, 1, shape[2]});
+    ov::Tensor context_rows(hidden_states, ov::Coordinate{0, 0, 0}, ov::Coordinate{shape[0], 1, shape[2]});
+    hidden_delta.copy_to(context_rows);
+    // block rows read their own embeddings; their hidden states are never used
+    const size_t context_bytes = hidden_delta.get_byte_size();
+    std::memset(static_cast<uint8_t*>(hidden_states.data()) + context_bytes,
+                0,
+                hidden_states.get_byte_size() - context_bytes);
+    return hidden_states;
+}
+
+inline ov::Tensor build_draft_token_type_ids(size_t hidden_delta_length, size_t block_length) {
+    ov::Tensor token_type_ids(ov::element::i64, {1, hidden_delta_length + block_length});
+    auto* data = token_type_ids.data<int64_t>();
+    std::fill_n(data, hidden_delta_length, 0);
+    std::fill_n(data + hidden_delta_length, block_length, 1);
+    return token_type_ids;
 }
 
 inline size_t draft_candidate_count(size_t num_assistant_tokens, size_t generated_len, size_t max_new_tokens) {

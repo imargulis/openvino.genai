@@ -310,6 +310,9 @@ void apply_dflash_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap& propert
     if (auto softcap = get_rt_info_value<std::string>(model, {"dflash", "final_logit_softcapping"})) {
         properties["dflash_final_logit_softcapping"] = std::stof(*softcap);
     }
+    if (auto input_layout = get_rt_info_value<std::string>(model, {"dflash", "input_layout"})) {
+        properties["dflash_input_layout"] = *input_layout;
+    }
 }
 
 DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config) {
@@ -378,8 +381,33 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config) {
         info.final_logit_softcapping = softcap_it->second.as<float>();
         config.erase(softcap_it);
     }
+    if (auto layout_it = config.find("dflash_input_layout"); layout_it != config.end()) {
+        info.input_layout = layout_it->second.as<std::string>();
+        OPENVINO_ASSERT(info.input_layout == PER_ROW_INPUT_LAYOUT,
+                        "Unsupported DFlash draft input layout '",
+                        info.input_layout,
+                        "'. Supported layout is '",
+                        PER_ROW_INPUT_LAYOUT,
+                        "'.");
+        config.erase(layout_it);
+    }
 
     return info;
+}
+
+bool is_per_row_draft(const std::shared_ptr<ov::Model>& draft_model, const DFlashRTInfo& info) {
+    const bool has_token_type_ids = utils::has_input(draft_model, "token_type_ids");
+    if (info.input_layout.empty()) {
+        OPENVINO_ASSERT(!has_token_type_ids,
+                        "DFlash draft model has a 'token_type_ids' input but no dflash/input_layout metadata, so its "
+                        "input layout is unknown. Re-export the draft with a current optimum-intel.");
+        return false;
+    }
+    OPENVINO_ASSERT(has_token_type_ids,
+                    "DFlash draft model with the '",
+                    info.input_layout,
+                    "' input layout must have a 'token_type_ids' input.");
+    return true;
 }
 
 void apply_dflash_gpu_compile_properties(const DFlashRTInfo& info,
