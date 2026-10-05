@@ -844,6 +844,7 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
             continue;
         }
 
+        const auto draft_step_start = std::chrono::steady_clock::now();
         const int64_t seed_token = state.generated_tokens.back();
         validate_hidden_prefix_length(state);
         auto hidden_delta = materialize_pending_hidden_delta(state);
@@ -897,6 +898,12 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
                                                       nullptr,
                                                       std::move(aligned_proposals)));
         m_main_pipeline->update_request(request_id, candidate_sequences, false);
+        const auto draft_step_duration =
+            MicroSeconds(PerfMetrics::get_microsec(std::chrono::steady_clock::now() - draft_step_start));
+        auto& draft_step_raw_metrics = m_perf_metrics.draft_step_metrics.raw_metrics;
+        draft_step_raw_metrics.m_durations.push_back(draft_step_duration);
+        draft_step_raw_metrics.m_batch_sizes.push_back(candidates.size());
+        draft_step_raw_metrics.m_inference_durations[0] += draft_step_duration;
     }
     const auto draft_end = std::chrono::steady_clock::now();
     m_sd_metrics.draft_duration += PerfMetrics::get_microsec(draft_end - draft_start) / 1e6;
