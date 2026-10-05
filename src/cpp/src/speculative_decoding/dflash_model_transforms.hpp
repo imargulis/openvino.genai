@@ -18,6 +18,10 @@ namespace genai {
 namespace utils {
 namespace dflash {
 
+// Every per-token draft input spans the new rows [context delta ; block], told apart by token_type_ids.
+// Drafts exported without this marker take the context rows in hidden_states and the block in input_ids.
+inline constexpr const char* PER_ROW_INPUT_LAYOUT = "per_row";
+
 /**
  * @brief Runtime configuration for DFlash speculative decoding.
  */
@@ -31,6 +35,8 @@ struct DFlashRTInfo {
     float input_embedding_scale = 1.0f;
     float output_multiplier = 1.0f;
     float final_logit_softcapping = 0.0f;
+    // empty for the legacy layout
+    std::string input_layout;
 };
 
 struct DFlashSelectorRTInfo {
@@ -72,6 +78,14 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config);
 void apply_dflash_gpu_compile_properties(const DFlashRTInfo& info,
                                          const std::string& device,
                                          ov::AnyMap& compile_properties);
+
+/**
+ * @brief Checks the draft inputs against its dflash/input_layout marker.
+ *
+ * @return true for the per-row layout, false for the legacy one.
+ * @throws ov::Exception when the draft has a token_type_ids input without the per-row marker, or the other way round.
+ */
+bool is_per_row_draft(const std::shared_ptr<ov::Model>& draft_model, const DFlashRTInfo& info);
 
 void apply_dflash_selector_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap& properties);
 
