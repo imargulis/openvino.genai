@@ -51,9 +51,20 @@ public:
 
     void multistep();
 
+    struct RequestProgress {
+        uint64_t request_id = 0;
+        size_t num_processed_tokens = 0;
+        // candidates inserted by update_request() and not validated yet
+        size_t num_tokens_to_validate = 0;
+        // tokens the generate phase of the next step serves, 0 while the prompt is processed
+        size_t num_generate_tokens = 0;
+    };
+
     void finish_request(int64_t request_id = -1);
     void pull_awaiting_requests(bool is_pause_request = false);
     GeneratedRequests get_generated_requests();
+    // Progress of the unfinished requests, in scheduling order.
+    std::vector<RequestProgress> get_requests_progress() const;
     UpdateRequestResult update_request(uint64_t request_id, const GeneratedSequences& candidates, bool is_update_logit_processor);
     void sync_generated_embeddings();
     bool is_requests_empty();

@@ -115,6 +115,25 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::get_ge
     return result;
 }
 
+std::vector<ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::RequestProgress>
+ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::get_requests_progress() const {
+    std::vector<RequestProgress> progress;
+    progress.reserve(m_requests.size());
+    for (const auto& request : m_requests) {
+        if (request->has_finished()) {
+            continue;
+        }
+        // the generate phase condition of Scheduler::_schedule_generate_phase_dynamic_split_fuse()
+        const bool in_generate_phase = request->can_generate_tokens() && !request->is_waiting() &&
+                                       !request->handle_stopped() && !request->handle_cancelled();
+        progress.push_back({request->get_request_id(),
+                            request->get_num_processed_tokens(),
+                            request->get_num_tokens_to_validate(),
+                            in_generate_phase ? request->get_num_available_tokens_for_batching() : 0});
+    }
+    return progress;
+}
+
 ov::Tensor select_rows_by_indices(const ov::Tensor& tensor, const std::vector<size_t>& indices) {
     OPENVINO_ASSERT(!indices.empty(), "Indices vector is empty");
 
