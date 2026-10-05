@@ -29,6 +29,7 @@
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/variable.hpp"
 #include "openvino/pass/sdpa_to_paged_attention.hpp"
+#include "openvino/runtime/properties.hpp"
 #include "speculative_decoding/continuous_batching/dflash_strategy_utils.hpp"
 #include "speculative_decoding/dflash_model_transforms.hpp"
 #include "utils.hpp"
@@ -256,6 +257,7 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     model->set_rt_info(std::string("151669"), {"dflash", "mask_token_id"});
     model->set_rt_info(std::string("1,12,23,34,45"), {"dflash", "target_layer_ids"});
     model->set_rt_info(std::string("2"), {"dflash", "version"});
+    model->set_rt_info(std::string("32.0"), {"dflash", "gpu_min_activations_scale_factor"});
     model->set_rt_info(std::string("1.25"), {"dflash", "input_embedding_scale"});
     model->set_rt_info(std::string("0.75"), {"dflash", "output_multiplier"});
     model->set_rt_info(std::string("8.0"), {"dflash", "final_logit_softcapping"});
@@ -268,6 +270,7 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     ASSERT_EQ(properties.at("dflash_mask_token_id").as<int64_t>(), 151669);
     ASSERT_EQ(properties.at("dflash_target_layer_ids").as<std::vector<int32_t>>(),
               (std::vector<int32_t>{1, 12, 23, 34, 45}));
+    ASSERT_FLOAT_EQ(properties.at("dflash_gpu_min_activations_scale_factor").as<float>(), 32.0f);
 
     auto rt_info = ov::genai::utils::dflash::extract_dflash_info_from_config(properties);
     ASSERT_TRUE(rt_info.dflash_mode);
@@ -275,6 +278,7 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     ASSERT_EQ(rt_info.mask_token_id, 151669);
     ASSERT_EQ(rt_info.target_layer_ids, (std::vector<int32_t>{1, 12, 23, 34, 45}));
     ASSERT_EQ(rt_info.candidate_position_offset, 1);
+    ASSERT_FLOAT_EQ(rt_info.gpu_min_activations_scale_factor, 32.0f);
     ASSERT_FLOAT_EQ(rt_info.input_embedding_scale, 1.25f);
     ASSERT_FLOAT_EQ(rt_info.output_multiplier, 0.75f);
     ASSERT_FLOAT_EQ(rt_info.final_logit_softcapping, 8.0f);
@@ -295,6 +299,47 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     properties["dflash_target_layer_ids"] = std::vector<int32_t>{1, 12, 23, 34, 45};
     properties["dflash_candidate_position_offset"] = size_t(2);
     EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(properties), ov::Exception);
+}
+
+TEST(DFlashModelTransforms, RequiresDFlash2GpuActivationScaleMetadata) {
+    ov::AnyMap properties;
+    properties["dflash_mode"] = true;
+    properties["dflash_version"] = int64_t{2};
+    properties["dflash_mask_token_id"] = int64_t{151669};
+    properties["dflash_target_layer_ids"] = std::vector<int32_t>{0};
+
+    EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(properties), ov::Exception);
+}
+
+TEST(DFlashModelTransforms, RejectsInvalidDFlash2GpuActivationScaleMetadata) {
+    auto model = make_annotated_stateful_sdpa_model();
+    model->set_rt_info(true, "dflash_mode");
+    model->set_rt_info(std::string("2"), {"dflash", "version"});
+    model->set_rt_info(std::string("151669"), {"dflash", "mask_token_id"});
+    model->set_rt_info(std::string("0"), {"dflash", "target_layer_ids"});
+    model->set_rt_info(std::string("0"), {"dflash", "gpu_min_activations_scale_factor"});
+
+    ov::AnyMap properties;
+    EXPECT_THROW(ov::genai::utils::dflash::apply_dflash_rt_info(model, properties), ov::Exception);
+}
+
+TEST(DFlashModelTransforms, PromotesDFlash2GpuActivationScaleAtCompileTime) {
+    ov::genai::utils::dflash::DFlashRTInfo info;
+    info.dflash_mode = true;
+    info.dflash_version = 2;
+    info.gpu_min_activations_scale_factor = 32.0f;
+
+    ov::AnyMap properties;
+    ov::genai::utils::dflash::apply_dflash_gpu_compile_properties(info, "GPU", properties);
+    ASSERT_FLOAT_EQ(properties.at(ov::hint::activations_scale_factor.name()).as<float>(), 32.0f);
+
+    properties[ov::hint::activations_scale_factor.name()] = 64.0f;
+    ov::genai::utils::dflash::apply_dflash_gpu_compile_properties(info, "GPU.0", properties);
+    ASSERT_FLOAT_EQ(properties.at(ov::hint::activations_scale_factor.name()).as<float>(), 64.0f);
+
+    properties[ov::hint::activations_scale_factor.name()] = 8.0f;
+    ov::genai::utils::dflash::apply_dflash_gpu_compile_properties(info, "GPU", properties);
+    ASSERT_FLOAT_EQ(properties.at(ov::hint::activations_scale_factor.name()).as<float>(), 32.0f);
 }
 
 TEST(DFlashModelTransforms, RejectsUnsupportedDraftVersion) {
