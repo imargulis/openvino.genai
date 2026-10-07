@@ -1575,15 +1575,6 @@ float detail::proposal_probability(const DraftProposal& proposal, int64_t token_
     return 0.0f;
 }
 
-bool detail::accept_draft_token(float target_probability,
-                                float draft_probability,
-                                std::mt19937& rng_engine) {
-    OPENVINO_ASSERT(draft_probability > 0.0f,
-                    "Draft probability must be positive for rejection sampling.");
-    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-    return uniform(rng_engine) * draft_probability <= target_probability;
-}
-
 Token detail::sample_residual_distribution(const std::vector<float>& target_probabilities,
                                            const DraftProposal& proposal,
                                            std::mt19937& rng_engine) {
