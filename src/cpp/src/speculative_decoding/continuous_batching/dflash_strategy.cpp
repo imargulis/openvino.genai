@@ -829,6 +829,7 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
                                                       0,
                                                       {},
                                                       nullptr,
+                                                      {},
                                                       std::move(aligned_proposals)));
         m_main_pipeline->update_request(request_id, candidate_sequences, false);
         const auto draft_step_duration =
