@@ -15,8 +15,7 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::Contin
     const SchedulerConfig& scheduler_config,
     const std::string& device,
     const ov::AnyMap& plugin_config,
-    bool is_validation_mode_enabled,
-    bool collect_draft_proposals) {
+    bool is_validation_mode_enabled) {
     m_tokenizer = tokenizer;
     m_generation_config = generation_config;
     if (m_generation_config.assistant_confidence_threshold == 0.f) {
@@ -25,7 +24,8 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::Contin
         }
     }
     m_is_validation_mode_enabled = is_validation_mode_enabled;
-    m_collect_draft_proposals = collect_draft_proposals;
+    // Every draft pipeline records q(.) of its sampled tokens for the main pipeline to verify them.
+    m_collect_draft_proposals = !is_validation_mode_enabled;
     initialize_pipeline(model, scheduler_config, device, plugin_config);
 }
 
@@ -37,16 +37,14 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::Contin
     const SchedulerConfig& scheduler_config,
     const std::string& device,
     const ov::AnyMap& plugin_config,
-    bool is_validation_mode_enabled,
-    bool collect_draft_proposals)
+    bool is_validation_mode_enabled)
     : ContinuousBatchingForSpeculativeDecodingImpl(model,
                                                    tokenizer,
                                                    generation_config,
                                                    scheduler_config,
                                                    device,
                                                    plugin_config,
-                                                   is_validation_mode_enabled,
-                                                   collect_draft_proposals) {
+                                                   is_validation_mode_enabled) {
     m_inputs_embedder = inputs_embedder;
     // Note: set_inputs_embedder also sets the embedding model internally.
     m_model_runner->set_inputs_embedder(inputs_embedder);
@@ -268,21 +266,28 @@ remove_tokens_from_sequence(Sequence::Ptr& sequence,
     return (sequence_generated_len - min_generated_tokens);
 }
 
+void attach_draft_proposal(Sequence::Ptr& sequence, const DraftProposalPtr& proposal) {
+    if (proposal && !proposal->empty()) {
+        detail::validate_draft_proposal(*proposal);
+        sequence->set_draft_proposal(sequence->get_generated_len() - 1, proposal);
+    }
+}
+
 size_t
 insert_tokens_to_sequence(Sequence::Ptr& sequence,
                           const std::vector<int64_t>& token_ids,
                           const std::vector<float>& token_log_probs,
                           LogitProcessor& logit_proccessor,
                           bool is_update_sampler,
-                          const std::vector<DraftProposal>* draft_proposals = nullptr) {
+                          const std::vector<DraftProposalPtr>* draft_proposals = nullptr) {
     size_t generated_len = sequence->get_generated_len(), candidate_len = token_ids.size();
     OPENVINO_ASSERT(generated_len <= candidate_len);
     OPENVINO_ASSERT(!draft_proposals || draft_proposals->empty() || draft_proposals->size() == candidate_len,
                     "Draft proposal rows must be empty or aligned with candidate token IDs.");
     for (size_t i = generated_len; i < candidate_len; ++i) {
         sequence->append_token(token_ids[i], token_log_probs[i]);
-        if (draft_proposals && !draft_proposals->empty() && !(*draft_proposals)[i].empty()) {
-            sequence->set_draft_proposal(sequence->get_generated_len() - 1, (*draft_proposals)[i]);
+        if (draft_proposals && !draft_proposals->empty()) {
+            attach_draft_proposal(sequence, (*draft_proposals)[i]);
         }
         if (is_update_sampler) {
             logit_proccessor.register_new_generated_token(token_ids[i]);
@@ -338,10 +343,8 @@ init_request(
 
         for (size_t i = 0; i < min_candidate_len; ++i) {
             sequence->append_token(token_ids[i], log_probs[i]);
-            if (!candidate_sequence.second.draft_proposals.empty() &&
-                !candidate_sequence.second.draft_proposals[i].empty()) {
-                sequence->set_draft_proposal(sequence->get_generated_len() - 1,
-                                             candidate_sequence.second.draft_proposals[i]);
+            if (!candidate_sequence.second.draft_proposals.empty()) {
+                attach_draft_proposal(sequence, candidate_sequence.second.draft_proposals[i]);
             }
             if (is_update_logit_processor) {
                 logit_processor.register_new_generated_token(token_ids[i]);
@@ -449,10 +452,10 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
 
                 result.removed_tokens_cnt = remove_tokens_from_sequence(running_sequence, min_generated_tokens, logit_processor);
 
-                auto candidate_sequence = *candidate_ptr;
+                const auto& candidate_sequence = *candidate_ptr;
                 std::vector<int64_t> candidate_token_ids = candidate_sequence.token_ids;
                 std::vector<float> candidate_token_log_probs = candidate_sequence.log_probs;
-                std::vector<DraftProposal> candidate_draft_proposals = candidate_sequence.draft_proposals;
+                std::vector<DraftProposalPtr> candidate_draft_proposals = candidate_sequence.draft_proposals;
                 candidate_token_ids.resize(min_candidate_len);
                 candidate_token_log_probs.resize(min_candidate_len);
                 if (!candidate_draft_proposals.empty()) {

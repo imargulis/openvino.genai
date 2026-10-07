@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <optional>
 #include <thread>
 
 #include "openvino/genai/text_streamer.hpp"
 #include "openvino/pass/sdpa_to_paged_attention.hpp"
 #include "fast_draft_strategy.hpp"
 #include "continuous_batching/paged_attention_transformations.hpp"
+#include "logger.hpp"
 #include "utils.hpp"
 
 
@@ -22,10 +24,61 @@ bool are_tokenizers_equal(Tokenizer& lhs, Tokenizer& rhs) {
     
     ov::Shape shape_lhs = encoded_string_lhs.get_shape(),
               shape_rhs = encoded_string_rhs.get_shape();
+    if (shape_lhs != shape_rhs) {
+        return false;
+    }
+    const int64_t* ids_lhs = encoded_string_lhs.data<const int64_t>();
+    const int64_t* ids_rhs = encoded_string_rhs.data<const int64_t>();
 
-    return shape_lhs == shape_rhs && lhs.get_eos_token_id() == rhs.get_eos_token_id() &&
+    return std::equal(ids_lhs, ids_lhs + encoded_string_lhs.get_size(), ids_rhs) &&
+           lhs.get_eos_token_id() == rhs.get_eos_token_id() &&
            lhs.get_bos_token_id() == rhs.get_bos_token_id() && lhs.get_pad_token_id() == rhs.get_pad_token_id();
 }
+
+namespace {
+std::optional<size_t> get_logits_width(const std::shared_ptr<ov::Model>& model) {
+    for (const auto& output : model->outputs()) {
+        if (output.get_names().count("logits") == 0) {
+            continue;
+        }
+        const ov::PartialShape& shape = output.get_partial_shape();
+        if (shape.rank().is_static() && shape.size() > 0 && shape[shape.size() - 1].is_static()) {
+            return static_cast<size_t>(shape[shape.size() - 1].get_length());
+        }
+    }
+    return std::nullopt;
+}
+
+// Logits rows are commonly padded beyond the tokenizer vocabulary (lm_head rounded up to a multiple of 64 or
+// 128), so draft and main logits may differ in width. Their ids are interchangeable only if both tokenizers
+// assign every token the same id and every token id lies within both rows; ids past the vocabulary are padding.
+void check_vocabularies_match(const std::shared_ptr<ov::Model>& main_model,
+                              const std::shared_ptr<ov::Model>& draft_model,
+                              const Tokenizer& main_tokenizer,
+                              const Tokenizer& draft_tokenizer) {
+    const auto main_width = get_logits_width(main_model), draft_width = get_logits_width(draft_model);
+    if (!main_width || !draft_width || *main_width == *draft_width) {
+        return;
+    }
+    const std::vector<std::string>* main_vocab = nullptr;
+    const std::vector<std::string>* draft_vocab = nullptr;
+    try {
+        main_vocab = &main_tokenizer.get_vocab_vector();
+        draft_vocab = &draft_tokenizer.get_vocab_vector();
+    } catch (const ov::Exception&) {
+        GENAI_WARN("Draft and main models produce logits of different widths (%zu and %zu), and their vocabularies "
+                   "cannot be compared without detokenizers; token ids are assumed to denote the same tokens.",
+                   *draft_width, *main_width);
+        return;
+    }
+    OPENVINO_ASSERT(*main_vocab == *draft_vocab,
+                    "Draft and main models produce logits of different widths (", *draft_width, " and ", *main_width,
+                    "), which is supported only when both tokenizers have identical vocabularies.");
+    OPENVINO_ASSERT(main_vocab->size() <= std::min(*main_width, *draft_width),
+                    "The tokenizer vocabulary of ", main_vocab->size(), " tokens does not fit the logits of the draft (",
+                    *draft_width, ") and main (", *main_width, ") models.");
+}
+}  // namespace
 
 int64_t ContinuousBatchingPipeline::SpeculativeDecodingImpl::compute_rope_delta(const ov::Tensor& position_ids) {
     const ov::Shape shape = position_ids.get_shape();
@@ -40,6 +93,15 @@ int64_t ContinuousBatchingPipeline::SpeculativeDecodingImpl::compute_rope_delta(
     const int64_t* data = position_ids.data<const int64_t>();
     const int64_t max_position_id = *std::max_element(data, data + position_ids.get_size());
     return max_position_id + 1 - static_cast<int64_t>(shape[seq_axis]);
+}
+
+GenerationConfig
+ContinuousBatchingPipeline::SpeculativeDecodingImpl::make_draft_sampling_params(const GenerationConfig& sampling_params) {
+    GenerationConfig draft_sampling_params = sampling_params;
+    draft_sampling_params.ignore_eos = true;
+    draft_sampling_params.stop_strings = {};
+    draft_sampling_params.rng_seed = detail::proposal_rng_seed(sampling_params.rng_seed);
+    return draft_sampling_params;
 }
 
 std::pair<ov::genai::SchedulerConfig, ov::genai::SchedulerConfig>
@@ -129,6 +191,7 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::SpeculativeDecodingImpl(con
 
     // todo: remove this condition after support of CVS-154103
     OPENVINO_ASSERT(are_tokenizers_equal(main_model_tokenizer, draft_model_tokenizer), "Tokenizers for draft and main models are different!");
+    check_vocabularies_match(main_model_desc.model, draft_model_desc.model, main_model_tokenizer, draft_model_tokenizer);
     m_tokenizer = main_model_tokenizer;
     ov::AnyMap draft_properties = draft_model_desc.properties.empty() ? main_model_desc.properties : draft_model_desc.properties;
     // to create `main_pipeline` with enabled validation_mode and `draft_pipeline` with disabled validation mode
@@ -137,7 +200,7 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::SpeculativeDecodingImpl(con
         scheduler_configs.first, main_device, main_model_desc.properties, true);
     m_draft_pipeline = std::make_shared<ContinuousBatchingForSpeculativeDecodingImpl>(
         draft_model_desc.model, draft_model_tokenizer, draft_model_desc.generation_config,
-        scheduler_configs.second, draft_device, draft_properties, false, true);
+        scheduler_configs.second, draft_device, draft_properties, false);
 
     m_perf_metrics = ov::genai::SDPerModelsPerfMetrics();
     m_draft_pipeline->raw_perf_metrics.m_inference_durations =  {{ MicroSeconds(0.0f) }};
@@ -150,10 +213,7 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::add_request(uint64_t reques
                                                                  std::optional<ov::Tensor> prompt_ids,
                                                                  std::optional<std::unordered_map<std::string, ov::Tensor>> lm_extra_inputs) {
     std::lock_guard<std::mutex> lock(m_draft_generations_mutex);
-    auto draft_sampling_params = sampling_params;
-    draft_sampling_params.ignore_eos = true;
-    draft_sampling_params.stop_strings = {};
-    draft_sampling_params.rng_seed = detail::proposal_rng_seed(sampling_params.rng_seed);
+    const auto draft_sampling_params = make_draft_sampling_params(sampling_params);
     // The speculative draft path only uses language-model inputs. Multimodal auxiliary inputs such as
     // deepstack/visual tensors are consumed only by the main model, so lm_extra_inputs are not forwarded here.
     m_draft_generations.insert({request_id, m_draft_pipeline->add_request(request_id, input_ids, draft_sampling_params, prompt_ids)});
@@ -169,10 +229,7 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::add_request(uint64_t reques
                                                                  const std::string& prompt,
                                                                  const ov::genai::GenerationConfig& sampling_params) {
     std::lock_guard<std::mutex> lock(m_draft_generations_mutex);
-    auto draft_sampling_params = sampling_params;
-    draft_sampling_params.ignore_eos = true;
-    draft_sampling_params.stop_strings = {};
-    draft_sampling_params.rng_seed = detail::proposal_rng_seed(sampling_params.rng_seed);
+    const auto draft_sampling_params = make_draft_sampling_params(sampling_params);
     m_draft_generations.insert({request_id, m_draft_pipeline->add_request(request_id, prompt, draft_sampling_params)});
     return m_main_pipeline->add_request(request_id, prompt, sampling_params);
 }

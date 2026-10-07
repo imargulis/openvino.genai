@@ -16,7 +16,7 @@
 #include "openvino/genai/generation_config.hpp"
 #include "generation_stream.hpp"
 #include "logger.hpp"
-#include "speculative_decoding/continuous_batching/update_request_structs.hpp"
+#include "sampling/draft_proposal.hpp"
 
 namespace ov::genai {
 enum class SequenceStatus {
@@ -59,7 +59,7 @@ class Sequence {
 
     TokenIds m_generated_ids;
     LogProbs m_generated_log_probs;
-    std::optional<std::vector<DraftProposal>> m_draft_proposals;
+    std::optional<std::vector<DraftProposalPtr>> m_draft_proposals;
     uint64_t m_grouped_id;
     uint64_t m_id = _get_next_global_sequence_id();
     ov::Tensor m_hidden_state = ov::Tensor();
@@ -292,12 +292,16 @@ public:
         m_generated_log_probs[idx] = log_prob;
     }
 
-    void set_draft_proposal(size_t idx, DraftProposal proposal) {
+    void set_draft_proposal(size_t idx, DraftProposalPtr proposal) {
         if (!m_draft_proposals) {
             m_draft_proposals.emplace(m_generated_ids.size());
         }
         OPENVINO_ASSERT(idx < m_draft_proposals->size());
         (*m_draft_proposals)[idx] = std::move(proposal);
+    }
+
+    void set_draft_proposal(size_t idx, DraftProposal proposal) {
+        set_draft_proposal(idx, std::make_shared<const DraftProposal>(std::move(proposal)));
     }
 
     const DraftProposal& get_draft_proposal(size_t idx) const {
@@ -306,11 +310,12 @@ public:
             return empty_proposal;
         }
         OPENVINO_ASSERT(idx < m_draft_proposals->size());
-        return (*m_draft_proposals)[idx];
+        const auto& proposal = (*m_draft_proposals)[idx];
+        return proposal ? *proposal : empty_proposal;
     }
 
-    const std::vector<DraftProposal>& get_draft_proposals() const {
-        static const std::vector<DraftProposal> empty_proposals;
+    const std::vector<DraftProposalPtr>& get_draft_proposals() const {
+        static const std::vector<DraftProposalPtr> empty_proposals;
         return m_draft_proposals ? *m_draft_proposals : empty_proposals;
     }
 
@@ -319,7 +324,7 @@ public:
             return;
         }
         OPENVINO_ASSERT(idx < m_draft_proposals->size());
-        (*m_draft_proposals)[idx] = {};
+        (*m_draft_proposals)[idx].reset();
     }
 
     void clear_draft_proposals() {

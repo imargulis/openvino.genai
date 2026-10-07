@@ -32,20 +32,35 @@
 namespace ov::genai {
 
 namespace detail {
-inline constexpr uint32_t PROPOSAL_RNG_SEED_SALT = 0x9E3779B9U;
+// Probability with which multinomial sampling draws token_id from the processed logits; 0 for tokens it
+// cannot draw, including ids beyond the logits width.
+float sampling_probability(const Logits& logits, int64_t token_id);
 
-inline std::mt19937::result_type proposal_rng_seed(size_t generation_seed) {
-    return static_cast<std::mt19937::result_type>(generation_seed) ^ PROPOSAL_RNG_SEED_SALT;
-}
+// The distribution multinomial sampling draws from: sparse over the surviving candidates when the logit
+// processor selected them, dense otherwise. With d2t (EAGLE), draft id i is recorded as target id i + d2t[i].
+DraftProposal make_draft_proposal(const Logits& logits, const int64_t* d2t = nullptr);
 
-std::vector<float> materialize_sampling_probabilities(const Logits& logits, size_t vocab_size);
-void validate_draft_proposal(const DraftProposal& proposal, size_t vocab_size);
+void validate_draft_proposal(const DraftProposal& proposal);
 float proposal_probability(const DraftProposal& proposal, int64_t token_id);
 float reported_log_probability(const Logits& logits, int64_t token_id, float sampling_probability);
 bool accept_draft_token(float target_probability, float draft_probability, std::mt19937& rng_engine);
-Token sample_residual_distribution(const std::vector<float>& target_probabilities,
-                                   const DraftProposal& proposal,
-                                   std::mt19937& rng_engine);
+
+// Draws from the residual max(0, p - q) normalized, where p is the target distribution of the processed
+// logits. Draft ids outside the target logits have p = 0 and target ids absent from q have q = 0. Falls back
+// to p when the residual has no mass, e.g. q == p up to rounding.
+Token sample_residual(const Logits& target_logits, const DraftProposal& proposal, std::mt19937& rng_engine);
+
+struct DraftTokenVerdict {
+    Token token;
+    bool accepted = false;
+};
+
+// Speculative sampling (Leviathan et al., 2023): accepts draft_token with probability min(1, p / q), otherwise
+// replaces it with a residual sample, so the emitted token follows the target distribution p exactly.
+DraftTokenVerdict verify_draft_token(const Logits& target_logits,
+                                     int64_t draft_token,
+                                     const DraftProposal& proposal,
+                                     std::mt19937& rng_engine);
 }  // namespace detail
 
 // Handle stop_token_ids

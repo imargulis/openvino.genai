@@ -979,6 +979,45 @@ Token Sampler::_greedy_sample(const Logits& logits, size_t top_logprobs) const {
     return Token(max_value, max_index);
 }
 
+// Candidate i of m_vector is drawn with probability values[i] / total: exp(logit - max_logit) when expf is
+// deferred, the stored probability otherwise, and uniform if every candidate is masked (-inf / NaN).
+struct CandidateWeights {
+    std::vector<float> values;
+    float total = 0.0f;
+    float max_logit = 0.0f;
+    bool fallback_uniform = false;
+};
+
+static CandidateWeights candidate_weights(const Logits& logits) {
+    OPENVINO_ASSERT(logits.is_vector_initialized(), "Candidate weights require initialized logits candidates.");
+    CandidateWeights result;
+    result.values.resize(logits.m_size);
+    if (logits.m_defer_expf) {
+        // m_vector holds K logits in arbitrary heap order, so scan for the max.
+        result.max_logit = logits.m_vector[0].m_log_prob;
+        for (size_t i = 1; i < logits.m_size; ++i)
+            result.max_logit = std::max(result.max_logit, logits.m_vector[i].m_log_prob);
+        for (size_t i = 0; i < logits.m_size; ++i) {
+            result.values[i] = expf(logits.m_vector[i].m_log_prob - result.max_logit);
+            result.total += result.values[i];
+        }
+    } else {
+        for (size_t i = 0; i < logits.m_size; ++i) {
+            result.values[i] = logits.m_vector[i].m_log_prob;
+            result.total += result.values[i];
+        }
+    }
+    // Defensive fallback: should not occur in practice (at least one non-masked token is always
+    // guaranteed), but if all logits happen to be -inf/NaN, sample uniformly over the K candidates
+    // so generation can continue rather than aborting.
+    result.fallback_uniform = !(result.total > 0.0f && std::isfinite(result.total));
+    if (result.fallback_uniform) {
+        std::fill(result.values.begin(), result.values.end(), 1.0f);
+        result.total = static_cast<float>(logits.m_size);
+    }
+    return result;
+}
+
 std::vector<Token> Sampler::_multinomial_sample(const Logits& logits, size_t num_tokens_per_sequence, std::mt19937& rng_engine) {
     std::uniform_real_distribution<float> u(0.0f, 1.0f);
     std::vector<Token> out_tokens;
@@ -990,42 +1029,24 @@ std::vector<Token> Sampler::_multinomial_sample(const Logits& logits, size_t num
         OPENVINO_ASSERT(logits.is_vector_initialized(),
             "Internal error: m_defer_expf=true but m_vector not initialized. "
             "defer_expf requires top_k > 0 which always populates m_vector via TopKFilter.");
-        // m_vector holds K logits in arbitrary heap order — _multinomial_sample does its own max scan.
-        float max_val = logits.m_vector[0].m_log_prob;
-        for (size_t i = 1; i < logits.m_size; ++i)
-            if (logits.m_vector[i].m_log_prob > max_val)
-                max_val = logits.m_vector[i].m_log_prob;
         // Precompute weights once to avoid recomputing expf on every draw.
-        std::vector<float> weights(logits.m_size);
-        float sum_cum = 0.0f;
-        for (size_t i = 0; i < logits.m_size; ++i) {
-            weights[i] = expf(logits.m_vector[i].m_log_prob - max_val);
-            sum_cum += weights[i];
-        }
-        // Defensive fallback: should not occur in practice (at least one non-masked token is
-        // always guaranteed), but if all logits happen to be -inf/NaN, sample uniformly over
-        // the K candidates so generation can continue rather than aborting.
-        const bool fallback_uniform = !(sum_cum > 0.0f && std::isfinite(sum_cum));
-        if (fallback_uniform) {
-            std::fill(weights.begin(), weights.end(), 1.0f);
-            sum_cum = static_cast<float>(logits.m_size);
-        }
-        // log_sum_cum = log(Σ exp(v[i])) = log(sum_cum) + max_val (log-sum-exp identity).
-        // In the fallback case max_val may be -inf, so use 0 to keep log_sum_cum finite.
-        const float log_sum_cum = logf(sum_cum) + (fallback_uniform ? 0.0f : max_val);
+        const CandidateWeights weights = candidate_weights(logits);
+        // log_sum_cum = log(Σ exp(v[i])) = log(total) + max_logit (log-sum-exp identity).
+        // In the fallback case max_logit may be -inf, so use 0 to keep log_sum_cum finite.
+        const float log_sum_cum = logf(weights.total) + (weights.fallback_uniform ? 0.0f : weights.max_logit);
 
         for (size_t token_idx = 0; token_idx < num_tokens_per_sequence; ++token_idx) {
-            const float r = sum_cum * u(rng_engine);
+            const float r = weights.total * u(rng_engine);
             float sum_run = 0.0f;
             size_t sampled_idx = logits.m_size - 1;
             for (size_t i = 0; i < logits.m_size; ++i) {
-                sum_run += weights[i];
+                sum_run += weights.values[i];
                 if (sum_run > r) { sampled_idx = i; break; }
             }
             // When m_full_vocab_log_sum_exp is set (logprobs > 0), m_data holds the
             // original raw model logits (grammar/penalties only wrote to m_vector).
             // Return raw log-probability: log p_i = raw_logit_i − log(Σ exp(raw_logit_j)).
-            const float log_prob = fallback_uniform
+            const float log_prob = weights.fallback_uniform
                 ? std::log(1.0f / static_cast<float>(logits.m_size))
                 : (!std::isnan(logits.m_full_vocab_log_sum_exp)
                     ? logits.m_data[logits.m_vector[sampled_idx].m_index] - logits.m_full_vocab_log_sum_exp
@@ -1411,72 +1432,92 @@ bool Sampler::validate_candidate(
     return true;
 }
 
-std::vector<float> detail::materialize_sampling_probabilities(const Logits& logits, size_t vocab_size) {
-    std::vector<float> probabilities(vocab_size, 0.0f);
-    float total = 0.0f;
-    if (logits.m_defer_expf) {
-        OPENVINO_ASSERT(logits.is_vector_initialized(), "Deferred sampling logits must use indexed storage.");
-        float max_logit = -std::numeric_limits<float>::infinity();
-        for (const auto& token : logits.m_vector) {
-            max_logit = std::max(max_logit, token.m_log_prob);
+namespace {
+// The distribution _multinomial_sample draws from: probabilities[i] is the probability of candidate
+// token_ids[i] when the logit processor selected candidates, otherwise of token i of the whole row.
+struct SamplingDistribution {
+    std::vector<int64_t> token_ids;
+    std::vector<float> probabilities;
+};
+
+SamplingDistribution sampling_distribution(const Logits& logits) {
+    OPENVINO_ASSERT(logits.m_size > 0, "Sampling logits have no candidate tokens.");
+    SamplingDistribution distribution;
+    if (logits.is_vector_initialized()) {
+        const CandidateWeights weights = candidate_weights(logits);
+        distribution.token_ids.resize(logits.m_size);
+        distribution.probabilities.resize(logits.m_size);
+        for (size_t i = 0; i < logits.m_size; ++i) {
+            distribution.token_ids[i] = logits.m_vector[i].m_index;
+            distribution.probabilities[i] = weights.values[i] / weights.total;
         }
-        for (const auto& token : logits.m_vector) {
-            const float probability = std::exp(token.m_log_prob - max_logit);
-            probabilities.at(static_cast<size_t>(token.m_index)) = probability;
-            total += probability;
-        }
-    } else if (logits.is_vector_initialized()) {
-        for (const auto& token : logits.m_vector) {
-            probabilities.at(static_cast<size_t>(token.m_index)) = token.m_log_prob;
-            total += token.m_log_prob;
+        return distribution;
+    }
+    distribution.probabilities.assign(logits.m_data, logits.m_data + logits.m_size);
+    const float total = std::accumulate(distribution.probabilities.begin(), distribution.probabilities.end(), 0.0f);
+    if (total > 0.0f && std::isfinite(total)) {
+        for (auto& probability : distribution.probabilities) {
+            probability /= total;
         }
     } else {
-        OPENVINO_ASSERT(logits.m_size == vocab_size, "Dense sampling probability size mismatch.");
-        for (size_t token = 0; token < vocab_size; ++token) {
-            probabilities[token] = logits.m_data[token];
-            total += logits.m_data[token];
-        }
+        std::fill(distribution.probabilities.begin(),
+                  distribution.probabilities.end(),
+                  1.0f / static_cast<float>(logits.m_size));
     }
+    return distribution;
+}
+}  // namespace
 
-    const bool valid_distribution =
-        total > 0.0f && std::isfinite(total) &&
-        std::all_of(probabilities.begin(), probabilities.end(), [](float probability) {
-            return probability >= 0.0f && std::isfinite(probability);
-        });
-    if (!valid_distribution) {
-        std::fill(probabilities.begin(), probabilities.end(), 0.0f);
-        if (logits.is_vector_initialized()) {
-            OPENVINO_ASSERT(logits.m_size > 0, "Sampling logits have no candidate tokens.");
-            const float uniform_probability = 1.0f / static_cast<float>(logits.m_size);
-            for (const auto& token : logits.m_vector) {
-                probabilities.at(static_cast<size_t>(token.m_index)) = uniform_probability;
+float detail::sampling_probability(const Logits& logits, int64_t token_id) {
+    if (logits.is_vector_initialized()) {
+        const CandidateWeights weights = candidate_weights(logits);
+        for (size_t i = 0; i < logits.m_size; ++i) {
+            if (logits.m_vector[i].m_index == token_id) {
+                return weights.values[i] / weights.total;
             }
-        } else {
-            OPENVINO_ASSERT(vocab_size > 0, "Sampling logits have an empty vocabulary.");
-            const float uniform_probability = 1.0f / static_cast<float>(vocab_size);
-            std::fill(probabilities.begin(), probabilities.end(), uniform_probability);
         }
-        return probabilities;
+        return 0.0f;
     }
-
-    for (auto& probability : probabilities) {
-        probability /= total;
+    if (token_id < 0 || static_cast<size_t>(token_id) >= logits.m_size) {
+        return 0.0f;
     }
-    return probabilities;
+    const float total = std::accumulate(logits.m_data, logits.m_data + logits.m_size, 0.0f);
+    if (!(total > 0.0f && std::isfinite(total))) {
+        return 1.0f / static_cast<float>(logits.m_size);
+    }
+    return logits.m_data[token_id] / total;
 }
 
-void detail::validate_draft_proposal(const DraftProposal& proposal, size_t vocab_size) {
+DraftProposal detail::make_draft_proposal(const Logits& logits, const int64_t* d2t) {
+    SamplingDistribution distribution = sampling_distribution(logits);
+    DraftProposal proposal;
+    const bool is_dense = distribution.token_ids.empty();
+    if (is_dense && d2t == nullptr) {
+        proposal.probabilities = std::move(distribution.probabilities);
+        return proposal;
+    }
+    for (size_t i = 0; i < distribution.probabilities.size(); ++i) {
+        if (distribution.probabilities[i] <= 0.0f) {
+            continue;
+        }
+        int64_t token_id = is_dense ? static_cast<int64_t>(i) : distribution.token_ids[i];
+        if (d2t != nullptr) {
+            token_id += d2t[token_id];
+        }
+        proposal.token_ids.push_back(token_id);
+        proposal.probabilities.push_back(distribution.probabilities[i]);
+    }
+    return proposal;
+}
+
+void detail::validate_draft_proposal(const DraftProposal& proposal) {
     OPENVINO_ASSERT(!proposal.empty(), "Sampled speculative candidates require a proposal distribution.");
-    if (proposal.is_dense()) {
-        OPENVINO_ASSERT(proposal.probabilities.size() == vocab_size,
-                        "Dense draft proposal vocabulary size does not match target logits.");
-    } else {
+    if (!proposal.is_dense()) {
         OPENVINO_ASSERT(proposal.token_ids.size() == proposal.probabilities.size(),
                         "Sparse draft proposal IDs and probabilities must stay aligned.");
         std::unordered_set<int64_t> unique_token_ids;
         for (const auto token_id : proposal.token_ids) {
-            OPENVINO_ASSERT(token_id >= 0 && static_cast<size_t>(token_id) < vocab_size,
-                            "Sparse draft proposal contains a token outside the target vocabulary.");
+            OPENVINO_ASSERT(token_id >= 0, "Sparse draft proposal contains a negative token ID.");
             OPENVINO_ASSERT(unique_token_ids.insert(token_id).second,
                             "Sparse draft proposal contains duplicate token IDs.");
         }
@@ -1533,40 +1574,75 @@ bool detail::accept_draft_token(float target_probability,
     return uniform(rng_engine) * draft_probability < target_probability;
 }
 
-Token detail::sample_residual_distribution(const std::vector<float>& target_probabilities,
-                                           const DraftProposal& proposal,
-                                           std::mt19937& rng_engine) {
-    validate_draft_proposal(proposal, target_probabilities.size());
-    std::vector<float> residual = target_probabilities;
-    if (proposal.is_dense()) {
-        OPENVINO_ASSERT(proposal.probabilities.size() == residual.size(),
-                        "Dense draft proposal vocabulary size does not match target logits.");
-        for (size_t token_id = 0; token_id < residual.size(); ++token_id) {
-            residual[token_id] = std::max(0.0f, residual[token_id] - proposal.probabilities[token_id]);
+Token detail::sample_residual(const Logits& target_logits, const DraftProposal& proposal, std::mt19937& rng_engine) {
+    const SamplingDistribution target = sampling_distribution(target_logits);
+    const bool is_dense_target = target.token_ids.empty();
+    std::vector<float> residual = target.probabilities;
+    if (is_dense_target) {
+        // Only q's support changes p, and draft ids beyond the target logits carry no target mass.
+        if (proposal.is_dense()) {
+            const size_t shared_size = std::min(residual.size(), proposal.probabilities.size());
+            for (size_t token_id = 0; token_id < shared_size; ++token_id) {
+                residual[token_id] = std::max(0.0f, residual[token_id] - proposal.probabilities[token_id]);
+            }
+        } else {
+            for (size_t index = 0; index < proposal.token_ids.size(); ++index) {
+                const int64_t token_id = proposal.token_ids[index];
+                if (token_id >= 0 && static_cast<size_t>(token_id) < residual.size()) {
+                    residual[token_id] = std::max(0.0f, residual[token_id] - proposal.probabilities[index]);
+                }
+            }
+        }
+    } else if (proposal.is_dense()) {
+        for (size_t i = 0; i < residual.size(); ++i) {
+            residual[i] = std::max(0.0f, residual[i] - proposal_probability(proposal, target.token_ids[i]));
         }
     } else {
+        std::unordered_map<int64_t, float> draft_probabilities;
+        draft_probabilities.reserve(proposal.token_ids.size());
         for (size_t index = 0; index < proposal.token_ids.size(); ++index) {
-            const size_t token_id = static_cast<size_t>(proposal.token_ids[index]);
-            residual.at(token_id) = std::max(0.0f, residual.at(token_id) - proposal.probabilities[index]);
+            draft_probabilities.emplace(proposal.token_ids[index], proposal.probabilities[index]);
+        }
+        for (size_t i = 0; i < residual.size(); ++i) {
+            const auto it = draft_probabilities.find(target.token_ids[i]);
+            if (it != draft_probabilities.end()) {
+                residual[i] = std::max(0.0f, residual[i] - it->second);
+            }
         }
     }
+
     float residual_sum = std::accumulate(residual.begin(), residual.end(), 0.0f);
-    OPENVINO_ASSERT(residual_sum > 0.0f && std::isfinite(residual_sum),
-                    "Residual speculative sampling distribution is invalid.");
+    if (!(residual_sum > 0.0f && std::isfinite(residual_sum))) {
+        residual = target.probabilities;
+        residual_sum = std::accumulate(residual.begin(), residual.end(), 0.0f);
+    }
     std::uniform_real_distribution<float> uniform(0.0f, residual_sum);
     const float sample = uniform(rng_engine);
     float cumulative = 0.0f;
-    size_t selected_token = residual.size() - 1;
-    for (size_t token = 0; token < residual.size(); ++token) {
-        cumulative += residual[token];
+    size_t selected = residual.size() - 1;
+    for (size_t i = 0; i < residual.size(); ++i) {
+        cumulative += residual[i];
         if (sample < cumulative) {
-            selected_token = token;
+            selected = i;
             break;
         }
     }
-    const float target_probability = target_probabilities[selected_token];
-    return Token(std::log(std::max(target_probability, std::numeric_limits<float>::min())),
-                 static_cast<int64_t>(selected_token));
+    const int64_t token_id = is_dense_target ? static_cast<int64_t>(selected) : target.token_ids[selected];
+    return Token(reported_log_probability(target_logits, token_id, target.probabilities[selected]), token_id);
+}
+
+detail::DraftTokenVerdict detail::verify_draft_token(const Logits& target_logits,
+                                                     int64_t draft_token,
+                                                     const DraftProposal& proposal,
+                                                     std::mt19937& rng_engine) {
+    OPENVINO_ASSERT(!proposal.empty(), "Sampled speculative candidates require a proposal distribution.");
+    const float draft_probability = proposal_probability(proposal, draft_token);
+    OPENVINO_ASSERT(draft_probability > 0.0f, "Selected draft token is absent from its proposal distribution.");
+    const float target_probability = sampling_probability(target_logits, draft_token);
+    if (accept_draft_token(target_probability, draft_probability, rng_engine)) {
+        return {Token(reported_log_probability(target_logits, draft_token, target_probability), draft_token), true};
+    }
+    return {sample_residual(target_logits, proposal, rng_engine), false};
 }
 
 std::pair<size_t, std::set<std::string>>
@@ -1611,19 +1687,23 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
         if (sampling_params.is_greedy_decoding()) {
             OPENVINO_ASSERT(num_running_sequences == 1);
         }
+        // Sampled draft candidates are verified by speculative sampling against their recorded proposals;
+        // greedy and prompt lookup candidates are verified by exact match.
+        const bool is_speculative_sampling =
+            is_validation_mode_enabled && sampling_params.do_sample && !sampling_params.is_prompt_lookup();
+        const bool is_draft_proposal_needed =
+            collect_draft_proposals && !is_validation_mode_enabled && sampling_params.is_multinomial();
+        const int64_t* d2t = m_d2t_mapping ? m_d2t_mapping->get_data_ptr<int64_t>() : nullptr;
         for (size_t running_sequence_id = 0; running_sequence_id < num_running_sequences; ++running_sequence_id) {
             auto& running_sequence = running_sequences[running_sequence_id];
-            if (is_validation_mode_enabled && sampling_params.do_sample &&
-                !sampling_params.is_prompt_lookup() && num_generated_tokens_to_validate > 0) {
+            if (is_speculative_sampling && num_generated_tokens_to_validate > 0) {
                 OPENVINO_ASSERT(running_sequence->get_generated_len() >= num_generated_tokens_to_validate,
                                 "Sampled speculative candidate count exceeds the generated sequence length.");
-                const size_t proposal_start =
-                    running_sequence->get_generated_len() - num_generated_tokens_to_validate;
-                for (size_t candidate_index = proposal_start;
+                for (size_t candidate_index = running_sequence->get_generated_len() - num_generated_tokens_to_validate;
                      candidate_index < running_sequence->get_generated_len();
                      ++candidate_index) {
-                    detail::validate_draft_proposal(running_sequence->get_draft_proposal(candidate_index),
-                                                    sequence_group_logits.get_shape()[2]);
+                    OPENVINO_ASSERT(!running_sequence->get_draft_proposal(candidate_index).empty(),
+                                    "Sampled speculative candidates require a proposal distribution.");
                 }
             }
             bool is_validation_passed = true;
@@ -1653,124 +1733,75 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
 
                 auto logit_vector = _get_logit_vector(sequence_group_logits, running_sequence_id, logit_token_offset);
                 logit_processor.apply(logit_vector);
-                std::optional<DraftProposal> draft_proposal;
-                if (collect_draft_proposals && !is_validation_mode_enabled && sampling_params.is_multinomial()) {
-                    draft_proposal = {{},
-                                      detail::materialize_sampling_probabilities(logit_vector,
-                                                                                 sequence_group_logits.get_shape()[2])};
-                }
-
-                if (is_validation_mode_enabled && sampling_params.do_sample &&
-                    !sampling_params.is_prompt_lookup() && generated_seq_token_offset > 0) {
-                    const size_t candidate_index =
-                        running_sequence->get_generated_len() - generated_seq_token_offset;
-                    const auto& sparse_proposal = running_sequence->get_draft_proposal(candidate_index);
-                    const auto target_probabilities =
-                        detail::materialize_sampling_probabilities(logit_vector,
-                                                                   sequence_group_logits.get_shape()[2]);
-                    const int64_t draft_token = running_sequence->get_generated_ids()[candidate_index];
-                    const float draft_probability = detail::proposal_probability(sparse_proposal, draft_token);
-                    OPENVINO_ASSERT(draft_probability > 0.0f,
-                                    "Selected draft token is absent from its proposal distribution.");
-                    const float target_probability = target_probabilities.at(static_cast<size_t>(draft_token));
-                    const bool accepted =
-                        detail::accept_draft_token(target_probability, draft_probability, rng_engine);
-                    if (accepted) {
-                        Token accepted_token(detail::reported_log_probability(logit_vector,
-                                                                               draft_token,
-                                                                               target_probability),
-                                             draft_token);
-                        running_sequence->update_generated_log_prob(candidate_index, accepted_token.m_log_prob);
-                        running_sequence->clear_draft_proposal(candidate_index);
-                        register_new_token(accepted_token,
-                                           running_sequence,
-                                           logit_processor,
-                                           false,
-                                           is_validation_mode_enabled);
-                        if (is_stop_token_id_hit(draft_token, sampling_params.stop_token_ids) &&
-                            !sampling_params.ignore_eos) {
-                            const size_t trailing_draft_tokens = generated_seq_token_offset - 1;
-                            if (trailing_draft_tokens > 0) {
-                                running_sequence->remove_last_tokens(trailing_draft_tokens);
-                                assisting_pipeline_info.max_removed_tokens_per_request =
-                                    std::max(assisting_pipeline_info.max_removed_tokens_per_request,
-                                             trailing_draft_tokens);
-                            }
-                            running_sequence->set_status(SequenceStatus::FINISHED);
-                            running_sequence->set_finish_reason(GenerationFinishReason::STOP);
-                            sg_sampling_info.sampler_output.m_dropped_sequences.push_back(
-                                running_sequence->get_id());
-                            break;
-                        }
-                        continue;
-                    }
-
-                    Token residual_token =
-                        detail::sample_residual_distribution(target_probabilities,
-                                                             sparse_proposal,
-                                                             rng_engine);
-                    residual_token.m_log_prob = detail::reported_log_probability(
-                        logit_vector,
-                        residual_token.m_index,
-                        target_probabilities[static_cast<size_t>(residual_token.m_index)]);
-                    running_sequence->remove_last_tokens(generated_seq_token_offset);
-                    assisting_pipeline_info.max_removed_tokens_per_request =
-                        std::max(assisting_pipeline_info.max_removed_tokens_per_request,
-                                 generated_seq_token_offset);
-                    register_new_token(residual_token,
-                                       running_sequence,
-                                       logit_processor,
-                                       true,
-                                       is_validation_mode_enabled);
-                    is_validation_passed = false;
-                    break;
-                }
 
                 Token sampled_token;
                 bool is_generate_n_tokens = false;
-                if (sampling_params.is_greedy_decoding()) {
-                    sampled_token = { _greedy_sample(logit_vector, sampling_params.logprobs) };
-                } else {
-                    // is_multinomial()
-                    is_generate_n_tokens = sequence_group->num_total_seqs() == 1;
-                    const size_t num_tokens_per_sequence = is_generate_n_tokens ? sampling_params.num_return_sequences : 1;
-                    is_generate_n_tokens &= (num_tokens_per_sequence > 1);
-                    auto sampled_token_ids = _multinomial_sample(logit_vector, num_tokens_per_sequence, rng_engine);
-                    OPENVINO_ASSERT(sampled_token_ids.size() == num_tokens_per_sequence,
-                                   "Multinomial sampler returned unexpected number of tokens");
-                    // to create n sequence just in case of `sequence_group->num_total_seqs() == 1` and `sampling_params.num_return_sequences > 1`
-                    if (is_generate_n_tokens) {
-                        const auto forked_seq_ids = create_n_forked_sequences(sequence_group, logit_processor, sampled_token_ids);
-                        sg_sampling_info.sampler_output.m_forked_sequences.insert({running_sequences[0]->get_id(), forked_seq_ids});
-                    }
-                    sampled_token = sampled_token_ids.front();
-                }
-                if (!is_validation_mode_enabled && m_d2t_mapping) { // compute token offset for draft model in speculative sampling
-                    ov::Tensor d2t_tensor = m_d2t_mapping->get_tensor_view();
-                    auto d2t = d2t_tensor.data<int64_t>();
-                    sampled_token.m_index = sampled_token.m_index + (d2t ? d2t[sampled_token.m_index] : 0);
-                }
                 // flag to add sampled token to generated sequence or extend logit processors only
-                bool is_extend_sequence = logit_token_offset == 0 || is_generate_n_tokens || !is_validation_passed;
-                if (is_validation_mode_enabled && !is_extend_sequence) {
-                    is_validation_passed =
-                        validate_candidate(running_sequences[running_sequence_id],
-                                           generated_seq_token_offset,
-                                           sampled_token,
-                                           is_extend_sequence,
-                                           assisting_pipeline_info.max_removed_tokens_per_request);
-                    // update log prob just while validation process
-                    if (!is_extend_sequence) {
-                        OPENVINO_ASSERT(generated_and_verified_len < running_sequences[running_sequence_id]->get_generated_len());
-                        running_sequence->update_generated_log_prob(generated_and_verified_len, sampled_token.m_log_prob);
+                bool is_extend_sequence = logit_token_offset == 0 || !is_validation_passed;
+                if (is_speculative_sampling && !is_extend_sequence) {
+                    const size_t candidate_index = generated_and_verified_len;
+                    const auto verdict =
+                        detail::verify_draft_token(logit_vector,
+                                                   running_sequence->get_generated_ids()[candidate_index],
+                                                   running_sequence->get_draft_proposal(candidate_index),
+                                                   rng_engine);
+                    sampled_token = verdict.token;
+                    if (verdict.accepted) {
+                        running_sequence->update_generated_log_prob(candidate_index, sampled_token.m_log_prob);
+                        running_sequence->clear_draft_proposal(candidate_index);
+                    } else {
+                        // The replacement is drawn for the rejected position, so it takes the place of the rejected
+                        // candidate and every candidate after it.
+                        running_sequence->remove_last_tokens(generated_seq_token_offset);
+                        assisting_pipeline_info.max_removed_tokens_per_request =
+                            std::max(assisting_pipeline_info.max_removed_tokens_per_request, generated_seq_token_offset);
+                        is_extend_sequence = true;
+                        is_validation_passed = false;
+                    }
+                } else {
+                    if (sampling_params.is_greedy_decoding()) {
+                        sampled_token = { _greedy_sample(logit_vector, sampling_params.logprobs) };
+                    } else {
+                        // is_multinomial()
+                        is_generate_n_tokens = sequence_group->num_total_seqs() == 1;
+                        const size_t num_tokens_per_sequence = is_generate_n_tokens ? sampling_params.num_return_sequences : 1;
+                        is_generate_n_tokens &= (num_tokens_per_sequence > 1);
+                        auto sampled_token_ids = _multinomial_sample(logit_vector, num_tokens_per_sequence, rng_engine);
+                        OPENVINO_ASSERT(sampled_token_ids.size() == num_tokens_per_sequence,
+                                       "Multinomial sampler returned unexpected number of tokens");
+                        // to create n sequence just in case of `sequence_group->num_total_seqs() == 1` and `sampling_params.num_return_sequences > 1`
+                        if (is_generate_n_tokens) {
+                            const auto forked_seq_ids = create_n_forked_sequences(sequence_group, logit_processor, sampled_token_ids);
+                            sg_sampling_info.sampler_output.m_forked_sequences.insert({running_sequences[0]->get_id(), forked_seq_ids});
+                        }
+                        sampled_token = sampled_token_ids.front();
+                    }
+                    if (!is_validation_mode_enabled && m_d2t_mapping) { // compute token offset for draft model in speculative sampling
+                        ov::Tensor d2t_tensor = m_d2t_mapping->get_tensor_view();
+                        auto d2t = d2t_tensor.data<int64_t>();
+                        sampled_token.m_index = sampled_token.m_index + (d2t ? d2t[sampled_token.m_index] : 0);
+                    }
+                    is_extend_sequence = is_extend_sequence || is_generate_n_tokens;
+                    if (is_validation_mode_enabled && !is_extend_sequence) {
+                        is_validation_passed =
+                            validate_candidate(running_sequences[running_sequence_id],
+                                               generated_seq_token_offset,
+                                               sampled_token,
+                                               is_extend_sequence,
+                                               assisting_pipeline_info.max_removed_tokens_per_request);
+                        // update log prob just while validation process
+                        if (!is_extend_sequence) {
+                            OPENVINO_ASSERT(generated_and_verified_len < running_sequences[running_sequence_id]->get_generated_len());
+                            running_sequence->update_generated_log_prob(generated_and_verified_len, sampled_token.m_log_prob);
+                        }
                     }
                 }
                 register_new_token(sampled_token, running_sequences[running_sequence_id], logit_processor, is_extend_sequence, is_validation_mode_enabled);
-                if (draft_proposal) {
+                if (is_draft_proposal_needed) {
                     OPENVINO_ASSERT(is_extend_sequence,
                                     "Draft proposal must be attached to a newly appended sampled token.");
                     running_sequence->set_draft_proposal(running_sequence->get_generated_len() - 1,
-                                                         std::move(*draft_proposal));
+                                                         detail::make_draft_proposal(logit_vector, d2t));
                 }
                                
                 // to exit from sampling in case of failed token validation
