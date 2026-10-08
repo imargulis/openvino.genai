@@ -1163,7 +1163,6 @@ void register_new_token(const Token& sampled_token,
     if (is_extend_sequence) {
         running_sequence->append_token(sampled_token.m_index, sampled_token.m_log_prob);
     }
-    logit_processor.update_generated_len(logit_processor.get_generated_len() + 1);
     if (!is_validation_mode_enabled &&
         logit_processor.get_assistant_confidence_threshold() > 0 &&
         (std::fabs(std::exp(sampled_token.m_log_prob)) < logit_processor.get_assistant_confidence_threshold() || sampled_token.m_log_prob == 0)) {
@@ -1732,6 +1731,9 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
                 }
 
                 auto logit_vector = _get_logit_vector(sequence_group_logits, running_sequence_id, logit_token_offset);
+                // The processor is shared by the sequences of the group and by the positions of a validation window,
+                // so min_new_tokens is evaluated against the tokens generated before this position of this sequence.
+                logit_processor.update_generated_len(generated_and_verified_len);
                 logit_processor.apply(logit_vector);
 
                 Token sampled_token;
