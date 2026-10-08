@@ -53,6 +53,7 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::make_draft_sampling_params(
     GenerationConfig draft_sampling_params = sampling_params;
     draft_sampling_params.ignore_eos = true;
     draft_sampling_params.stop_strings = {};
+    draft_sampling_params.rng_seed = detail::proposal_rng_seed(sampling_params.rng_seed);
     return draft_sampling_params;
 }
 
