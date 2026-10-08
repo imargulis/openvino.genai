@@ -137,9 +137,7 @@ GenerationHandle ContinuousBatchingPipeline::MtpDecodingImpl::add_request(
     validate_mtp_generation_config(sampling_params);
 
     std::lock_guard<std::mutex> lock(m_draft_generations_mutex);
-    auto draft_sampling_params = sampling_params;
-    draft_sampling_params.ignore_eos = true;
-    draft_sampling_params.stop_strings = {};
+    const auto draft_sampling_params = make_draft_sampling_params(sampling_params);
     // Draft gets shifted embeds only; VLM extras belong to the main model.
     ov::Tensor draft_input_embeds = create_draft_input_embeds(input_ids);
     // Use insert_or_assign, not insert: a finished prior request may leave a stale (stopped) handle
