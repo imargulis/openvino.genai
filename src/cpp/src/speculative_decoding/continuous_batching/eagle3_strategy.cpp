@@ -265,9 +265,7 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::add_request(uint64_t request_id,
                                             lm_extra_inputs);
     }
 
-    auto draft_sampling_params = sampling_params;
-    draft_sampling_params.ignore_eos = true;
-    draft_sampling_params.stop_strings = {};
+    const auto draft_sampling_params = make_draft_sampling_params(sampling_params);
     // remove first token from input_ids to create the draft model input
     // refer to: https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py#L617
     ov::Tensor draft_input = create_draft_input(input_ids);
@@ -316,9 +314,7 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::add_request(uint64_t request_id,
         return m_main_pipeline->add_request(request_id, prompt, sampling_params);
     }
 
-    auto draft_sampling_params = sampling_params;
-    draft_sampling_params.ignore_eos = true;
-    draft_sampling_params.stop_strings = {};
+    const auto draft_sampling_params = make_draft_sampling_params(sampling_params);
     // remove first token from input_ids to create draft_input_ids
     // add_special_tokens is false for better compression rate
     auto input_ids = m_tokenizer.encode(prompt, ov::genai::add_special_tokens(false)).input_ids;
