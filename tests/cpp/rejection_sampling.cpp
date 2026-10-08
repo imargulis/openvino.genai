@@ -516,6 +516,56 @@ TEST(RejectionSampling, LiftsMinNewTokensMaskInsideTheValidationWindow) {
     EXPECT_EQ(sequence->get_generated_ids(), (TokenIds{0, 1, 2, 4}));
 }
 
+// min_new_tokens = 5 masks the stop token for the first five generated tokens. Rejecting candidate 2 in favour of 3
+// leaves three generated tokens, so the stop token 4 must stay masked at the fourth even though its logit is largest.
+TEST(RejectionSampling, KeepsMinNewTokensMaskAfterRejection) {
+    GenerationConfig config;
+    config.max_new_tokens = 30;
+    config.do_sample = true;
+    config.top_k = 1;
+    config.min_new_tokens = 5;
+    config.stop_token_ids = {4};
+    auto group = make_group(config);
+    auto sequence = add_candidates(group, {1, 2}, {{{1}, {1.f}}, {{2}, {1.f}}});
+    std::vector<float> window_logits = {
+        0, 5.f, 0, 0, 0,
+        0, 0, 0, 5.f, 0,
+        5.f, 0, 0, 0, 0,
+    };
+    Sampler sampler;
+    sampler.sample({group}, logits_tensor(window_logits, 3), true);
+    ASSERT_EQ(sequence->get_generated_ids(), (TokenIds{0, 1, 3}));
+
+    group->schedule_tokens(group->get_num_available_tokens_for_batching());
+    std::vector<float> next_logits = {0, 0, 4.f, 0, 5.f};
+    sampler.sample({group}, logits_tensor(next_logits, 1), true);
+
+    EXPECT_EQ(sequence->get_generated_ids(), (TokenIds{0, 1, 3, 2}));
+    EXPECT_FALSE(sequence->has_finished());
+}
+
+// Candidate 1 accepted at the first position is history for the second: presence_penalty turns logit 5 of token 1
+// into -5 there, so p(1) = 0 and the repeated candidate is replaced by 2, as in target-only decoding.
+TEST(RejectionSampling, PenalizesCandidatesAcceptedEarlierInTheWindow) {
+    GenerationConfig config;
+    config.max_new_tokens = 30;
+    config.do_sample = true;
+    config.top_k = 1;
+    config.presence_penalty = 10.0f;
+    auto group = make_group(config);
+    auto sequence = add_candidates(group, {1, 1}, {{{1}, {1.f}}, {{1}, {1.f}}});
+    std::vector<float> logits = {
+        0, 5.f, 0, 0, 0,
+        0, 5.f, 4.f, 0, 0,
+        5.f, 0, 0, 0, 0,
+    };
+    Sampler sampler;
+    sampler.sample({group}, logits_tensor(logits, 3), true);
+
+    EXPECT_EQ(sequence->get_generated_ids(), (TokenIds{0, 1, 2}));
+    EXPECT_EQ(group->get_num_processed_tokens(), 5u + 2u);
+}
+
 // An accepted stop token ends generation and discards the candidates drafted after it.
 TEST(RejectionSampling, AcceptedStopTokenDiscardsTrailingCandidates) {
     GenerationConfig config;

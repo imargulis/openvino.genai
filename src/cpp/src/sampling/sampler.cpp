@@ -2018,7 +2018,7 @@ SamplerOutput Sampler::sample(const std::vector<SequenceGroup::Ptr> & sequence_g
             auto min_processed_tokens = sequence_group->get_prompt_len() + assisting_pipeline_info.min_generated_len - 1;
             sequence_group->update_processed_tokens_num(min_processed_tokens);
             auto& logit_processor = get_logit_processor(sequence_group->get_request_id());
-            logit_processor.update_generated_len(min_processed_tokens);
+            logit_processor.update_generated_len(assisting_pipeline_info.min_generated_len);
         }
         if (assisting_pipeline_info.updated_validation_len) {
             sequence_group->set_num_validated_tokens(assisting_pipeline_info.updated_validation_len);
