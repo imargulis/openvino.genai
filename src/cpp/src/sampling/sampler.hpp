@@ -4,9 +4,10 @@
 
 #pragma once
 
-#include <list>
 #include <cassert>
+#include <cstdint>
 #include <cstdlib>
+#include <list>
 #include <limits>
 #include <map>
 #include <algorithm>
@@ -29,6 +30,39 @@
 #include "sampling/structured_output/structured_output_controller.hpp"
 
 namespace ov::genai {
+
+namespace detail {
+// Probability with which multinomial sampling draws token_id from the processed logits; 0 for tokens it
+// cannot draw, including ids beyond the logits width.
+float sampling_probability(const Logits& logits, int64_t token_id);
+
+// The distribution multinomial sampling draws from: sparse over the surviving candidates when the logit
+// processor selected them, dense otherwise. With d2t (EAGLE), draft id i is recorded as target id i + d2t[i].
+DraftProposal make_draft_proposal(const Logits& logits, const int64_t* d2t = nullptr);
+
+void validate_draft_proposal(const DraftProposal& proposal);
+float proposal_probability(const DraftProposal& proposal, int64_t token_id);
+float reported_log_probability(const Logits& logits, int64_t token_id, float sampling_probability);
+bool accept_draft_token(float target_probability, float draft_probability, std::mt19937& rng_engine);
+
+// Draws from the residual max(0, p - q) normalized, where p is the target distribution of the processed
+// logits. Draft ids outside the target logits have p = 0 and target ids absent from q have q = 0. Falls back
+// to p when the residual has no mass, e.g. q == p up to rounding.
+Token sample_residual(const Logits& target_logits, const DraftProposal& proposal, std::mt19937& rng_engine);
+
+struct DraftTokenVerdict {
+    Token token;
+    bool accepted = false;
+};
+
+// Speculative sampling (Leviathan et al., 2023): accepts draft_token with probability min(1, p / q), otherwise
+// replaces it with a residual sample, so the emitted token follows the target distribution p exactly.
+DraftTokenVerdict verify_draft_token(const Logits& target_logits,
+                                     int64_t draft_token,
+                                     const DraftProposal& proposal,
+                                     std::mt19937& rng_engine);
+}  // namespace detail
+
 // Handle stop_token_ids
 inline bool is_stop_token_id_hit(int64_t generated_token, const std::set<int64_t> & stop_token_ids) {
     for (auto & stop_token_id : stop_token_ids) {
@@ -143,9 +177,11 @@ class Sampler {
     std::vector<int64_t> _try_finish_generation(SequenceGroup::Ptr& sequence_group,
                                                  const std::pair<size_t, std::set<std::string>>& stop_strings);
 
-    bool validate_candidate(Sequence::Ptr running_sequence, size_t& token_idx, Token& sampled_token,
-                            bool& is_extend_sequence, size_t& max_removed_tokens, bool do_sample, bool has_real_probabilities,
-                            std::mt19937& rng_engine);
+    bool validate_candidate(Sequence::Ptr running_sequence,
+                            size_t& token_idx,
+                            Token& sampled_token,
+                            bool& is_extend_sequence,
+                            size_t& max_removed_tokens);
 
     // Verify the candidate tree against target-model logits: greedily accept the longest
     // matching prefix across all tree paths, then append a bonus token.
@@ -157,7 +193,8 @@ class Sampler {
 
     SequenceGroupSamplingInfo sample_from_sequence_group(SequenceGroup::Ptr sequence_group, ov::Tensor sequence_group_logits,
                                                         RequestSamplerContext& context,
-                                                        bool is_validation_mode_enabled);
+                                                        bool is_validation_mode_enabled,
+                                                        bool collect_draft_proposals);
 
     // request ID => beam search tracking information (kept separate — has its own mutex)
     std::map<uint64_t, GroupBeamSearcher> m_beam_search_info;
@@ -180,7 +217,10 @@ public:
     Sampler(size_t num_threads = 1): m_thread_pool(num_threads) {};
     explicit Sampler(const Tokenizer & tokenizer, size_t num_threads = 1) : m_tokenizer(tokenizer), m_thread_pool(num_threads) {};
 
-    SamplerOutput sample(const std::vector<SequenceGroup::Ptr> & sequence_groups, ov::Tensor logits, bool is_validation_mode_enabled = false);
+    SamplerOutput sample(const std::vector<SequenceGroup::Ptr>& sequence_groups,
+                         ov::Tensor logits,
+                         bool is_validation_mode_enabled = false,
+                         bool collect_draft_proposals = false);
 
     // Non-CB pipelines required API for seed. The CB path uses per-request engines from m_request_contexts.
     void set_seed(size_t new_seed) { m_default_seed = new_seed; }

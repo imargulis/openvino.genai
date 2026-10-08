@@ -38,6 +38,9 @@ protected:
 
     // flag to enable validation mode for sampler
     bool m_is_validation_mode_enabled = false;
+    // Draft pipelines retain the complete proposal distribution used for each
+    // sampled candidate so the target can verify it exactly.
+    bool m_collect_draft_proposals = false;
 
     size_t m_num_decoder_layers = 0;
 
