@@ -730,8 +730,12 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_step() {
         const auto sample_start = std::chrono::steady_clock::now();
         const bool defer_sequence_group_updates =
             m_scheduler->has_linear_attention_cache() && m_is_validation_mode_enabled;
-        sampler_output = m_sampler->sample(
-            m_requests, logits, m_is_validation_mode_enabled, false, defer_sequence_group_updates);
+        sampler_output = m_sampler->sample(m_requests,
+                                            logits,
+                                            m_is_validation_mode_enabled,
+                                            false,
+                                            defer_sequence_group_updates,
+                                            m_collect_draft_proposals);
         m_pipeline_metrics.sampling_duration =
             PerfMetrics::get_microsec(std::chrono::steady_clock::now() - sample_start);
         m_batch_size = sampler_output.num_generated_tokens;
