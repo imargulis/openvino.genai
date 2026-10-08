@@ -397,6 +397,61 @@ TEST_F(CBForSDTest, add_tokens__one_sequence) {
     ASSERT_EQ(after.at(0).at(0).log_probs, log_probs);
 }
 
+// The main sampler verifies each candidate against the q(.) stored at its position, so proposals must stay attached
+// to the tokens they were drafted for across update rounds.
+TEST_F(CBForSDTest, draft_proposals_follow_inserted_tokens__one_sequence) {
+    std::vector<int64_t> input_vector{0, 1, 2, 3, 4};
+    ov::Tensor input_tensor(ov::element::i64, ov::Shape{1, 5}, input_vector.data());
+    m_pipeline.add_request(0, input_tensor);
+
+    std::vector<int64_t> tokens = { 0, 1, 2 };
+    std::vector<float> log_probs = { 0.1f, 0.2f, 0.3f };
+    ov::genai::GeneratedSequences candidate{{ 0, ov::genai::GeneratedSequence(tokens, log_probs) }};
+    ASSERT_EQ(m_pipeline.update_request(0, candidate, false).inserted_tokens_cnt, 3);
+
+    // The draft proposed tokens 3 and 4 this round.
+    tokens = { 0, 1, 2, 3, 4 };
+    log_probs = { 0.1f, 0.2f, 0.3f, 0.4f, 0.5f };
+    const auto q3 = std::make_shared<const ov::genai::DraftProposal>(ov::genai::DraftProposal{{3, 4}, {0.75f, 0.25f}});
+    const auto q4 = std::make_shared<const ov::genai::DraftProposal>(ov::genai::DraftProposal{{}, {0, 0, 0, 0, 1.f}});
+    ov::genai::GeneratedSequences candidate_1{
+        { 0, ov::genai::GeneratedSequence(tokens, log_probs, 0, {}, nullptr, {nullptr, nullptr, nullptr, q3, q4}) }};
+    ASSERT_EQ(m_pipeline.update_request(0, candidate_1, false).inserted_tokens_cnt, 2);
+
+    auto proposals = m_pipeline.get_generated_requests().at(0).at(0).draft_proposals;
+    ASSERT_EQ(proposals, (std::vector<ov::genai::DraftProposalPtr>{nullptr, nullptr, nullptr, q3, q4}));
+
+    // A round without proposals leaves the pending ones in place.
+    tokens.push_back(5);
+    log_probs.push_back(0.6f);
+    ov::genai::GeneratedSequences candidate_2{{ 0, ov::genai::GeneratedSequence(tokens, log_probs) }};
+    ASSERT_EQ(m_pipeline.update_request(0, candidate_2, false).inserted_tokens_cnt, 1);
+    proposals = m_pipeline.get_generated_requests().at(0).at(0).draft_proposals;
+    ASSERT_EQ(proposals, (std::vector<ov::genai::DraftProposalPtr>{nullptr, nullptr, nullptr, q3, q4, nullptr}));
+
+    // Synchronizing a draft sequence with the main model's tokens commits them, so their proposals are dropped.
+    ASSERT_EQ(m_pipeline.update_request(0, candidate_2, true).inserted_tokens_cnt, 0);
+    EXPECT_TRUE(m_pipeline.get_generated_requests().at(0).at(0).draft_proposals.empty());
+}
+
+TEST_F(CBForSDTest, rejects_invalid_draft_proposal__one_sequence) {
+    std::vector<int64_t> input_vector{0, 1, 2, 3, 4};
+    ov::Tensor input_tensor(ov::element::i64, ov::Shape{1, 5}, input_vector.data());
+    m_pipeline.add_request(0, input_tensor);
+
+    std::vector<int64_t> tokens = { 0 };
+    std::vector<float> log_probs = { 0.1f };
+    ov::genai::GeneratedSequences candidate{{ 0, ov::genai::GeneratedSequence(tokens, log_probs) }};
+    ASSERT_EQ(m_pipeline.update_request(0, candidate, false).inserted_tokens_cnt, 1);
+
+    tokens = { 0, 1 };
+    log_probs = { 0.1f, 0.2f };
+    const auto incomplete = std::make_shared<const ov::genai::DraftProposal>(ov::genai::DraftProposal{{1}, {0.5f}});
+    ov::genai::GeneratedSequences candidate_1{
+        { 0, ov::genai::GeneratedSequence(tokens, log_probs, 0, {}, nullptr, {nullptr, incomplete}) }};
+    EXPECT_THROW(m_pipeline.update_request(0, candidate_1, false), ov::Exception);
+}
+
 TEST_F(CBForSDTest, dflash_candidate_update_without_logit_processor_update__one_sequence) {
     std::vector<int64_t> input_vector{0, 1, 2, 3, 4};
     ov::Tensor input_tensor(ov::element::i64, ov::Shape{1, 5}, input_vector.data());
