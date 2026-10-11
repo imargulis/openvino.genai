@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -17,6 +18,9 @@ namespace ov {
 namespace genai {
 namespace utils {
 namespace dflash {
+
+inline constexpr const char* DFLASH2_SELECTOR_KIND = "dflash2";
+inline constexpr const char* DSPARK_MARKOV_SELECTOR_KIND = "dspark_markov";
 
 /**
  * @brief Runtime configuration for DFlash speculative decoding.
@@ -31,6 +35,10 @@ struct DFlashRTInfo {
     float input_embedding_scale = 1.0f;
     float output_multiplier = 1.0f;
     float final_logit_softcapping = 0.0f;
+    // A DSpark backbone with a Markov head; the head is a separate step model.
+    size_t dspark_markov_rank = 0;
+    std::string dspark_markov_head_type;
+    std::shared_ptr<ov::Model> dspark_markov_model;
 };
 
 struct DFlashSelectorRTInfo {
@@ -41,6 +49,8 @@ struct DFlashSelectorRTInfo {
     size_t top_k = 0;
     size_t hidden_size = 0;
     size_t vocab_size = 0;
+    std::string kind = DFLASH2_SELECTOR_KIND;
+    std::string markov_head_type;
 };
 
 /**
@@ -73,10 +83,25 @@ void apply_dflash_gpu_compile_properties(const DFlashRTInfo& info,
                                          const std::string& device,
                                          ov::AnyMap& compile_properties);
 
+/**
+ * @brief Reads the DSpark Markov step model exported next to a DSpark draft backbone.
+ *
+ * Does nothing unless apply_dflash_rt_info() found a Markov head in the backbone metadata.
+ */
+void read_dspark_markov_model(const std::filesystem::path& models_path, ov::AnyMap& properties);
+
+/**
+ * @brief Validates the DSpark Markov step model: prev_token_ids [N] -> markov_bias [N, vocab].
+ */
+void validate_dspark_markov_model(const std::shared_ptr<ov::Model>& model, const DFlashRTInfo& info);
+
 void apply_dflash_selector_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap& properties);
 
 DFlashSelectorRTInfo extract_dflash_selector_info_from_config(ov::AnyMap& config);
 
+/**
+ * @brief Validates a Top-K lattice selector: a DFlash-2 candidate selector or a DSpark Markov selector.
+ */
 void validate_dflash_selector_model(const std::shared_ptr<ov::Model>& model,
                                     const DFlashSelectorRTInfo& info);
 

@@ -38,6 +38,12 @@ namespace {
 constexpr const char* DFLASH_HIDDEN_STATES_RT_INFO_KEY = "hidden_states_decoder_layers";
 constexpr const char* LAST_HIDDEN_STATE_OUTPUT_NAME = "last_hidden_state";
 constexpr const char* DFLASH_GPU_MIN_ACTIVATIONS_SCALE_FACTOR = "dflash_gpu_min_activations_scale_factor";
+constexpr const char* DSPARK_MARKOV_RANK = "dspark_markov_rank";
+constexpr const char* DSPARK_MARKOV_HEAD_TYPE = "dspark_markov_head_type";
+constexpr const char* DSPARK_MARKOV_MODEL = "dspark_markov_model";
+constexpr const char* DSPARK_MARKOV_MODEL_FILE_NAME = "openvino_markov_model.xml";
+constexpr const char* DSPARK_VANILLA_MARKOV_HEAD = "vanilla";
+constexpr const char* DSPARK_MARKOV_STEP_INTERFACE = "markov_step_v1";
 
 float parse_dflash_gpu_min_activations_scale_factor(const std::string& value) {
     try {
@@ -310,6 +316,12 @@ void apply_dflash_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap& propert
     if (auto softcap = get_rt_info_value<std::string>(model, {"dflash", "final_logit_softcapping"})) {
         properties["dflash_final_logit_softcapping"] = std::stof(*softcap);
     }
+    if (auto markov_rank = get_rt_info_value<std::string>(model, {"dspark", "markov_rank"})) {
+        properties[DSPARK_MARKOV_RANK] = static_cast<size_t>(std::stoull(*markov_rank));
+    }
+    if (auto head_type = get_rt_info_value<std::string>(model, {"dspark", "markov_head_type"})) {
+        properties[DSPARK_MARKOV_HEAD_TYPE] = *head_type;
+    }
 }
 
 DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config) {
@@ -378,8 +390,84 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config) {
         info.final_logit_softcapping = softcap_it->second.as<float>();
         config.erase(softcap_it);
     }
+    if (auto rank_it = config.find(DSPARK_MARKOV_RANK); rank_it != config.end()) {
+        info.dspark_markov_rank = rank_it->second.as<size_t>();
+        config.erase(rank_it);
+    }
+    if (auto head_type_it = config.find(DSPARK_MARKOV_HEAD_TYPE); head_type_it != config.end()) {
+        info.dspark_markov_head_type = head_type_it->second.as<std::string>();
+        config.erase(head_type_it);
+    }
+    if (auto model_it = config.find(DSPARK_MARKOV_MODEL); model_it != config.end()) {
+        info.dspark_markov_model = model_it->second.as<std::shared_ptr<ov::Model>>();
+        config.erase(model_it);
+    }
+    if (info.dspark_markov_rank > 0) {
+        OPENVINO_ASSERT(info.dspark_markov_head_type == DSPARK_VANILLA_MARKOV_HEAD,
+                        "Unsupported DSpark markov_head_type '",
+                        info.dspark_markov_head_type,
+                        "'. Supported Markov heads: vanilla.");
+        OPENVINO_ASSERT(info.dspark_markov_model,
+                        "The DSpark draft has a Markov head but no Markov step model. Load the draft with "
+                        "draft_model(<draft folder>) so that ",
+                        DSPARK_MARKOV_MODEL_FILE_NAME,
+                        " is read next to the draft backbone.");
+        validate_dspark_markov_model(info.dspark_markov_model, info);
+    }
 
     return info;
+}
+
+void read_dspark_markov_model(const std::filesystem::path& models_path, ov::AnyMap& properties) {
+    auto rank_it = properties.find(DSPARK_MARKOV_RANK);
+    if (rank_it == properties.end() || rank_it->second.as<size_t>() == 0) {
+        return;
+    }
+    const auto model_path = models_path / DSPARK_MARKOV_MODEL_FILE_NAME;
+    OPENVINO_ASSERT(std::filesystem::exists(model_path),
+                    "The DSpark draft in ",
+                    models_path,
+                    " has a Markov head, but ",
+                    DSPARK_MARKOV_MODEL_FILE_NAME,
+                    " is missing. Re-export the draft with an optimum-intel version that exports the Markov head.");
+    properties[DSPARK_MARKOV_MODEL] = utils::singleton_core().read_model(model_path);
+}
+
+void validate_dspark_markov_model(const std::shared_ptr<ov::Model>& model, const DFlashRTInfo& info) {
+    OPENVINO_ASSERT(model, "DSpark Markov step model cannot be null.");
+    OPENVINO_ASSERT(model->has_rt_info("dspark_markov_mode") && model->get_rt_info<bool>("dspark_markov_mode"),
+                    "The DSpark Markov step model must set dspark_markov_mode RT info.");
+    const auto interface = get_rt_info_value<std::string>(model, {"dspark_markov", "interface"});
+    OPENVINO_ASSERT(interface && *interface == DSPARK_MARKOV_STEP_INTERFACE,
+                    "Unsupported DSpark Markov step interface: ",
+                    interface.value_or("<missing>"),
+                    ".");
+    const auto head_type = get_rt_info_value<std::string>(model, {"dspark_markov", "head_type"});
+    OPENVINO_ASSERT(head_type && *head_type == info.dspark_markov_head_type,
+                    "The DSpark Markov step head type does not match the draft backbone.");
+    const auto markov_rank = get_rt_info_value<std::string>(model, {"dspark_markov", "markov_rank"});
+    OPENVINO_ASSERT(markov_rank && std::stoull(*markov_rank) == info.dspark_markov_rank,
+                    "The DSpark Markov step rank does not match the draft backbone.");
+    OPENVINO_ASSERT(model->get_variables().empty(), "The DSpark Markov step model must be stateless.");
+
+    OPENVINO_ASSERT(model->inputs().size() == 1 && utils::has_input(model, "prev_token_ids"),
+                    "The DSpark Markov step model must have a single 'prev_token_ids' input.");
+    const auto input = model->input("prev_token_ids");
+    const auto input_shape = input.get_partial_shape();
+    OPENVINO_ASSERT(input.get_element_type() == ov::element::i64 && input_shape.rank().is_static() &&
+                        input_shape.rank().get_length() == 1,
+                    "The DSpark Markov step input 'prev_token_ids' must be a rank-1 I64 tensor.");
+    OPENVINO_ASSERT(model->outputs().size() == 1, "The DSpark Markov step model must have a single output.");
+    const auto output = model->output("markov_bias");
+    const auto output_shape = output.get_partial_shape();
+    OPENVINO_ASSERT(output.get_element_type() == ov::element::f32 && output_shape.rank().is_static() &&
+                        output_shape.rank().get_length() == 2,
+                    "The DSpark Markov step output 'markov_bias' must be a rank-2 FP32 tensor.");
+    if (auto vocab_size = get_rt_info_value<std::string>(model, {"dspark_markov", "vocab_size"});
+        vocab_size && output_shape[1].is_static()) {
+        OPENVINO_ASSERT(static_cast<size_t>(output_shape[1].get_length()) == std::stoull(*vocab_size),
+                        "The DSpark Markov step vocabulary size does not match its metadata.");
+    }
 }
 
 void apply_dflash_gpu_compile_properties(const DFlashRTInfo& info,
@@ -409,6 +497,12 @@ void apply_dflash_selector_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap
         return;
     }
     properties["dflash_selector_mode"] = true;
+    if (auto kind = get_rt_info_value<std::string>(model, {"dflash_selector", "kind"})) {
+        properties["dflash_selector_kind"] = *kind;
+    }
+    if (auto head_type = get_rt_info_value<std::string>(model, {"dflash_selector", "markov_head_type"})) {
+        properties["dflash_selector_markov_head_type"] = *head_type;
+    }
     if (auto version = get_rt_info_value<std::string>(model, {"dflash_selector", "dflash_version"})) {
         properties["dflash_selector_version"] = static_cast<int64_t>(std::stoll(*version));
     }
@@ -443,17 +537,25 @@ DFlashSelectorRTInfo extract_dflash_selector_info_from_config(ov::AnyMap& config
 
     auto extract_required = [&config](const std::string& name) {
         auto it = config.find(name);
-        OPENVINO_ASSERT(it != config.end(), "DFlash-2 selector is missing ", name, " RT info.");
+        OPENVINO_ASSERT(it != config.end(), "DFlash selector is missing ", name, " RT info.");
         auto value = it->second;
         config.erase(it);
         return value;
     };
-    info.dflash_version = extract_required("dflash_selector_version").as<int64_t>();
+    if (auto kind_it = config.find("dflash_selector_kind"); kind_it != config.end()) {
+        info.kind = kind_it->second.as<std::string>();
+        config.erase(kind_it);
+    }
     info.interface = extract_required("dflash_selector_interface").as<std::string>();
     info.score_semantics = extract_required("dflash_selector_score_semantics").as<std::string>();
     info.top_k = extract_required("dflash_selector_top_k").as<size_t>();
-    info.hidden_size = extract_required("dflash_selector_hidden_size").as<size_t>();
     info.vocab_size = extract_required("dflash_selector_vocab_size").as<size_t>();
+    if (info.kind == DSPARK_MARKOV_SELECTOR_KIND) {
+        info.markov_head_type = extract_required("dflash_selector_markov_head_type").as<std::string>();
+    } else {
+        info.dflash_version = extract_required("dflash_selector_version").as<int64_t>();
+        info.hidden_size = extract_required("dflash_selector_hidden_size").as<size_t>();
+    }
     return info;
 }
 
@@ -461,14 +563,27 @@ void validate_dflash_selector_model(const std::shared_ptr<ov::Model>& model,
                                     const DFlashSelectorRTInfo& info) {
     OPENVINO_ASSERT(model, "DFlash-2 selector model cannot be null.");
     OPENVINO_ASSERT(info.selector_mode, "DFlash-2 selector RT info must enable selector_mode.");
-    OPENVINO_ASSERT(info.dflash_version == 2, "DFlash-2 selector version must be 2.");
+    const bool is_dspark_markov = info.kind == DSPARK_MARKOV_SELECTOR_KIND;
+    OPENVINO_ASSERT(is_dspark_markov || info.kind == DFLASH2_SELECTOR_KIND,
+                    "Unsupported DFlash selector kind: ",
+                    info.kind,
+                    ".");
+    if (is_dspark_markov) {
+        OPENVINO_ASSERT(info.markov_head_type == DSPARK_VANILLA_MARKOV_HEAD,
+                        "Unsupported DSpark selector markov_head_type '",
+                        info.markov_head_type,
+                        "'. Supported Markov heads: vanilla.");
+    } else {
+        OPENVINO_ASSERT(info.dflash_version == 2, "DFlash-2 selector version must be 2.");
+        OPENVINO_ASSERT(info.hidden_size > 0, "DFlash-2 selector structural metadata must be positive.");
+    }
     OPENVINO_ASSERT(info.interface == "topk_lattice_v1",
                     "Unsupported DFlash-2 selector interface: ",
                     info.interface,
                     ".");
     OPENVINO_ASSERT(info.score_semantics == "unary_inclusive",
                     "DFlash-2 selector score_semantics must be 'unary_inclusive'.");
-    OPENVINO_ASSERT(info.top_k > 0 && info.hidden_size > 0 && info.vocab_size > 0,
+    OPENVINO_ASSERT(info.top_k > 0 && info.vocab_size > 0,
                     "DFlash-2 selector structural metadata must be positive.");
     OPENVINO_ASSERT(info.top_k <= info.vocab_size,
                     "DFlash-2 selector top_k cannot exceed vocab_size.");
@@ -495,14 +610,19 @@ void validate_dflash_selector_model(const std::shared_ptr<ov::Model>& model,
         return shape;
     };
     const auto logits_shape = validate_input("draft_logits", ov::element::f32, 3);
-    const auto hidden_shape = validate_input("draft_hidden_states", ov::element::f32, 3);
     validate_input("anchor_token_ids", ov::element::i64, 1);
     OPENVINO_ASSERT(logits_shape[2].is_dynamic() ||
                         static_cast<size_t>(logits_shape[2].get_length()) == info.vocab_size,
                     "DFlash-2 selector logits vocabulary size does not match metadata.");
-    OPENVINO_ASSERT(hidden_shape[2].is_dynamic() ||
-                        static_cast<size_t>(hidden_shape[2].get_length()) == info.hidden_size,
-                    "DFlash-2 selector hidden size does not match metadata.");
+    if (is_dspark_markov) {
+        OPENVINO_ASSERT(model->inputs().size() == 2,
+                        "The DSpark Markov selector must take only draft_logits and anchor_token_ids.");
+    } else {
+        const auto hidden_shape = validate_input("draft_hidden_states", ov::element::f32, 3);
+        OPENVINO_ASSERT(hidden_shape[2].is_dynamic() ||
+                            static_cast<size_t>(hidden_shape[2].get_length()) == info.hidden_size,
+                        "DFlash-2 selector hidden size does not match metadata.");
+    }
     OPENVINO_ASSERT(model->outputs().size() == 2,
                     "DFlash-2 selector must expose edge_scores and candidate_ids outputs.");
     const auto edge_scores = model->output("edge_scores");

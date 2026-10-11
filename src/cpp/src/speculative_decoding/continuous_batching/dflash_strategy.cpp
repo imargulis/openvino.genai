@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <numeric>
@@ -42,6 +43,11 @@ struct DFlashProposalResult {
 
 std::vector<float> zero_log_probs(size_t count) {
     return std::vector<float>(count, 0.0f);
+}
+
+bool selector_uses_draft_hidden_states(bool selector_enabled,
+                                       const ov::genai::utils::dflash::DFlashSelectorRTInfo& selector_rt_info) {
+    return selector_enabled && selector_rt_info.kind != ov::genai::utils::dflash::DSPARK_MARKOV_SELECTOR_KIND;
 }
 
 bool has_compiled_input(const ov::CompiledModel& model, const std::string& name) {
@@ -88,12 +94,13 @@ public:
           m_embedding_model(std::move(embedding_model)),
           m_request(create_draft_infer_request(model_desc,
                                                static_cast<bool>(m_embedding_model),
-                                               selector_enabled,
+                                               selector_uses_draft_hidden_states(selector_enabled, selector_rt_info),
                                                rt_info)),
           m_sampler(tokenizer),
           m_mask_token_id(rt_info.mask_token_id),
           m_candidate_position_offset(rt_info.candidate_position_offset),
           m_selector_enabled(selector_enabled),
+          m_selector_uses_hidden_states(selector_uses_draft_hidden_states(selector_enabled, selector_rt_info)),
           m_selector_info(selector_rt_info),
           m_output_multiplier(rt_info.output_multiplier),
           m_final_logit_softcapping(rt_info.final_logit_softcapping) {
@@ -107,6 +114,12 @@ public:
                                                     selector_desc.device,
                                                     selector_desc.properties)
                                      .create_infer_request();
+        } else if (rt_info.dspark_markov_rank > 0) {
+            m_markov_request = utils::singleton_core()
+                                   .compile_model(rt_info.dspark_markov_model, model_desc.device, model_desc.properties)
+                                   .create_infer_request();
+            m_markov_previous_token = ov::Tensor(ov::element::i64, {BATCH_SIZE});
+            m_markov_request->set_tensor("prev_token_ids", m_markov_previous_token);
         }
         m_has_beam_idx = has_compiled_input(m_request.get_compiled_model(), "beam_idx");
         if (m_has_beam_idx) {
@@ -173,28 +186,48 @@ public:
         m_committed_context_length += hidden_delta_length;
         DFlashDraftOutputs outputs;
         outputs.logits = m_request.get_tensor("logits");
-        if (m_selector_enabled) {
+        if (m_selector_uses_hidden_states) {
             outputs.hidden_states = m_request.get_tensor("last_hidden_state");
         }
         return outputs;
     }
 
-    DFlashProposalResult sample_candidates(const ov::Tensor& logits, size_t candidate_count) {
+    bool has_markov_head() const {
+        return m_markov_request.has_value();
+    }
+
+    DFlashProposalResult sample_candidates(const ov::Tensor& logits, int64_t anchor_token, size_t candidate_count) {
         DFlashProposalResult result;
         result.candidates.reserve(candidate_count);
         result.proposals.reserve(candidate_count);
         const auto shape = logits.get_shape();
+        int64_t previous_token = anchor_token;
+        uint64_t markov_inference_time_us = 0;
         for (size_t idx = 0; idx < candidate_count; ++idx) {
             ov::Tensor one_position(logits,
                                     ov::Coordinate{0, idx, 0},
                                     ov::Coordinate{1, idx + 1, shape[2]});
-            auto sampled = sample_one_candidate(apply_backbone_logit_transform(one_position));
+            auto position_logits = apply_backbone_logit_transform(one_position);
+            if (has_markov_head()) {
+                position_logits = add_markov_bias(position_logits, previous_token, markov_inference_time_us);
+            }
+            auto sampled = sample_one_candidate(position_logits);
+            if (has_markov_head()) {
+                // Every later Markov bias depends on the token drafted at this position.
+                if (sampled.candidates.empty()) {
+                    break;
+                }
+                previous_token = sampled.candidates.back().token_id;
+            }
             result.candidates.insert(result.candidates.end(),
                                      std::make_move_iterator(sampled.candidates.begin()),
                                      std::make_move_iterator(sampled.candidates.end()));
             result.proposals.insert(result.proposals.end(),
                                     std::make_move_iterator(sampled.proposals.begin()),
                                     std::make_move_iterator(sampled.proposals.end()));
+        }
+        if (has_markov_head()) {
+            update_inference_time(markov_inference_time_us);
         }
         m_raw_perf_metrics.m_batch_sizes.emplace_back(result.candidates.size());
         return result;
@@ -207,36 +240,37 @@ public:
                         "DFlash-2 selector mode is not initialized.");
         OPENVINO_ASSERT(outputs.logits.get_element_type() == ov::element::f32,
                         "DFlash-2 selector requires FP32 unary logits.");
-        OPENVINO_ASSERT(outputs.hidden_states && outputs.hidden_states.get_element_type() == ov::element::f32,
-                        "DFlash-2 selector requires FP32 draft hidden states.");
 
         const auto logits_shape = outputs.logits.get_shape();
-        const auto hidden_shape = outputs.hidden_states.get_shape();
         OPENVINO_ASSERT(logits_shape.size() == 3 && logits_shape[0] == BATCH_SIZE,
                         "DFlash-2 logits must have shape [1, S, vocab].");
-        OPENVINO_ASSERT(hidden_shape.size() == 3 && hidden_shape[0] == BATCH_SIZE,
-                        "DFlash-2 hidden states must have shape [1, S, hidden].");
-        OPENVINO_ASSERT(logits_shape[1] == hidden_shape[1],
-                        "DFlash-2 logits and hidden-state proposal lengths must match.");
         OPENVINO_ASSERT(candidate_count <= logits_shape[1],
                         "DFlash-2 requested candidates exceed the draft output length.");
         OPENVINO_ASSERT(logits_shape[2] == m_selector_info.vocab_size,
                         "DFlash-2 draft vocabulary does not match selector metadata.");
-        OPENVINO_ASSERT(hidden_shape[2] == m_selector_info.hidden_size,
-                        "DFlash-2 draft hidden size does not match selector metadata.");
+        if (m_selector_uses_hidden_states) {
+            OPENVINO_ASSERT(outputs.hidden_states && outputs.hidden_states.get_element_type() == ov::element::f32,
+                            "DFlash-2 selector requires FP32 draft hidden states.");
+            const auto hidden_shape = outputs.hidden_states.get_shape();
+            OPENVINO_ASSERT(hidden_shape.size() == 3 && hidden_shape[0] == BATCH_SIZE,
+                            "DFlash-2 hidden states must have shape [1, S, hidden].");
+            OPENVINO_ASSERT(logits_shape[1] == hidden_shape[1],
+                            "DFlash-2 logits and hidden-state proposal lengths must match.");
+            OPENVINO_ASSERT(hidden_shape[2] == m_selector_info.hidden_size,
+                            "DFlash-2 draft hidden size does not match selector metadata.");
+            ov::Tensor hidden_states(outputs.hidden_states,
+                                     ov::Coordinate{0, 0, 0},
+                                     ov::Coordinate{1, candidate_count, hidden_shape[2]});
+            m_selector_request->set_tensor("draft_hidden_states", hidden_states);
+        }
 
         const size_t top_k = m_selector_info.top_k;
         ov::Tensor draft_logits(outputs.logits,
                                 ov::Coordinate{0, 0, 0},
                                 ov::Coordinate{BATCH_SIZE, candidate_count, logits_shape[2]});
-
-        ov::Tensor hidden_states(outputs.hidden_states,
-                                 ov::Coordinate{0, 0, 0},
-                                 ov::Coordinate{1, candidate_count, hidden_shape[2]});
         ov::Tensor anchor_ids(ov::element::i64, {BATCH_SIZE});
         anchor_ids.data<int64_t>()[0] = anchor_token;
         m_selector_request->set_tensor("draft_logits", draft_logits);
-        m_selector_request->set_tensor("draft_hidden_states", hidden_states);
         m_selector_request->set_tensor("anchor_token_ids", anchor_ids);
         update_inference_time(execute_selector_inference());
 
@@ -327,7 +361,7 @@ private:
 
     static ov::InferRequest create_draft_infer_request(const ov::genai::ModelDesc& model_desc,
                                                         bool use_external_embeddings,
-                                                        bool selector_enabled,
+                                                        bool selector_uses_hidden_states,
                                                         const ov::genai::utils::dflash::DFlashRTInfo& rt_info) {
         OPENVINO_ASSERT(model_desc.model, "DFlash draft model cannot be null.");
         OPENVINO_ASSERT(utils::has_input(model_desc.model, "hidden_states"),
@@ -347,7 +381,7 @@ private:
                         "DFlash CB/PA draft model must have an 'attention_mask' input.");
         OPENVINO_ASSERT(model_has_output(model_desc.model, "logits"),
                         "DFlash CB/PA draft model must expose 'logits'.");
-        if (selector_enabled) {
+        if (selector_uses_hidden_states) {
             OPENVINO_ASSERT(model_has_output(model_desc.model, "last_hidden_state"),
                             "DFlash-2 selector mode requires draft 'last_hidden_state'.");
         }
@@ -395,6 +429,25 @@ private:
             destination[index] = value;
         }
         return transformed_logits;
+    }
+
+    ov::Tensor add_markov_bias(const ov::Tensor& logits, int64_t previous_token, uint64_t& inference_time_us) {
+        OPENVINO_ASSERT(logits.get_element_type() == ov::element::f32,
+                        "DSpark Markov correction requires FP32 draft logits.");
+        m_markov_previous_token.data<int64_t>()[0] = previous_token;
+        inference_time_us += execute_markov_inference();
+        const auto markov_bias = m_markov_request->get_tensor("markov_bias");
+        OPENVINO_ASSERT(markov_bias.get_element_type() == ov::element::f32 &&
+                            markov_bias.get_size() == logits.get_size(),
+                        "DSpark Markov bias must be one FP32 row over the draft vocabulary.");
+        ov::Tensor corrected_logits(ov::element::f32, logits.get_shape());
+        const auto* logits_data = logits.data<const float>();
+        std::transform(logits_data,
+                       logits_data + logits.get_size(),
+                       markov_bias.data<const float>(),
+                       corrected_logits.data<float>(),
+                       std::plus<float>());
+        return corrected_logits;
     }
 
     DFlashProposalResult sample_one_candidate(const ov::Tensor& logits) {
@@ -446,6 +499,13 @@ private:
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
     }
 
+    uint64_t execute_markov_inference() {
+        auto start = std::chrono::steady_clock::now();
+        m_markov_request->infer();
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+    }
+
     void update_inference_time(uint64_t inference_time_us) {
         m_raw_perf_metrics.m_durations.emplace_back(static_cast<float>(inference_time_us));
         m_raw_perf_metrics.m_inference_durations[0] += MicroSeconds(static_cast<float>(inference_time_us));
@@ -465,8 +525,11 @@ private:
     int64_t m_mask_token_id = -1;
     size_t m_candidate_position_offset = 1;
     bool m_selector_enabled = false;
+    bool m_selector_uses_hidden_states = false;
     ov::genai::utils::dflash::DFlashSelectorRTInfo m_selector_info;
     std::optional<ov::InferRequest> m_selector_request;
+    std::optional<ov::InferRequest> m_markov_request;
+    ov::Tensor m_markov_previous_token;
     float m_output_multiplier = 1.0f;
     float m_final_logit_softcapping = 0.0f;
     std::mt19937 m_selector_rng;
@@ -497,9 +560,20 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                         !utils::is_npu_requested(draft_model_desc.device, draft_model_desc.properties),
                     "DFlash speculative decoding requires the Continuous Batching/Paged Attention backend on CPU or GPU; "
                     "NPU is not supported.");
+    if (m_rt_info.dspark_markov_rank > 0) {
+        // DSpark checkpoints that combine the Markov bias with these backbone transforms are not validated yet.
+        OPENVINO_ASSERT(m_rt_info.output_multiplier == 1.0f && m_rt_info.final_logit_softcapping == 0.0f,
+                        "DSpark Markov drafts do not support output_multiplier or final_logit_softcapping.");
+    }
     if (m_selector_enabled) {
-        OPENVINO_ASSERT(m_rt_info.dflash_version == 2,
-                        "selector_model() requires a DFlash version 2 backbone.");
+        if (selector_rt_info.kind == utils::dflash::DSPARK_MARKOV_SELECTOR_KIND) {
+            OPENVINO_ASSERT(m_rt_info.dspark_markov_rank > 0 &&
+                                selector_rt_info.markov_head_type == m_rt_info.dspark_markov_head_type,
+                            "A DSpark Markov selector_model() requires a DSpark backbone with the same Markov head.");
+        } else {
+            OPENVINO_ASSERT(m_rt_info.dflash_version == 2,
+                            "selector_model() requires a DFlash version 2 backbone.");
+        }
         utils::dflash::validate_dflash_selector_model(selector_model_desc.model, selector_rt_info);
         const auto& selector_device =
             selector_model_desc.device.empty() ? draft_model_desc.device : selector_model_desc.device;
@@ -548,7 +622,8 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     if (needs_lm_head_graft) {
         utils::dflash::attach_target_lm_head_to_draft(main_model,
                                                       draft_model_desc_for_runner.model,
-                                                      m_selector_enabled);
+                                                      selector_uses_draft_hidden_states(m_selector_enabled,
+                                                                                        selector_rt_info));
     }
 
     const bool target_has_linear_attention = utils::get_cache_types(*main_model).has_linear();
@@ -598,6 +673,7 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                                                     selector_rt_info,
                                                     m_selector_enabled,
                                                     draft_embedding_model);
+    m_rt_info.dspark_markov_model.reset();
 
     if (is_vlm_dflash) {
         m_main_pipeline = std::make_shared<ContinuousBatchingForSpeculativeDecodingImpl>(
@@ -834,7 +910,7 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
             candidates = std::move(proposal_result.candidates);
             draft_proposals = std::move(proposal_result.proposals);
         } else {
-            auto proposal_result = m_draft->sample_candidates(draft_outputs.logits, validation_count);
+            auto proposal_result = m_draft->sample_candidates(draft_outputs.logits, seed_token, validation_count);
             candidates = std::move(proposal_result.candidates);
             draft_proposals = std::move(proposal_result.proposals);
         }
@@ -989,11 +1065,11 @@ ov::genai::RawPerfMetrics ContinuousBatchingPipeline::DFlashDecodingImpl::collec
     }
 
     const auto& draft_metrics = m_draft->get_raw_perf_metrics();
-    const size_t inferences_per_stage = m_selector_enabled ? 2 : 1;
+    const size_t inferences_per_stage = (m_selector_enabled || m_draft->has_markov_head()) ? 2 : 1;
     OPENVINO_ASSERT(draft_metrics.m_durations.size() ==
                         draft_metrics.m_batch_sizes.size() * inferences_per_stage,
                     "DFlash inference timings must contain one backbone inference and, when enabled, "
-                    "one selector inference per proposal stage.");
+                    "one selector inference or one summed Markov-walk timing per proposal stage.");
 
     for (size_t stage = 0; stage < draft_metrics.m_batch_sizes.size(); ++stage) {
         const auto first_inference = draft_metrics.m_durations.begin() + stage * inferences_per_stage;

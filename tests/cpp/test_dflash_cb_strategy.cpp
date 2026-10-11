@@ -4,12 +4,15 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
 #include <memory>
 #include <numeric>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "openvino/core/graph_util.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/assign.hpp"
 #include "openvino/op/concat.hpp"
@@ -172,6 +175,77 @@ std::shared_ptr<ov::Model> make_dflash_selector_model() {
     model->set_rt_info(std::string("4"), {"dflash_selector", "hidden_size"});
     model->set_rt_info(std::string("16"), {"dflash_selector", "vocab_size"});
     return model;
+}
+
+std::shared_ptr<ov::Model> make_dspark_selector_model() {
+    auto draft_logits =
+        std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, -1, 16});
+    draft_logits->output(0).set_names({"draft_logits"});
+    auto anchor_token_ids =
+        std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{1});
+    anchor_token_ids->output(0).set_names({"anchor_token_ids"});
+
+    auto top_k = std::make_shared<ov::op::v11::TopK>(
+        draft_logits,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {2}),
+        -1,
+        ov::op::v11::TopK::Mode::MAX,
+        ov::op::v11::TopK::SortType::SORT_VALUES);
+    auto candidate_ids = std::make_shared<ov::op::v0::Convert>(top_k->output(1), ov::element::i64);
+    candidate_ids->output(0).set_names({"candidate_ids"});
+    auto unsqueeze = std::make_shared<ov::op::v0::Unsqueeze>(
+        top_k->output(0),
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {2}));
+    auto edge_scores = std::make_shared<ov::op::v0::Tile>(
+        unsqueeze,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {1, 1, 2, 1}));
+    auto edge_scores_result = std::make_shared<ov::op::v0::Result>(edge_scores);
+    edge_scores_result->output(0).set_names({"edge_scores"});
+    auto candidate_ids_result = std::make_shared<ov::op::v0::Result>(candidate_ids);
+    auto model = std::make_shared<ov::Model>(ov::ResultVector{edge_scores_result, candidate_ids_result},
+                                             ov::ParameterVector{draft_logits, anchor_token_ids});
+    model->set_rt_info(true, "dflash_selector_mode");
+    model->set_rt_info(std::string("dspark_markov"), {"dflash_selector", "kind"});
+    model->set_rt_info(std::string("vanilla"), {"dflash_selector", "markov_head_type"});
+    model->set_rt_info(std::string("topk_lattice_v1"), {"dflash_selector", "interface"});
+    model->set_rt_info(std::string("unary_inclusive"), {"dflash_selector", "score_semantics"});
+    model->set_rt_info(std::string("2"), {"dflash_selector", "top_k"});
+    model->set_rt_info(std::string("16"), {"dflash_selector", "vocab_size"});
+    return model;
+}
+
+std::shared_ptr<ov::Model> make_dspark_markov_step_model(size_t vocab_size = 16, size_t markov_rank = 4) {
+    auto prev_token_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1});
+    prev_token_ids->output(0).set_names({"prev_token_ids"});
+    std::vector<float> codebook_values(vocab_size * markov_rank);
+    std::iota(codebook_values.begin(), codebook_values.end(), 0.0f);
+    auto codebook = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{vocab_size, markov_rank}, codebook_values);
+    auto codes = std::make_shared<ov::op::v8::Gather>(
+        codebook,
+        prev_token_ids,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0}));
+    auto projection = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{vocab_size, markov_rank}, codebook_values);
+    auto markov_bias = std::make_shared<ov::op::v0::MatMul>(codes, projection, false, true);
+    auto result = std::make_shared<ov::op::v0::Result>(markov_bias);
+    result->output(0).set_names({"markov_bias"});
+    auto model = std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{prev_token_ids});
+    model->set_rt_info(true, "dspark_markov_mode");
+    model->set_rt_info(std::string("markov_step_v1"), {"dspark_markov", "interface"});
+    model->set_rt_info(std::string("vanilla"), {"dspark_markov", "head_type"});
+    model->set_rt_info(std::to_string(markov_rank), {"dspark_markov", "markov_rank"});
+    model->set_rt_info(std::to_string(vocab_size), {"dspark_markov", "vocab_size"});
+    return model;
+}
+
+ov::AnyMap make_dspark_draft_properties(size_t markov_rank, const std::string& head_type) {
+    ov::AnyMap properties;
+    properties["dflash_mode"] = true;
+    properties["dflash_mask_token_id"] = int64_t{15};
+    properties["dflash_target_layer_ids"] = std::vector<int32_t>{0};
+    properties["dflash_candidate_position_offset"] = size_t{0};
+    properties["dspark_markov_rank"] = markov_rank;
+    properties["dspark_markov_head_type"] = head_type;
+    return properties;
 }
 
 std::shared_ptr<ov::Model> make_dflash_export_backbone_model() {
@@ -391,6 +465,129 @@ TEST(DFlashModelTransforms, RejectsStatefulSelector) {
     };
 
     EXPECT_THROW(ov::genai::utils::dflash::validate_dflash_selector_model(model, info), ov::Exception);
+}
+
+TEST(DSparkModelTransforms, AppliesAndExtractsMarkovHeadRtInfo) {
+    auto backbone = make_dflash_export_backbone_model();
+    backbone->set_rt_info(true, "dflash_mode");
+    backbone->set_rt_info(std::string("15"), {"dflash", "mask_token_id"});
+    backbone->set_rt_info(std::string("0,1"), {"dflash", "target_layer_ids"});
+    backbone->set_rt_info(std::string("0"), {"dflash", "candidate_position_offset"});
+    backbone->set_rt_info(std::string("4"), {"dspark", "markov_rank"});
+    backbone->set_rt_info(std::string("vanilla"), {"dspark", "markov_head_type"});
+
+    ov::AnyMap properties;
+    ov::genai::utils::dflash::apply_dflash_rt_info(backbone, properties);
+    ASSERT_EQ(properties.at("dspark_markov_rank").as<size_t>(), 4);
+    ASSERT_EQ(properties.at("dspark_markov_head_type").as<std::string>(), "vanilla");
+
+    auto markov_model = make_dspark_markov_step_model();
+    properties["dspark_markov_model"] = markov_model;
+    auto rt_info = ov::genai::utils::dflash::extract_dflash_info_from_config(properties);
+    ASSERT_EQ(rt_info.dflash_version, 1);
+    ASSERT_EQ(rt_info.candidate_position_offset, 0);
+    ASSERT_EQ(rt_info.dspark_markov_rank, 4);
+    ASSERT_EQ(rt_info.dspark_markov_head_type, "vanilla");
+    ASSERT_EQ(rt_info.dspark_markov_model, markov_model);
+    ASSERT_TRUE(properties.empty());
+}
+
+TEST(DSparkModelTransforms, KeepsDFlashDraftWithoutMarkovHeadUnchanged) {
+    auto properties = make_dspark_draft_properties(0, "vanilla");
+    auto rt_info = ov::genai::utils::dflash::extract_dflash_info_from_config(properties);
+    ASSERT_EQ(rt_info.dspark_markov_rank, 0);
+    ASSERT_EQ(rt_info.dspark_markov_model, nullptr);
+    ASSERT_TRUE(properties.empty());
+}
+
+TEST(DSparkModelTransforms, RejectsMarkovHeadWithoutStepModel) {
+    auto properties = make_dspark_draft_properties(4, "vanilla");
+    EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(properties), ov::Exception);
+}
+
+TEST(DSparkModelTransforms, RejectsUnsupportedMarkovHeadType) {
+    for (const std::string head_type : {"gated", "rnn"}) {
+        auto properties = make_dspark_draft_properties(4, head_type);
+        properties["dspark_markov_model"] = make_dspark_markov_step_model();
+        EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(properties), ov::Exception);
+    }
+}
+
+TEST(DSparkModelTransforms, RejectsMarkovStepModelThatDoesNotMatchTheBackbone) {
+    ov::genai::utils::dflash::DFlashRTInfo info;
+    info.dspark_markov_rank = 4;
+    info.dspark_markov_head_type = "vanilla";
+    EXPECT_NO_THROW(ov::genai::utils::dflash::validate_dspark_markov_model(make_dspark_markov_step_model(), info));
+
+    info.dspark_markov_rank = 8;
+    EXPECT_THROW(ov::genai::utils::dflash::validate_dspark_markov_model(make_dspark_markov_step_model(), info),
+                 ov::Exception);
+
+    info.dspark_markov_rank = 4;
+    auto wrong_interface = make_dspark_markov_step_model();
+    wrong_interface->set_rt_info(std::string("markov_step_v2"), {"dspark_markov", "interface"});
+    EXPECT_THROW(ov::genai::utils::dflash::validate_dspark_markov_model(wrong_interface, info), ov::Exception);
+
+    auto wrong_vocab = make_dspark_markov_step_model();
+    wrong_vocab->set_rt_info(std::string("32"), {"dspark_markov", "vocab_size"});
+    EXPECT_THROW(ov::genai::utils::dflash::validate_dspark_markov_model(wrong_vocab, info), ov::Exception);
+
+    EXPECT_THROW(ov::genai::utils::dflash::validate_dspark_markov_model(make_dflash_export_backbone_model(), info),
+                 ov::Exception);
+}
+
+TEST(DSparkModelTransforms, ReadsMarkovStepModelNextToTheDraft) {
+    const auto draft_dir =
+        std::filesystem::temp_directory_path() /
+        ("genai_dspark_markov_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::remove_all(draft_dir);
+    std::filesystem::create_directories(draft_dir);
+
+    ov::AnyMap without_markov_head{{"dspark_markov_rank", size_t{0}}};
+    ov::genai::utils::dflash::read_dspark_markov_model(draft_dir, without_markov_head);
+    ASSERT_EQ(without_markov_head.count("dspark_markov_model"), 0);
+
+    ov::AnyMap with_markov_head{{"dspark_markov_rank", size_t{4}}};
+    EXPECT_THROW(ov::genai::utils::dflash::read_dspark_markov_model(draft_dir, with_markov_head), ov::Exception);
+
+    ov::save_model(make_dspark_markov_step_model(), draft_dir / "openvino_markov_model.xml");
+    ov::genai::utils::dflash::read_dspark_markov_model(draft_dir, with_markov_head);
+    const auto markov_model = with_markov_head.at("dspark_markov_model").as<std::shared_ptr<ov::Model>>();
+    ov::genai::utils::dflash::DFlashRTInfo info;
+    info.dspark_markov_rank = 4;
+    info.dspark_markov_head_type = "vanilla";
+    EXPECT_NO_THROW(ov::genai::utils::dflash::validate_dspark_markov_model(markov_model, info));
+    std::filesystem::remove_all(draft_dir);
+}
+
+TEST(DSparkModelTransforms, AppliesExtractsAndValidatesMarkovSelectorRtInfo) {
+    auto model = make_dspark_selector_model();
+    ov::AnyMap properties;
+    ov::genai::utils::dflash::apply_dflash_selector_rt_info(model, properties);
+    auto info = ov::genai::utils::dflash::extract_dflash_selector_info_from_config(properties);
+
+    ASSERT_TRUE(info.selector_mode);
+    ASSERT_EQ(info.kind, ov::genai::utils::dflash::DSPARK_MARKOV_SELECTOR_KIND);
+    ASSERT_EQ(info.markov_head_type, "vanilla");
+    ASSERT_EQ(info.interface, "topk_lattice_v1");
+    ASSERT_EQ(info.top_k, 2);
+    ASSERT_EQ(info.vocab_size, 16);
+    ASSERT_EQ(info.hidden_size, 0);
+    ASSERT_TRUE(properties.empty());
+    EXPECT_NO_THROW(ov::genai::utils::dflash::validate_dflash_selector_model(model, info));
+
+    auto gated_info = info;
+    gated_info.markov_head_type = "gated";
+    EXPECT_THROW(ov::genai::utils::dflash::validate_dflash_selector_model(model, gated_info), ov::Exception);
+
+    auto dflash2_info = info;
+    dflash2_info.kind = ov::genai::utils::dflash::DFLASH2_SELECTOR_KIND;
+    dflash2_info.dflash_version = 2;
+    dflash2_info.hidden_size = 4;
+    EXPECT_THROW(ov::genai::utils::dflash::validate_dflash_selector_model(model, dflash2_info), ov::Exception);
+
+    EXPECT_THROW(ov::genai::utils::dflash::validate_dflash_selector_model(make_dflash_selector_model(), info),
+                 ov::Exception);
 }
 
 TEST(DFlashModelTransforms, KeepsDraftHiddenStateWhenGraftingSelectorLogits) {

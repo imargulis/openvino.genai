@@ -74,9 +74,14 @@ DFlash2SelectorConfig extract_dflash2_selector_config(
     DFlash2SelectorConfig config;
     config.model_desc = extract_selector_model_from_config(properties);
     if (config.model_desc.model) {
-        OPENVINO_ASSERT(draft_rt_info.dflash_mode && draft_rt_info.dflash_version == 2,
-                        "selector_model() requires a DFlash v2 draft_model().");
         config.rt_info = utils::dflash::extract_dflash_selector_info_from_config(config.model_desc.properties);
+        if (config.rt_info.kind == utils::dflash::DSPARK_MARKOV_SELECTOR_KIND) {
+            OPENVINO_ASSERT(draft_rt_info.dflash_mode && draft_rt_info.dspark_markov_rank > 0,
+                            "A DSpark Markov selector_model() requires a DSpark draft_model() with a Markov head.");
+        } else {
+            OPENVINO_ASSERT(draft_rt_info.dflash_mode && draft_rt_info.dflash_version == 2,
+                            "selector_model() requires a DFlash v2 draft_model().");
+        }
     }
     return config;
 }
