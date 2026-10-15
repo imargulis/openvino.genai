@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <vector>
@@ -234,6 +235,55 @@ inline size_t validation_candidate_count(size_t draft_count, size_t generated_le
         return 0;
     }
     return std::min(draft_count, remaining - 1);
+}
+
+// The candidate scorer takes the rows of num_blocks draft blocks packed back to back: block n spans rows
+// subsequence_begins[n] to subsequence_begins[n + 1]. The graph marks the first row of every block and gives it the
+// block's anchor as predecessor, so an empty block would mark a row twice and shift the anchors of later blocks.
+inline void validate_subsequence_begins(const ov::Tensor& subsequence_begins, size_t num_blocks, size_t num_rows) {
+    OPENVINO_ASSERT(num_blocks > 0, "The candidate scorer needs at least one draft block.");
+    OPENVINO_ASSERT(subsequence_begins && subsequence_begins.get_element_type() == ov::element::i64 &&
+                        subsequence_begins.get_shape() == ov::Shape{num_blocks + 1},
+                    "The candidate scorer subsequence_begins must be an I64 tensor of shape [",
+                    num_blocks + 1,
+                    "].");
+    const auto* begins = subsequence_begins.data<const int64_t>();
+    OPENVINO_ASSERT(begins[0] == 0 && begins[num_blocks] == static_cast<int64_t>(num_rows),
+                    "The candidate scorer subsequence_begins must start at 0 and end at the number of draft rows ",
+                    num_rows,
+                    ".");
+    for (size_t block = 0; block < num_blocks; ++block) {
+        OPENVINO_ASSERT(begins[block] < begins[block + 1],
+                        "The candidate scorer subsequence_begins must be strictly increasing: draft block ",
+                        block,
+                        " is empty.");
+    }
+}
+
+// Walks the Top-K lattice of one draft block greedily: edge_scores[s, i, j] scores candidate j at position s after
+// candidate i at position s - 1. All rows at position 0 follow the anchor token and are identical.
+// TODO: Temporary until speculative sampling in the target sampler is fixed; DFlash drafts are greedy-only until then.
+// Afterwards, sample each position from the request's processed distribution over the K candidates of the row and
+// pass that distribution to the target as the draft proposal of the token.
+inline std::vector<size_t> greedy_candidate_path(const ov::Tensor& edge_scores) {
+    OPENVINO_ASSERT(edge_scores && edge_scores.get_element_type() == ov::element::f32,
+                    "Candidate scorer edge_scores must be an FP32 tensor.");
+    const auto shape = edge_scores.get_shape();
+    OPENVINO_ASSERT(shape.size() == 3 && shape[1] > 0 && shape[1] == shape[2],
+                    "Candidate scorer edge_scores must have shape [S, K, K].");
+    const size_t sequence_length = shape[0];
+    const size_t top_k = shape[1];
+    const auto* data = edge_scores.data<const float>();
+
+    std::vector<size_t> path;
+    path.reserve(sequence_length);
+    size_t previous_index = 0;
+    for (size_t position = 0; position < sequence_length; ++position) {
+        const auto* row = data + (position * top_k + previous_index) * top_k;
+        previous_index = static_cast<size_t>(std::distance(row, std::max_element(row, row + top_k)));
+        path.push_back(previous_index);
+    }
+    return path;
 }
 
 struct ValidationAccounting {
