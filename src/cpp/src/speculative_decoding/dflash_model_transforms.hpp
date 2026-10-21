@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -18,9 +19,8 @@ namespace genai {
 namespace utils {
 namespace dflash {
 
-// Every per-token draft input spans the new rows [context delta ; block], told apart by token_type_ids.
-// Drafts exported without this marker take the context rows in hidden_states and the block in input_ids.
-inline constexpr const char* PER_ROW_INPUT_LAYOUT = "per_row";
+// The markov_head_top_k value that selects the dense Markov step instead of the Top-K candidate scorer.
+inline constexpr int64_t TOP_K_FOR_MARKOV_STEP = 0;
 
 /**
  * @brief Runtime configuration for DFlash speculative decoding.
@@ -35,18 +35,16 @@ struct DFlashRTInfo {
     float input_embedding_scale = 1.0f;
     float output_multiplier = 1.0f;
     float final_logit_softcapping = 0.0f;
-    // empty for the legacy layout
-    std::string input_layout;
-};
-
-struct DFlashSelectorRTInfo {
-    bool selector_mode = false;
-    int64_t dflash_version = 0;
-    std::string interface;
-    std::string score_semantics;
-    size_t top_k = 0;
-    size_t hidden_size = 0;
-    size_t vocab_size = 0;
+    // A backbone with a Markov head: DSpark (vanilla head) or DFlash-2 (gated head). The head is exported as a separate
+    // model, and the draft runs the computation of it selected by markov_head_top_k: the dense step or the Top-K
+    // candidate scorer.
+    size_t markov_rank = 0;
+    std::string markov_head_type;
+    std::shared_ptr<ov::Model> markov_head_computation;
+    // TOP_K_FOR_MARKOV_STEP for the dense step, otherwise the K of the candidate scorer. Without markov_head_top_k,
+    // draft_model() selects the candidate scorer with the exported K; this initial value applies only to drafts
+    // without a Markov head.
+    int64_t markov_head_top_k = TOP_K_FOR_MARKOV_STEP;
 };
 
 /**
@@ -80,19 +78,51 @@ void apply_dflash_gpu_compile_properties(const DFlashRTInfo& info,
                                          ov::AnyMap& compile_properties);
 
 /**
- * @brief Checks the draft inputs against its dflash/input_layout marker.
+ * @brief Reads the Markov head model (openvino_markov_head_model.xml) exported next to a draft backbone with a
+ * Markov head, such as DSpark or DFlash-2, and keeps the computation selected by the markov_head_top_k draft property;
+ * see select_markov_head_computation(). Consumes markov_head_top_k.
  *
- * @return true for the per-row layout, false for the legacy one.
- * @throws ov::Exception when the draft has a token_type_ids input without the per-row marker, or the other way round.
+ * Reads nothing unless apply_dflash_rt_info() found a Markov head in the backbone metadata.
  */
-bool is_per_row_draft(const std::shared_ptr<ov::Model>& draft_model, const DFlashRTInfo& info);
+void read_markov_head(const std::filesystem::path& models_path, ov::AnyMap& properties);
 
-void apply_dflash_selector_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap& properties);
+/**
+ * @brief Keeps one computation of the Markov head model and stores it in properties, together with the
+ * selected markov_head_top_k, for extract_dflash_info_from_config().
+ *
+ * The Markov head model holds up to two computations over the same weights:
+ * - the dense step, prev_token_ids [N] -> markov_bias [N, vocab], walked once per drafted position. Only vanilla
+ *   heads have it; a gated head's transitions depend on the draft hidden states, so it has no dense step;
+ * - the Top-K candidate scorer, draft_logits [T, vocab], anchor_token_ids [N], subsequence_begins [N + 1] ->
+ *   edge_scores [T, K, K], candidate_ids [T, K], which scores whole blocks in one inference. A gated head also takes
+ *   draft_hidden_states [T, hidden], the backbone's final hidden state of every row. The T rows hold N blocks back
+ *   to back; block n spans rows subsequence_begins[n] to subsequence_begins[n + 1], and its anchor token precedes
+ *   its first row. The graph does not check subsequence_begins; callers validate it with
+ *   dflash_cb::validate_subsequence_begins().
+ *
+ * top_k TOP_K_FOR_MARKOV_STEP (0) keeps the dense step. Any other top_k keeps the candidate scorer with that K,
+ * replacing the exported K when it differs. Without top_k, the candidate scorer keeps the exported K.
+ *
+ * @throws ov::Exception when top_k selects the dense step of a head without one.
+ */
+void select_markov_head_computation(const std::shared_ptr<ov::Model>& markov_head_model,
+                                    std::optional<int64_t> top_k,
+                                    ov::AnyMap& properties);
 
-DFlashSelectorRTInfo extract_dflash_selector_info_from_config(ov::AnyMap& config);
+/**
+ * @brief Validates the dense step computation of the Markov head against the draft backbone:
+ * prev_token_ids [N] -> markov_bias [N, vocab].
+ */
+void validate_markov_step(const std::shared_ptr<ov::Model>& markov_step, const DFlashRTInfo& info);
 
-void validate_dflash_selector_model(const std::shared_ptr<ov::Model>& model,
-                                    const DFlashSelectorRTInfo& info);
+/**
+ * @brief Validates the Top-K candidate scorer computation of the Markov head against the draft backbone:
+ * draft_logits [T, vocab], anchor_token_ids [N], subsequence_begins [N + 1], and draft_hidden_states [T, hidden] for
+ * a gated head -> edge_scores [T, K, K], candidate_ids [T, K].
+ *
+ * edge_scores already include each candidate's draft logit; the greedy candidate walk uses them as is.
+ */
+void validate_candidate_scorer(const std::shared_ptr<ov::Model>& candidate_scorer, const DFlashRTInfo& info);
 
 /**
  * @brief Parses target hidden-state RT info and resolves the requested locators.
@@ -113,16 +143,6 @@ void expose_target_hidden_states(std::shared_ptr<ov::Model>& model,
                                  const std::vector<int32_t>& target_layer_ids);
 
 /**
- * @brief Makes DFlash draft accept CB-native hidden states externally.
- *
- * DFlash draft graphs are exported with hidden_states shaped [1, seq_len, hidden],
- * while continuous batching produces hidden states as [seq_len, 1, hidden].
- * This transform changes the public input shape and inserts a reshape back to
- * the exported graph layout for existing consumers.
- */
-void reshape_draft_hidden_states_input_for_cb(std::shared_ptr<ov::Model>& model);
-
-/**
  * @brief Grafts the target lm_head onto the draft model.
  *
  * Clones only the weight side (input(1)) of the target's final lm_head MatMul - including any INT4
@@ -133,6 +153,14 @@ void reshape_draft_hidden_states_input_for_cb(std::shared_ptr<ov::Model>& model)
 void attach_target_lm_head_to_draft(const std::shared_ptr<ov::Model>& main_model,
                                     const std::shared_ptr<ov::Model>& draft_model,
                                     bool keep_hidden_state = false);
+
+/**
+ * @brief Makes the draft's last_hidden_state output read the rows that the lm_head reads after
+ * apply_gather_before_matmul_transformation(), so it holds the hidden state of every logits row.
+ *
+ * Run after the gather transformation, on a draft whose lm_head was grafted with keep_hidden_state.
+ */
+void gather_last_hidden_state_with_logits(const std::shared_ptr<ov::Model>& draft_model);
 
 /**
  * @brief Attaches the target token embedding into the draft graph.

@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""DFlash continuous batching with several requests, on the stateful SDPA and the PagedAttention draft backends.
+"""DFlash continuous batching with several requests, drafted together on PagedAttention.
 
 Greedy speculative decoding must reproduce the target alone, whatever the draft proposes. Tiny random drafts
 reject almost every candidate. In the constant setup every token embedding carries a large channel 0 that only
@@ -29,7 +29,13 @@ MAX_NEW_TOKENS = 40
 PROMPT_LENGTHS = (5, 37, 70)
 PRECISION = {"INFERENCE_PRECISION_HINT": "f32", "KV_CACHE_PRECISION": "f32"}
 VARIANTS = ("dflash", "dspark", "dflash2")
-BACKENDS = ("SDPA", "PA")
+# draft variant and draft properties: DSpark's Markov head drafts with its candidate scorer or its dense step
+DRAFTS = {
+    "dflash": ("dflash", {}),
+    "dspark": ("dspark", {}),
+    "dspark-markov-step": ("dspark", {"markov_head_top_k": 0}),
+    "dflash2": ("dflash2", {}),
+}
 
 
 def _keep_first_channel(norm):
@@ -100,7 +106,7 @@ def _build_draft(output_dir: Path, variant: str, target_config, constant: bool):
         model_class = Qwen3DFlash2ForCausalLM
     else:
         architectures = ["Qwen3DSparkModel"]
-        config.markov_rank = 0
+        config.markov_rank = 8
         config.mask_token_id = mask_token_id
         config.target_layer_ids = target_layer_ids
         model_class = Qwen3DSparkForCausalLM
@@ -158,15 +164,13 @@ def _scheduler_config(max_num_batched_tokens=256):
     return config
 
 
-def _pipeline(models, variant=None, backend="SDPA", scheduler_config=None):
+def _pipeline(models, draft=None, scheduler_config=None, **draft_properties):
     properties = dict(PRECISION)
-    if variant is not None:
-        draft_properties = dict(PRECISION, ATTENTION_BACKEND=backend)
-        properties["draft_model"] = ov_genai.draft_model(models[variant], "CPU", **draft_properties)
-        if variant == "dflash2":
-            properties["selector_model"] = ov_genai.selector_model(
-                models[variant] / "openvino_selector_model.xml", "CPU", **PRECISION
-            )
+    if draft is not None:
+        variant, head_properties = DRAFTS[draft]
+        properties["draft_model"] = ov_genai.draft_model(
+            models[variant], "CPU", **PRECISION, **head_properties, **draft_properties
+        )
     return ov_genai.ContinuousBatchingPipeline(
         models["target"], scheduler_config or _scheduler_config(), "CPU", properties
     )
@@ -184,10 +188,9 @@ def target_outputs(dflash_models):
     return outputs
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize("variant", VARIANTS)
-def test_requests_drafted_together_match_target(dflash_models, target_outputs, variant, backend):
-    pipe = _pipeline(dflash_models, variant, backend)
+@pytest.mark.parametrize("draft", DRAFTS)
+def test_requests_drafted_together_match_target(dflash_models, target_outputs, draft):
+    pipe = _pipeline(dflash_models, draft)
     outputs, results = _generate(pipe, _prompts(), _generation_config())
     assert outputs == target_outputs
 
@@ -195,33 +198,19 @@ def test_requests_drafted_together_match_target(dflash_models, target_outputs, v
     assert metrics.get_num_draft_tokens() > 0
     if dflash_models["constant"]:
         assert metrics.get_num_accepted_tokens() == metrics.get_num_draft_tokens()
+    # one draft stage, the draft inference with its Markov head inferences, per step for all requests
     draft_stages = metrics.draft_model_metrics.raw_metrics.m_batch_sizes
     draft_steps = metrics.draft_step_metrics.raw_metrics.m_batch_sizes
-    if backend == "PA":
-        # one draft inference per step for all requests
-        assert len(draft_stages) == len(draft_steps)
-        assert max(draft_stages) > NUM_ASSISTANT_TOKENS
-    else:
-        assert len(draft_stages) > len(draft_steps)
+    assert len(draft_stages) == len(draft_steps)
+    assert max(draft_stages) > NUM_ASSISTANT_TOKENS
 
     single_outputs = [_generate(pipe, [prompt], _generation_config())[0][0] for prompt in _prompts()]
     assert single_outputs == target_outputs
 
 
-@pytest.mark.parametrize("variant", VARIANTS)
-def test_paged_draft_proposes_as_stateful_draft(dflash_models, variant):
-    accepted = {}
-    for backend in BACKENDS:
-        _, results = _generate(_pipeline(dflash_models, variant, backend), _prompts(), _generation_config())
-        metrics = results[0].extended_perf_metrics
-        accepted[backend] = (metrics.get_num_draft_tokens(), metrics.get_num_accepted_tokens())
-    assert accepted["PA"] == accepted["SDPA"]
-
-
-@pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize("variant", VARIANTS)
-def test_staggered_requests_match_target(dflash_models, target_outputs, variant, backend):
-    pipe = _pipeline(dflash_models, variant, backend)
+@pytest.mark.parametrize("draft", DRAFTS)
+def test_staggered_requests_match_target(dflash_models, target_outputs, draft):
+    pipe = _pipeline(dflash_models, draft)
     prompts = _prompts()
     handles = {}
     # a new request arrives while the earlier ones are prefilling, validating or drafting
@@ -238,23 +227,52 @@ def test_staggered_requests_match_target(dflash_models, target_outputs, variant,
     assert outputs == target_outputs
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize("variant", VARIANTS)
-def test_token_budget_limits_drafted_candidates(dflash_models, target_outputs, variant, backend):
+@pytest.mark.parametrize("draft", DRAFTS)
+def test_token_budget_limits_drafted_candidates(dflash_models, target_outputs, draft):
     # one full validation window fits, so later requests draft fewer candidates or wait
     scheduler_config = _scheduler_config(max_num_batched_tokens=NUM_ASSISTANT_TOKENS + 3)
-    pipe = _pipeline(dflash_models, variant, backend, scheduler_config)
+    pipe = _pipeline(dflash_models, draft, scheduler_config)
     outputs, _ = _generate(pipe, _prompts(), _generation_config())
     assert outputs == target_outputs
 
 
-def test_draft_with_token_type_ids_requires_layout_marker(dflash_models, tmp_path):
-    unmarked_dir = tmp_path / "unmarked"
-    shutil.copytree(dflash_models["dflash"], unmarked_dir)
-    xml_path = unmarked_dir / "openvino_model.xml"
+@pytest.mark.parametrize("draft", DRAFTS)
+def test_sampled_requests_are_reproducible(dflash_models, draft):
+    config = _generation_config()
+    config.do_sample = True
+    config.temperature = 0.8
+    config.rng_seed = 3
+    outputs = [_generate(_pipeline(dflash_models, draft), _prompts(), config)[0] for _ in range(2)]
+    assert outputs[0] == outputs[1]
+    assert all(len(tokens) == MAX_NEW_TOKENS for tokens in outputs[0])
+
+
+def test_draft_runs_on_paged_attention_only(dflash_models):
+    with pytest.raises(RuntimeError, match="PagedAttention only"):
+        _pipeline(dflash_models, "dflash", ATTENTION_BACKEND="SDPA")
+
+
+def test_draft_without_token_type_ids_is_rejected(dflash_models, tmp_path):
+    draft_dir = tmp_path / "no_token_type_ids"
+    shutil.copytree(dflash_models["dflash"], draft_dir)
+    xml_path = draft_dir / "openvino_model.xml"
     xml = xml_path.read_text(encoding="utf-8")
-    unmarked_xml = re.sub(r'\s*<input_layout value="per_row"\s*/>', "", xml)
-    assert unmarked_xml != xml
-    xml_path.write_text(unmarked_xml, encoding="utf-8")
-    with pytest.raises(RuntimeError, match="no dflash/input_layout metadata"):
-        _pipeline({**dflash_models, "dflash": unmarked_dir}, "dflash")
+    renamed_xml = re.sub(r'name(s?)="token_type_ids"', r'name\1="segment_ids"', xml)
+    assert renamed_xml != xml
+    xml_path.write_text(renamed_xml, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="must have a 'token_type_ids' input"):
+        _pipeline({**dflash_models, "dflash": draft_dir}, "dflash")
+
+
+def test_draft_with_markov_head_needs_its_model(dflash_models, tmp_path):
+    draft_dir = tmp_path / "no_markov_head"
+    shutil.copytree(dflash_models["dspark"], draft_dir)
+    for suffix in (".xml", ".bin"):
+        (draft_dir / f"openvino_markov_head_model{suffix}").unlink()
+    with pytest.raises(RuntimeError, match="openvino_markov_head_model.xml is not next to it"):
+        ov_genai.draft_model(draft_dir, "CPU")
+
+
+def test_gated_markov_head_has_no_dense_step(dflash_models):
+    with pytest.raises(RuntimeError, match="selects the dense Markov walk"):
+        ov_genai.draft_model(dflash_models["dflash2"], "CPU", markov_head_top_k=0)
