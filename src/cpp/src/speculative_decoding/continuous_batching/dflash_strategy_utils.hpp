@@ -4,10 +4,9 @@
 #pragma once
 
 #include <algorithm>
-#include <cstring>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
-#include <numeric>
-#include <vector>
 
 #include <openvino/core/except.hpp>
 #include <openvino/runtime/tensor.hpp>
@@ -16,140 +15,25 @@
 
 namespace ov::genai::dflash_cb {
 
-inline constexpr size_t DEFAULT_NUM_ASSISTANT_TOKENS = 5;
+// Largest seed + mask block a request may draft; bounds the extra batch budget of the draft scheduler.
+inline constexpr size_t MAX_DRAFT_BLOCK_ROWS = 32;
 
-inline void add_draft_assistant_token_headroom(GenerationConfig& draft_config, const GenerationConfig& config) {
-    const size_t assistant_tokens = config.num_assistant_tokens.value();
-    if (config.max_new_tokens != SIZE_MAX) {
-        if (config.max_new_tokens < SIZE_MAX - assistant_tokens) {
-            draft_config.max_new_tokens = config.max_new_tokens + assistant_tokens;
-        }
-    } else if (config.max_length != SIZE_MAX && config.max_length < SIZE_MAX - assistant_tokens) {
-        draft_config.max_length = config.max_length + assistant_tokens;
-    }
-}
-
-inline void copy_tensor_bytes(const ov::Tensor& src, ov::Tensor& dst) {
-    OPENVINO_ASSERT(src.get_element_type() == dst.get_element_type(),
-                    "DFlash hidden state copy requires matching tensor element types.");
-    OPENVINO_ASSERT(src.get_byte_size() == dst.get_byte_size(),
-                    "DFlash hidden state copy requires matching tensor byte sizes.");
-    src.copy_to(dst);
-}
-
-inline ov::Tensor truncate_normalized_hidden_state_from_end(const ov::Tensor& hidden_state, size_t tokens_to_remove) {
-    if (!hidden_state || hidden_state.get_size() == 0 || tokens_to_remove == 0) {
-        return hidden_state;
-    }
-
-    auto shape = hidden_state.get_shape();
-    OPENVINO_ASSERT(shape.size() == 3 && shape[1] == 1,
-                    "DFlash hidden_states delta must have shape [seq_len, 1, hidden].");
-    const size_t current_seq_len = shape[0];
-    if (tokens_to_remove >= current_seq_len) {
-        shape[0] = 0;
-        return ov::Tensor(hidden_state.get_element_type(), shape);
-    }
-
-    ov::Coordinate start_coord(shape.size(), 0);
-    ov::Coordinate end_coord(shape.begin(), shape.end());
-    end_coord[0] = current_seq_len - tokens_to_remove;
-    return ov::Tensor(hidden_state, start_coord, end_coord);
-}
-
-class HiddenDeltaBuffer {
-public:
-    static constexpr size_t INITIAL_CHUNK_CAPACITY = 10;
-
-    HiddenDeltaBuffer() {
-        m_chunks.reserve(INITIAL_CHUNK_CAPACITY);
-    }
-
-    void append(const ov::Tensor& hidden_delta, bool copy_data = false) {
-        if (!hidden_delta || hidden_delta.get_size() == 0) {
-            return;
-        }
-        const auto shape = hidden_delta.get_shape();
-        OPENVINO_ASSERT(shape.size() == 3 && shape[1] == 1,
-                        "DFlash hidden delta buffer expects [seq_len, 1, hidden] chunks.");
-        const size_t token_count = shape[0];
-        if (token_count == 0) {
-            return;
-        }
-
-        if (copy_data) {
-            ov::Tensor owned(hidden_delta.get_element_type(), shape);
-            copy_tensor_bytes(hidden_delta, owned);
-            m_chunks.push_back(owned);
-        } else {
-            m_chunks.push_back(hidden_delta);
-        }
-        m_token_count += token_count;
-    }
-
-    bool empty() const {
-        return m_token_count == 0;
-    }
-
-    size_t token_count() const {
-        return m_token_count;
-    }
-
-    ov::Tensor materialize() const {
-        OPENVINO_ASSERT(m_token_count > 0, "Cannot materialize empty DFlash hidden deltas.");
-        OPENVINO_ASSERT(!m_chunks.empty(), "DFlash hidden delta chunks are empty.");
-
-        if (m_chunks.size() == 1) {
-            const auto& chunk = m_chunks.front();
-            OPENVINO_ASSERT(chunk && chunk.get_size() > 0,
-                            "DFlash single hidden delta chunk is empty.");
-            return chunk;
-        }
-
-        auto merged_shape = m_chunks.front().get_shape();
-        OPENVINO_ASSERT(merged_shape.size() == 3 && merged_shape[1] == 1,
-                        "DFlash hidden delta buffer expects [seq_len, 1, hidden] chunks.");
-        merged_shape[0] = m_token_count;
-        ov::Tensor merged(m_chunks.front().get_element_type(), merged_shape);
-        size_t offset = 0;
-        for (const auto& chunk : m_chunks) {
-            const auto chunk_shape = chunk.get_shape();
-            OPENVINO_ASSERT(chunk_shape.size() == 3 && chunk_shape[1] == 1 && chunk_shape[2] == merged_shape[2],
-                            "Cannot merge DFlash hidden deltas with incompatible shape.");
-            const size_t chunk_tokens = chunk_shape[0];
-            ov::Tensor dst(merged,
-                           ov::Coordinate{offset, 0, 0},
-                           ov::Coordinate{offset + chunk_tokens, 1, merged_shape[2]});
-            copy_tensor_bytes(chunk, dst);
-            offset += chunk_tokens;
-        }
-        OPENVINO_ASSERT(offset == m_token_count, "DFlash hidden delta token count mismatch.");
-        return merged;
-    }
-
-    void clear() {
-        m_chunks.clear();
-        m_token_count = 0;
-    }
-
-private:
-    std::vector<ov::Tensor> m_chunks;
-    size_t m_token_count = 0;
+// Per-request state of the DFlash draft pipeline.
+struct DraftState {
+    // Request ids are reused across generate() calls; the sequence id identifies the request.
+    uint64_t sequence_id = 0;
+    // Leading positions whose draft KV was built from target hidden states.
+    size_t committed_rows = 0;
+    // Target hidden-state rows [rows, 1, hidden] after the committed positions, not yet forwarded.
+    // It may view the target's output tensor until it is owned.
+    ov::Tensor pending_rows;
+    bool owns_pending_rows = false;
+    size_t block_rows = 0;
+    size_t candidate_rows = 0;
 };
 
-inline void ensure_num_assistant_tokens_is_set(GenerationConfig& config) {
-    OPENVINO_ASSERT(config.assistant_confidence_threshold == 0.f,
-                    "DFlash CB/PA only supports num_assistant_tokens; assistant_confidence_threshold must be 0.f.");
-    OPENVINO_ASSERT(config.max_ngram_size == 0,
-                    "DFlash CB/PA does not support prompt lookup decoding; max_ngram_size must be 0.");
-    if (!config.num_assistant_tokens.has_value() || config.num_assistant_tokens.value() == 0) {
-        config.num_assistant_tokens = DEFAULT_NUM_ASSISTANT_TOKENS;
-    }
-}
-
 inline void ensure_vlm_generation_config(const GenerationConfig& config) {
-    // Keep generic DFlash decoding behavior unchanged. These checks cover only
-    // VLM representation/output modes that cannot be expressed faithfully with
+    // These checks cover only VLM representation/output modes that cannot be expressed faithfully with
     // row-aligned multimodal prompt IDs.
     OPENVINO_ASSERT(config.pruning_ratio == 0,
                     "DFlash VLM does not support visual token pruning.");
@@ -159,62 +43,17 @@ inline void ensure_vlm_generation_config(const GenerationConfig& config) {
                     "DFlash VLM does not support Omni intermediate outputs.");
 }
 
-inline std::vector<int64_t> build_placeholder_prompt_ids(size_t prompt_length, int64_t placeholder_id) {
-    OPENVINO_ASSERT(prompt_length > 0, "DFlash VLM logical prompt length must be greater than 0.");
-    OPENVINO_ASSERT(placeholder_id >= 0, "DFlash VLM requires a valid placeholder token ID.");
-    return std::vector<int64_t>(prompt_length, placeholder_id);
-}
-
-inline size_t linear_attention_checkpoint_block_count(size_t num_assistant_tokens) {
-    OPENVINO_ASSERT(num_assistant_tokens <= std::numeric_limits<size_t>::max() - 2,
-                    "DFlash num_assistant_tokens is too large for linear attention checkpoint block count.");
-    return num_assistant_tokens + 2;
-}
-
-inline size_t adjusted_linear_attention_block_count(size_t current_block_count,
-                                                    size_t num_assistant_tokens,
-                                                    bool target_has_linear_attention) {
-    if (!target_has_linear_attention) {
-        return current_block_count;
-    }
-    return std::max(current_block_count, linear_attention_checkpoint_block_count(num_assistant_tokens));
-}
-
-inline ov::Tensor build_draft_input_ids(int64_t seed_token,
-                                        int64_t mask_token_id,
-                                        size_t candidate_count,
-                                        size_t candidate_position_offset = 1) {
+// Rows of the seed + mask block for `candidate_count` drafted tokens.
+inline size_t draft_block_length(size_t candidate_count, size_t candidate_position_offset) {
     OPENVINO_ASSERT(candidate_count > 0, "DFlash candidate_count must be greater than 0.");
-    const size_t draft_input_length = candidate_count + candidate_position_offset;
-    ov::Tensor input_ids(ov::element::i64, {1, draft_input_length});
-    auto* data = input_ids.data<int64_t>();
-    data[0] = seed_token;
-    std::fill(data + 1, data + draft_input_length, mask_token_id);
-    return input_ids;
+    return candidate_count + candidate_position_offset;
 }
 
-inline ov::Tensor build_draft_position_ids(size_t committed_context_length,
-                                           size_t hidden_delta_length,
-                                           size_t candidate_count,
-                                           size_t candidate_position_offset = 1) {
-    OPENVINO_ASSERT(candidate_count > 0, "DFlash candidate_count must be greater than 0.");
-    ov::Tensor position_ids(ov::element::i64,
-                            {1, hidden_delta_length + candidate_count + candidate_position_offset});
-    auto* data = position_ids.data<int64_t>();
-    std::iota(data, data + position_ids.get_size(), static_cast<int64_t>(committed_context_length));
-    return position_ids;
-}
-
-inline ov::Tensor build_draft_attention_mask(size_t committed_context_length,
-                                             size_t hidden_delta_length,
-                                             size_t candidate_count,
-                                             size_t candidate_position_offset = 1) {
-    OPENVINO_ASSERT(candidate_count > 0, "DFlash candidate_count must be greater than 0.");
-    const size_t attention_mask_length =
-        committed_context_length + hidden_delta_length + candidate_count + candidate_position_offset;
-    ov::Tensor attention_mask(ov::element::i64, {1, attention_mask_length});
-    std::fill_n(attention_mask.data<int64_t>(), attention_mask.get_size(), 1);
-    return attention_mask;
+// A draft step forwards, per request, the target rows of the previous target step plus one block.
+inline size_t draft_max_num_batched_tokens(size_t main_max_num_batched_tokens, size_t max_num_seqs) {
+    const size_t limit = std::numeric_limits<size_t>::max();
+    const size_t block_budget = max_num_seqs > limit / MAX_DRAFT_BLOCK_ROWS ? limit : max_num_seqs * MAX_DRAFT_BLOCK_ROWS;
+    return main_max_num_batched_tokens > limit - block_budget ? limit : main_max_num_batched_tokens + block_budget;
 }
 
 inline size_t draft_candidate_count(size_t num_assistant_tokens, size_t generated_len, size_t max_new_tokens) {
@@ -225,6 +64,7 @@ inline size_t draft_candidate_count(size_t num_assistant_tokens, size_t generate
     return num_assistant_tokens;
 }
 
+// Candidates the target can still validate: the last token is always generated by the target.
 inline size_t validation_candidate_count(size_t draft_count, size_t generated_len, size_t max_new_tokens) {
     if (generated_len >= max_new_tokens) {
         return 0;
@@ -236,22 +76,58 @@ inline size_t validation_candidate_count(size_t draft_count, size_t generated_le
     return std::min(draft_count, remaining - 1);
 }
 
-struct ValidationAccounting {
-    size_t accepted = 0;
-    size_t rejected = 0;
-    bool target_extended = false;
+struct DraftRowSelection {
+    size_t begin = 0;
+    size_t count = 0;
 };
 
-inline ValidationAccounting validation_accounting(size_t draft_generated,
-                                                  size_t generated_before_draft,
-                                                  size_t target_generated_len) {
-    if (draft_generated == 0 || target_generated_len <= generated_before_draft) {
+// Rows of the target's exported hidden states that the draft has not seen yet. The exported rows end at
+// the target's processed length, and their last `rejected_candidates` rows belong to rejected candidates.
+inline DraftRowSelection select_new_target_rows(uint64_t request_id,
+                                                size_t known_rows,
+                                                size_t target_rows,
+                                                size_t hidden_rows,
+                                                size_t rejected_candidates) {
+    OPENVINO_ASSERT(target_rows >= known_rows,
+                    "DFlash draft is ahead of the target for request ", request_id, " (draft ", known_rows,
+                    " positions, target ", target_rows, "). The target likely recomputed preempted tokens, "
+                    "which the DFlash draft does not support; increase the cache size or use dynamic cache allocation.");
+    const size_t new_rows = target_rows - known_rows;
+    if (new_rows == 0) {
         return {};
     }
+    OPENVINO_ASSERT(hidden_rows >= rejected_candidates + new_rows,
+                    "DFlash target exported ", hidden_rows, " hidden-state rows for request ", request_id,
+                    ", but the draft needs ", new_rows, " after dropping ", rejected_candidates,
+                    " rejected candidates.");
+    const size_t kept_rows = hidden_rows - rejected_candidates;
+    return {kept_rows - new_rows, new_rows};
+}
 
-    const size_t produced_by_target = target_generated_len - generated_before_draft;
-    const size_t accepted = produced_by_target > 0 ? std::min(draft_generated, produced_by_target - 1) : 0;
-    return {accepted, draft_generated - accepted, true};
+struct DraftBlockPlan {
+    size_t block_rows = 0;
+    size_t candidate_rows = 0;
+};
+
+// A block is drafted once the draft knows the target hidden states up to the token before the seed,
+// the last generated token. The block keeps its full size while fewer candidates are validated near
+// max_new_tokens.
+inline DraftBlockPlan plan_draft_block(size_t num_assistant_tokens,
+                                       size_t generated_len,
+                                       size_t max_new_tokens,
+                                       size_t prompt_len,
+                                       size_t known_rows,
+                                       size_t candidate_position_offset) {
+    if (num_assistant_tokens == 0 || generated_len == 0 || known_rows != prompt_len + generated_len - 1) {
+        return {};
+    }
+    const size_t draft_count = draft_candidate_count(num_assistant_tokens, generated_len, max_new_tokens);
+    const size_t candidate_rows =
+        draft_count > 0 ? validation_candidate_count(draft_count, generated_len, max_new_tokens) : 0;
+    if (candidate_rows == 0) {
+        return {};
+    }
+    return {draft_block_length(draft_count, candidate_position_offset), candidate_rows};
 }
 
 }  // namespace ov::genai::dflash_cb

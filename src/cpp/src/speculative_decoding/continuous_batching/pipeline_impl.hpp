@@ -7,6 +7,7 @@
 #include <functional>
 #include "continuous_batching/pipeline_impl.hpp"
 #include "openvino/genai/continuous_batching_pipeline.hpp"
+#include "speculative_decoding/continuous_batching/dflash_strategy_utils.hpp"
 #include "update_request_structs.hpp"
 #include "utils.hpp"
 
@@ -176,6 +177,20 @@ protected:
     }
     bool eagle_mode_enabled = false;
     bool mtp_mode_enabled = false;
+    bool dflash_mode_enabled = false;
+
+    // DFlash draft, implemented in dflash_pipeline_impl.cpp.
+    void enable_dflash_draft(int64_t mask_token_id, size_t candidate_position_offset);
+    UpdateRequestResult update_dflash_draft_request(SequenceGroup::Ptr request, const GeneratedSequences& candidates);
+    void dflash_multistep();
+    // Applies the last forward to the request's draft state; returns the logits rows it consumed.
+    size_t finish_dflash_draft_step(SequenceGroup::Ptr request,
+                                    dflash_cb::DraftState& state,
+                                    const ov::Tensor& logits,
+                                    size_t first_logits_row);
+    int64_t m_dflash_mask_token_id = -1;
+    size_t m_dflash_candidate_position_offset = 1;
+    std::map<uint64_t, dflash_cb::DraftState> m_dflash_draft_states;
 };
 
 class ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl

@@ -96,8 +96,8 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::get_ge
             if (is_tree_search) {
                 tree_metadata_snapshot = std::make_shared<const TreeMetaData>(sequence->get_tree_metadata());
             }
-            // Only Eagle3 main model (validation stage) reports processed token count for draft alignment.
-            if (!(eagle_mode_enabled && m_is_validation_mode_enabled)) {
+            // Only Eagle3 and DFlash main models (validation stage) report processed token count for draft alignment.
+            if (!((eagle_mode_enabled || dflash_mode_enabled) && m_is_validation_mode_enabled)) {
                 num_processed_tokens = 0;
             }
             // Publish an initialized empty tensor for unscheduled sequences.
@@ -380,6 +380,9 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
     for (auto& request : m_requests) {
         if (request_id != request->get_request_id()) {
             continue;
+        }
+        if (dflash_mode_enabled && !m_is_validation_mode_enabled) {
+            return update_dflash_draft_request(request, candidates);
         }
 
         std::vector<Sequence::Ptr> running_sequences = request->get_running_sequences();
@@ -716,6 +719,11 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::pull_a
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::multistep() {
+    if (dflash_mode_enabled && !m_is_validation_mode_enabled) {
+        // a DFlash draft proposes all candidates of a request in one forward
+        dflash_multistep();
+        return;
+    }
     bool to_generate = true;
     size_t generated_tokens_cnt = 0;
 
