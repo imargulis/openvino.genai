@@ -73,7 +73,7 @@ from utils.constants import get_ov_cache_converted_models_dir
 from utils.atomic_download import AtomicDownloadManager
 from utils.media_tags import ModalityType, get_media_inputs_kwargs, get_universal_tag
 from utils.custom_op import assert_ir_contains_op_type, get_extension_model, get_extension_lib_path, CustomAdd
-from utils.hugging_face import download_and_convert_model
+from utils.hugging_face import download_and_convert_model, export_with_optimum_cli, sanitize_model_id
 from utils.ov_genai_pipelines import should_skip_npuw_tests
 
 import logging
@@ -3682,6 +3682,50 @@ def test_vlm_eagle3(cat_tensor):
     assert result_without_draft.texts[0].strip() == result_with_draft_tree.texts[0].strip(), (
         "Result should be the same when Eagle3 draft model and tree search are enabled and disabled."
     )
+
+
+VLM_DFLASH_MAIN_MODEL_ID = "optimum-intel-internal-testing/tiny-random-qwen3.5"
+VLM_DFLASH_DRAFT_MODEL_ID = "optimum-intel-internal-testing/tiny-random-qwen3.5-dflash"
+
+
+def _get_vlm_dflash_model_paths() -> tuple[Path, Path]:
+    _maybe_skip_unsupported_model_export(VLM_DFLASH_MAIN_MODEL_ID)
+    draft_model_path = get_ov_cache_converted_models_dir() / sanitize_model_id(VLM_DFLASH_DRAFT_MODEL_ID)
+    AtomicDownloadManager(draft_model_path).execute(
+        lambda temp_path: export_with_optimum_cli(
+            VLM_DFLASH_DRAFT_MODEL_ID, "text-generation-with-past", temp_path, trust_remote_code=True
+        )
+    )
+    return Path(_get_ov_model(VLM_DFLASH_MAIN_MODEL_ID)), draft_model_path
+
+
+def test_vlm_dflash(cat_tensor):
+    model_path, draft_model_path = _get_vlm_dflash_model_paths()
+    # An uncompressed KV cache keeps speculative and autoregressive decoding numerically identical.
+    properties = {"INFERENCE_PRECISION_HINT": openvino.Type.f32, "KV_CACHE_PRECISION": openvino.Type.f32}
+    scheduler_config = SchedulerConfig()
+    scheduler_config.enable_prefix_caching = False
+
+    ov_pipe = VLMPipeline(model_path, "CPU", scheduler_config=scheduler_config, **properties)
+    generation_config = _setup_generation_config(ov_pipe, max_new_tokens=20, do_sample=False)
+    result_without_draft = ov_pipe.generate(PROMPTS[2], images=[cat_tensor], generation_config=generation_config)
+
+    ov_pipe_with_draft = VLMPipeline(
+        model_path,
+        "CPU",
+        draft_model=draft_model(draft_model_path, "CPU", **properties),
+        scheduler_config=scheduler_config,
+        **properties,
+    )
+    generation_config.num_assistant_tokens = 3
+    result_with_draft = ov_pipe_with_draft.generate(
+        PROMPTS[2], images=[cat_tensor], generation_config=generation_config
+    )
+
+    assert result_without_draft.texts[0] == result_with_draft.texts[0], (
+        "Result should be the same when the DFlash draft model is enabled and disabled."
+    )
+    assert result_with_draft.extended_perf_metrics.get_num_draft_tokens() > 0
 
 
 def test_vlm_eagle3_chat_with_videos(

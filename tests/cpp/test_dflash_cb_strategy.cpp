@@ -4,8 +4,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -26,6 +28,11 @@
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/variable.hpp"
 #include "openvino/pass/sdpa_to_paged_attention.hpp"
+#include "openvino/runtime/core.hpp"
+#include "model_desc.hpp"
+#include "sampling/sampler.hpp"
+#include "sequence_group.hpp"
+#include "speculative_decoding/continuous_batching/dflash_strategy.hpp"
 #include "speculative_decoding/continuous_batching/dflash_strategy_utils.hpp"
 #include "speculative_decoding/dflash_model_transforms.hpp"
 #include "utils.hpp"
@@ -115,44 +122,6 @@ std::shared_ptr<ov::Model> make_eagle3_pattern_hidden_state_model() {
     return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input});
 }
 
-std::shared_ptr<ov::Model> make_dflash_draft_hidden_states_model(const ov::PartialShape& hidden_states_shape) {
-    auto hidden_states = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, hidden_states_shape);
-    hidden_states->set_friendly_name("hidden_states");
-    hidden_states->output(0).set_names({"hidden_states"});
-
-    const auto hidden_size = static_cast<size_t>(hidden_states_shape[2].get_length());
-    auto bias = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 1, hidden_size}, {1.0f});
-    auto consumer = std::make_shared<ov::op::v1::Add>(hidden_states, bias);
-    consumer->set_friendly_name("draft_hidden_states_consumer");
-    auto result = std::make_shared<ov::op::v0::Result>(consumer);
-    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{hidden_states});
-}
-
-ov::Tensor make_token_major_hidden_delta(size_t seq_len, size_t hidden_size, float start = 0.0f) {
-    ov::Tensor tensor(ov::element::f32, ov::Shape{seq_len, 1, hidden_size});
-    std::iota(tensor.data<float>(), tensor.data<float>() + tensor.get_size(), start);
-    return tensor;
-}
-
-std::vector<float> tensor_values(const ov::Tensor& tensor) {
-    const auto* data = tensor.data<const float>();
-    return std::vector<float>(data, data + tensor.get_size());
-}
-
-std::vector<int64_t> int64_tensor_values(const ov::Tensor& tensor) {
-    const auto* data = tensor.data<const int64_t>();
-    return std::vector<int64_t>(data, data + tensor.get_size());
-}
-
-std::shared_ptr<ov::op::v1::Add> find_dflash_draft_hidden_states_consumer(const std::shared_ptr<ov::Model>& model) {
-    for (const auto& node : model->get_ordered_ops()) {
-        if (node->get_friendly_name() == "draft_hidden_states_consumer") {
-            return ov::as_type_ptr<ov::op::v1::Add>(node);
-        }
-    }
-    return nullptr;
-}
-
 size_t count_outputs_with_name(const std::shared_ptr<ov::Model>& model, const std::string& name) {
     size_t count = 0;
     for (const auto& output : model->outputs()) {
@@ -164,33 +133,6 @@ size_t count_outputs_with_name(const std::shared_ptr<ov::Model>& model, const st
 }
 
 }  // namespace
-
-TEST(DFlashCBHiddenDeltaBuffer, AppendsAndMaterializesSingleChunk) {
-    ov::genai::dflash_cb::HiddenDeltaBuffer buffer;
-    auto hidden_delta = make_token_major_hidden_delta(2, 3);
-
-    buffer.append(hidden_delta);
-    auto materialized = buffer.materialize();
-
-    ASSERT_FALSE(buffer.empty());
-    ASSERT_EQ(buffer.token_count(), 2);
-    ASSERT_EQ(materialized.get_shape(), ov::Shape({2, 1, 3}));
-    ASSERT_EQ(tensor_values(materialized), tensor_values(hidden_delta));
-}
-
-TEST(DFlashCBHiddenDeltaBuffer, MergesChunksInOrder) {
-    ov::genai::dflash_cb::HiddenDeltaBuffer buffer;
-    auto first = make_token_major_hidden_delta(2, 2, 0.0f);
-    auto second = make_token_major_hidden_delta(1, 2, 4.0f);
-
-    buffer.append(first);
-    buffer.append(second);
-    auto materialized = buffer.materialize();
-
-    ASSERT_EQ(buffer.token_count(), 3);
-    ASSERT_EQ(materialized.get_shape(), ov::Shape({3, 1, 2}));
-    ASSERT_EQ(tensor_values(materialized), (std::vector<float>{0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f}));
-}
 
 TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     auto model = make_annotated_stateful_sdpa_model();
@@ -340,152 +282,6 @@ TEST(DFlashModelTransforms, RejectsReplacedRetainedLocatorWhileOriginalRemainsLi
         ov::Exception);
 }
 
-TEST(DFlashModelTransforms, ReshapesDynamicDraftHiddenStatesInputForCB) {
-    auto model = make_dflash_draft_hidden_states_model(
-        ov::PartialShape({ov::Dimension(1), ov::Dimension::dynamic(), ov::Dimension(4)}));
-
-    ov::genai::utils::dflash::reshape_draft_hidden_states_input_for_cb(model);
-
-    ASSERT_EQ(model->input("hidden_states").get_partial_shape(),
-              ov::PartialShape({ov::Dimension::dynamic(), ov::Dimension(1), ov::Dimension(4)}));
-    auto consumer = find_dflash_draft_hidden_states_consumer(model);
-    ASSERT_TRUE(consumer);
-    auto reshape = ov::as_type_ptr<ov::op::v1::Reshape>(consumer->input_value(0).get_node_shared_ptr());
-    ASSERT_TRUE(reshape);
-    ASSERT_EQ(reshape->get_output_partial_shape(0),
-              ov::PartialShape({ov::Dimension(1), ov::Dimension::dynamic(), ov::Dimension(4)}));
-}
-
-TEST(DFlashModelTransforms, ThrowsForIncompatibleDraftHiddenStatesInput) {
-    auto model = make_dflash_draft_hidden_states_model(ov::PartialShape({2, 2, 4}));
-
-    EXPECT_THROW(ov::genai::utils::dflash::reshape_draft_hidden_states_input_for_cb(model), ov::Exception);
-}
-
-TEST(DFlashCBHiddenState, TruncatesRejectedTail) {
-    auto hidden_delta = make_token_major_hidden_delta(4, 2);
-
-    auto unchanged = ov::genai::dflash_cb::truncate_normalized_hidden_state_from_end(hidden_delta, 0);
-    ASSERT_EQ(unchanged.get_shape(), ov::Shape({4, 1, 2}));
-    ASSERT_EQ(tensor_values(unchanged), tensor_values(hidden_delta));
-
-    auto truncated = ov::genai::dflash_cb::truncate_normalized_hidden_state_from_end(hidden_delta, 1);
-    ASSERT_EQ(truncated.get_shape(), ov::Shape({3, 1, 2}));
-    ASSERT_EQ(tensor_values(truncated), (std::vector<float>{0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f}));
-
-    auto empty = ov::genai::dflash_cb::truncate_normalized_hidden_state_from_end(hidden_delta, 4);
-    ASSERT_EQ(empty.get_shape(), ov::Shape({0, 1, 2}));
-    ASSERT_EQ(empty.get_size(), 0);
-}
-
-TEST(DFlashCBDraftInputs, BuildsSeedMaskBlock) {
-    auto input_ids_default = ov::genai::dflash_cb::build_draft_input_ids(42, 99, 3);
-    ASSERT_EQ(input_ids_default.get_shape(), ov::Shape({1, 4}));
-    ASSERT_EQ(int64_tensor_values(input_ids_default), (std::vector<int64_t>{42, 99, 99, 99}));
-
-    auto input_ids_deepspec = ov::genai::dflash_cb::build_draft_input_ids(42, 99, 3, /*candidate_position_offset=*/0);
-    ASSERT_EQ(input_ids_deepspec.get_shape(), ov::Shape({1, 3}));
-    ASSERT_EQ(int64_tensor_values(input_ids_deepspec), (std::vector<int64_t>{42, 99, 99}));
-}
-
-TEST(DFlashCBDraftInputs, BuildsPositionIdsFromCommittedLength) {
-    auto position_ids_default = ov::genai::dflash_cb::build_draft_position_ids(5, 2, 3);
-    ASSERT_EQ(position_ids_default.get_shape(), ov::Shape({1, 6}));
-    ASSERT_EQ(int64_tensor_values(position_ids_default), (std::vector<int64_t>{5, 6, 7, 8, 9, 10}));
-
-    auto position_ids_deepspec =
-        ov::genai::dflash_cb::build_draft_position_ids(5, 2, 3, /*candidate_position_offset=*/0);
-    ASSERT_EQ(position_ids_deepspec.get_shape(), ov::Shape({1, 5}));
-    ASSERT_EQ(int64_tensor_values(position_ids_deepspec), (std::vector<int64_t>{5, 6, 7, 8, 9}));
-}
-
-TEST(DFlashCBDraftInputs, BuildsAttentionMaskForFullDraftContext) {
-    auto attention_mask_default = ov::genai::dflash_cb::build_draft_attention_mask(5, 2, 3);
-    ASSERT_EQ(attention_mask_default.get_shape(), ov::Shape({1, 11}));
-    ASSERT_EQ(int64_tensor_values(attention_mask_default),
-              (std::vector<int64_t>{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}));
-
-    auto attention_mask_deepspec =
-        ov::genai::dflash_cb::build_draft_attention_mask(5, 2, 3, /*candidate_position_offset=*/0);
-    ASSERT_EQ(attention_mask_deepspec.get_shape(), ov::Shape({1, 10}));
-    ASSERT_EQ(int64_tensor_values(attention_mask_deepspec),
-              (std::vector<int64_t>{1, 1, 1, 1, 1, 1, 1, 1, 1, 1}));
-}
-
-TEST(DFlashCBVlmPromptIds, BuildsPlaceholderPromptIds) {
-    ASSERT_EQ(ov::genai::dflash_cb::build_placeholder_prompt_ids(3, 42), (std::vector<int64_t>{42, 42, 42}));
-}
-
-TEST(DFlashCBVlmPromptIds, RejectsInvalidPromptLengthAndPlaceholderId) {
-    EXPECT_THROW(ov::genai::dflash_cb::build_placeholder_prompt_ids(0, 42), ov::Exception);
-    EXPECT_THROW(ov::genai::dflash_cb::build_placeholder_prompt_ids(1, -1), ov::Exception);
-}
-
-TEST(DFlashCBGenerationConfig, DefaultsAssistantTokensToFive) {
-    ov::genai::GenerationConfig config;
-
-    ov::genai::dflash_cb::ensure_num_assistant_tokens_is_set(config);
-
-    ASSERT_EQ(config.num_assistant_tokens, ov::genai::dflash_cb::DEFAULT_NUM_ASSISTANT_TOKENS);
-}
-
-TEST(DFlashCBGenerationConfig, PreservesUnsetMaxNewTokensForDraft) {
-    ov::genai::GenerationConfig config;
-    ov::genai::dflash_cb::ensure_num_assistant_tokens_is_set(config);
-    auto draft_config = config;
-
-    ov::genai::dflash_cb::add_draft_assistant_token_headroom(draft_config, config);
-
-    ASSERT_EQ(draft_config.max_new_tokens, SIZE_MAX);
-}
-
-TEST(DFlashCBGenerationConfig, ExtendsFiniteActiveLimitForDraft) {
-    constexpr size_t assistant_tokens = ov::genai::dflash_cb::DEFAULT_NUM_ASSISTANT_TOKENS;
-
-    ov::genai::GenerationConfig max_new_tokens_config;
-    max_new_tokens_config.max_new_tokens = 10;
-    max_new_tokens_config.num_assistant_tokens = assistant_tokens;
-    auto max_new_tokens_draft_config = max_new_tokens_config;
-    ov::genai::dflash_cb::add_draft_assistant_token_headroom(max_new_tokens_draft_config,
-                                                              max_new_tokens_config);
-    ASSERT_EQ(max_new_tokens_draft_config.max_new_tokens, 10 + assistant_tokens);
-
-    ov::genai::GenerationConfig max_length_config;
-    max_length_config.max_length = 100;
-    max_length_config.num_assistant_tokens = assistant_tokens;
-    auto max_length_draft_config = max_length_config;
-    ov::genai::dflash_cb::add_draft_assistant_token_headroom(max_length_draft_config, max_length_config);
-    ASSERT_EQ(max_length_draft_config.max_length, 100 + assistant_tokens);
-}
-
-TEST(DFlashCBGenerationConfig, PreservesFiniteLimitWhenHeadroomWouldOverflow) {
-    constexpr size_t assistant_tokens = ov::genai::dflash_cb::DEFAULT_NUM_ASSISTANT_TOKENS;
-
-    ov::genai::GenerationConfig max_new_tokens_config;
-    max_new_tokens_config.max_new_tokens = SIZE_MAX - 2;
-    max_new_tokens_config.num_assistant_tokens = assistant_tokens;
-    auto max_new_tokens_draft_config = max_new_tokens_config;
-    ov::genai::dflash_cb::add_draft_assistant_token_headroom(max_new_tokens_draft_config,
-                                                              max_new_tokens_config);
-    ASSERT_EQ(max_new_tokens_draft_config.max_new_tokens, max_new_tokens_config.max_new_tokens);
-
-    ov::genai::GenerationConfig max_length_config;
-    max_length_config.max_length = SIZE_MAX - 2;
-    max_length_config.num_assistant_tokens = assistant_tokens;
-    auto max_length_draft_config = max_length_config;
-    ov::genai::dflash_cb::add_draft_assistant_token_headroom(max_length_draft_config, max_length_config);
-    ASSERT_EQ(max_length_draft_config.max_length, max_length_config.max_length);
-}
-
-TEST(DFlashCBGenerationConfig, PreservesExplicitAssistantTokens) {
-    ov::genai::GenerationConfig config;
-    config.num_assistant_tokens = 2;
-
-    ov::genai::dflash_cb::ensure_num_assistant_tokens_is_set(config);
-
-    ASSERT_EQ(config.num_assistant_tokens, 2);
-}
-
 TEST(DFlashCBGenerationConfig, AcceptsSupportedVlmOptions) {
     ov::genai::GenerationConfig config;
 
@@ -515,32 +311,6 @@ TEST(DFlashCBGenerationConfig, RejectsUnsupportedVlmOptions) {
     }
 }
 
-TEST(DFlashCBLinearAttentionCheckpointing, ComputesRequiredBlockCount) {
-    ASSERT_EQ(ov::genai::dflash_cb::linear_attention_checkpoint_block_count(5), 7);
-    ASSERT_EQ(
-        ov::genai::dflash_cb::linear_attention_checkpoint_block_count(
-            ov::genai::dflash_cb::DEFAULT_NUM_ASSISTANT_TOKENS),
-        ov::genai::dflash_cb::DEFAULT_NUM_ASSISTANT_TOKENS + 2);
-}
-
-TEST(DFlashCBLinearAttentionCheckpointing, AdjustsBlockCountOnlyForLinearAttentionTargets) {
-    ASSERT_EQ(ov::genai::dflash_cb::adjusted_linear_attention_block_count(
-                  /*current_block_count=*/0,
-                  /*num_assistant_tokens=*/5,
-                  /*target_has_linear_attention=*/false),
-              0);
-    ASSERT_EQ(ov::genai::dflash_cb::adjusted_linear_attention_block_count(
-                  /*current_block_count=*/0,
-                  /*num_assistant_tokens=*/5,
-                  /*target_has_linear_attention=*/true),
-              7);
-    ASSERT_EQ(ov::genai::dflash_cb::adjusted_linear_attention_block_count(
-                  /*current_block_count=*/9,
-                  /*num_assistant_tokens=*/5,
-                  /*target_has_linear_attention=*/true),
-              9);
-}
-
 TEST(DFlashCBCandidatePlanning, KeepsDraftWindowStableUntilGenerationEnds) {
     ASSERT_EQ(ov::genai::dflash_cb::draft_candidate_count(3, 0, 10), 3);
     ASSERT_EQ(ov::genai::dflash_cb::draft_candidate_count(3, 8, 10), 3);
@@ -563,24 +333,419 @@ TEST(DFlashCBCandidatePlanning, SupportsSingleAssistantToken) {
     ASSERT_EQ(ov::genai::dflash_cb::validation_candidate_count(1, 9, 10), 0);
 }
 
-TEST(DFlashCBValidationAccounting, ComputesAcceptedAndRejected) {
-    auto full_accept = ov::genai::dflash_cb::validation_accounting(3, 1, 5);
-    ASSERT_TRUE(full_accept.target_extended);
-    ASSERT_EQ(full_accept.accepted, 3);
-    ASSERT_EQ(full_accept.rejected, 0);
+TEST(DFlashCBDraftWindow, SelectsUnseenTargetRows) {
+    using ov::genai::dflash_cb::select_new_target_rows;
+    // prefill chunk: the target exported 4 rows ending at position 8, the draft knows 4 positions
+    auto prefill = select_new_target_rows(0, 4, 8, 4, 0);
+    ASSERT_EQ(prefill.begin, 0);
+    ASSERT_EQ(prefill.count, 4);
 
-    auto partial_accept = ov::genai::dflash_cb::validation_accounting(3, 1, 3);
-    ASSERT_TRUE(partial_accept.target_extended);
-    ASSERT_EQ(partial_accept.accepted, 1);
-    ASSERT_EQ(partial_accept.rejected, 2);
+    // validation rows [seed, c1, c2, c3] with c1 accepted: rows of the seed and c1
+    auto partial = select_new_target_rows(0, 10, 12, 4, 2);
+    ASSERT_EQ(partial.begin, 0);
+    ASSERT_EQ(partial.count, 2);
 
-    auto full_reject = ov::genai::dflash_cb::validation_accounting(3, 1, 2);
-    ASSERT_TRUE(full_reject.target_extended);
-    ASSERT_EQ(full_reject.accepted, 0);
-    ASSERT_EQ(full_reject.rejected, 3);
+    auto full = select_new_target_rows(0, 10, 14, 4, 0);
+    ASSERT_EQ(full.begin, 0);
+    ASSERT_EQ(full.count, 4);
 
-    auto no_target_extension = ov::genai::dflash_cb::validation_accounting(3, 1, 1);
-    ASSERT_FALSE(no_target_extension.target_extended);
-    ASSERT_EQ(no_target_extension.accepted, 0);
-    ASSERT_EQ(no_target_extension.rejected, 0);
+    // the target skipped the request this step: its published rows are stale
+    ASSERT_EQ(select_new_target_rows(0, 12, 12, 4, 3).count, 0);
 }
+
+TEST(DFlashCBDraftWindow, RejectsTargetRowsBehindTheDraft) {
+    using ov::genai::dflash_cb::select_new_target_rows;
+    // the target recomputed preempted tokens and reports fewer positions than the draft holds
+    ASSERT_THROW(select_new_target_rows(0, 12, 10, 4, 0), ov::Exception);
+    // the target exported fewer rows than the draft needs
+    ASSERT_THROW(select_new_target_rows(0, 4, 10, 4, 0), ov::Exception);
+}
+
+TEST(DFlashCBDraftWindow, PlansBlockOnceHiddenStatesReachTheSeed) {
+    using ov::genai::dflash_cb::plan_draft_block;
+    // prompt 8, the seed at position 8, hidden states for positions 0..7
+    auto block = plan_draft_block(3, 1, 100, 8, 8, /*candidate_position_offset=*/1);
+    ASSERT_EQ(block.block_rows, 4);
+    ASSERT_EQ(block.candidate_rows, 3);
+
+    auto deepspec = plan_draft_block(3, 1, 100, 8, 8, /*candidate_position_offset=*/0);
+    ASSERT_EQ(deepspec.block_rows, 3);
+    ASSERT_EQ(deepspec.candidate_rows, 3);
+
+    // the block keeps its trained size while fewer candidates are validated near max_new_tokens
+    auto near_end = plan_draft_block(3, 8, 10, 8, 15, 1);
+    ASSERT_EQ(near_end.block_rows, 4);
+    ASSERT_EQ(near_end.candidate_rows, 1);
+
+    // no seed yet, hidden states behind the seed, drafting off, or only the last token left
+    ASSERT_EQ(plan_draft_block(3, 0, 100, 8, 4, 1).block_rows, 0);
+    ASSERT_EQ(plan_draft_block(3, 2, 100, 8, 8, 1).block_rows, 0);
+    ASSERT_EQ(plan_draft_block(0, 1, 100, 8, 8, 1).block_rows, 0);
+    ASSERT_EQ(plan_draft_block(3, 9, 10, 8, 16, 1).block_rows, 0);
+}
+
+TEST(DFlashCBDraftWindow, BoundsDraftBatchBudget) {
+    using ov::genai::dflash_cb::draft_max_num_batched_tokens;
+    using ov::genai::dflash_cb::MAX_DRAFT_BLOCK_ROWS;
+    ASSERT_EQ(draft_max_num_batched_tokens(256, 4), 256 + 4 * MAX_DRAFT_BLOCK_ROWS);
+    ASSERT_EQ(draft_max_num_batched_tokens(std::numeric_limits<size_t>::max(), 4), std::numeric_limits<size_t>::max());
+}
+
+namespace {
+
+constexpr int64_t MASK_TOKEN = 99;
+constexpr size_t HIDDEN_SIZE = 2;
+
+std::shared_ptr<ov::Model> make_dflash_draft_inputs_model() {
+    ov::ParameterVector params;
+    auto add_input = [&](const std::string& name, const ov::element::Type& type, const ov::PartialShape& shape) {
+        auto parameter = std::make_shared<ov::op::v0::Parameter>(type, shape);
+        parameter->output(0).get_tensor().set_names({name});
+        params.push_back(parameter);
+    };
+    add_input("token_type_ids", ov::element::i64, ov::PartialShape{-1, 1});
+    add_input("hidden_states", ov::element::f32, ov::PartialShape{-1, 1, static_cast<int64_t>(HIDDEN_SIZE)});
+    add_input("sampled_tokens_indices", ov::element::i64, ov::PartialShape{-1});
+    auto logits = ov::op::v0::Constant::create(ov::element::f32, {1, 1, 8}, {0.0f});
+    logits->output(0).get_tensor().set_names({"logits"});
+    return std::make_shared<ov::Model>(ov::OutputVector{logits}, params);
+}
+
+// Hidden-state rows [rows, 1, HIDDEN_SIZE] whose values count up from `first`.
+ov::Tensor make_hidden_rows(size_t rows, float first) {
+    ov::Tensor tensor(ov::element::f32, {rows, 1, HIDDEN_SIZE});
+    std::iota(tensor.data<float>(), tensor.data<float>() + tensor.get_size(), first);
+    return tensor;
+}
+
+ov::genai::GeneratedSequences target_step(const std::vector<int64_t>& tokens,
+                                          size_t num_processed_tokens,
+                                          const ov::Tensor& hidden_states) {
+    ov::genai::GeneratedSequences sequences;
+    sequences.emplace(0,
+                      ov::genai::GeneratedSequence(tokens,
+                                                   std::vector<float>(tokens.size(), 0.0f),
+                                                   num_processed_tokens,
+                                                   hidden_states));
+    return sequences;
+}
+
+}  // namespace
+
+class DFlashCBPipelineTest : public testing::Test, public ov::genai::ContinuousBatchingPipeline {
+protected:
+    class DraftInstance : public ContinuousBatchingForDFlashDecodingImpl {
+    public:
+        explicit DraftInstance(size_t candidate_position_offset = 1) {
+            m_sampler = std::make_shared<ov::genai::Sampler>();
+            dflash_mode_enabled = true;
+            m_dflash_mask_token_id = MASK_TOKEN;
+            m_dflash_candidate_position_offset = candidate_position_offset;
+            ov::Core core;
+            auto request = core.compile_model(make_dflash_draft_inputs_model(), "CPU").create_infer_request();
+            m_model_runner = std::make_shared<ov::genai::ModelRunner>(request, /*block_size=*/4);
+            m_model_runner->enable_dflash_draft(candidate_position_offset);
+        }
+
+        ov::genai::SequenceGroup::Ptr add(uint64_t request_id,
+                                          const std::vector<int64_t>& prompt,
+                                          size_t num_assistant_tokens,
+                                          size_t max_new_tokens = 100) {
+            auto config = ov::genai::utils::get_greedy_config();
+            config.num_assistant_tokens = num_assistant_tokens;
+            config.max_new_tokens = max_new_tokens;
+            auto group = std::make_shared<ov::genai::SequenceGroup>(request_id, prompt, config);
+            group->pause_generation(true);
+            m_requests.push_back(group);
+            return group;
+        }
+
+        void remove(uint64_t request_id) {
+            m_requests.erase(std::remove_if(m_requests.begin(), m_requests.end(),
+                                            [&](const ov::genai::SequenceGroup::Ptr& group) {
+                                                return group->get_request_id() == request_id;
+                                            }),
+                             m_requests.end());
+        }
+
+        using ContinuousBatchingForDFlashDecodingImpl::finish_dflash_draft_step;
+
+        auto& state(uint64_t request_id) {
+            return m_dflash_draft_states.at(request_id);
+        }
+
+        // Forwards `scheduled_rows` of the request's window (all by default) and finishes the step the way the
+        // draft multistep does.
+        void forward_window(const ov::genai::SequenceGroup::Ptr& group,
+                            const ov::Tensor& logits,
+                            std::optional<size_t> scheduled_rows = std::nullopt) {
+            auto& draft_state = state(group->get_request_id());
+            const size_t context_rows = draft_state.pending_rows ? draft_state.pending_rows.get_shape()[0] : 0;
+            group->schedule_tokens(scheduled_rows.value_or(context_rows + draft_state.block_rows));
+            group->finish_iteration();
+            finish_dflash_draft_step(group, draft_state, logits, 0);
+        }
+    };
+
+    // Logits whose argmax per row is the given token.
+    static ov::Tensor make_logits(const std::vector<int64_t>& argmax_tokens, size_t vocab_size = 128) {
+        ov::Tensor logits(ov::element::f32, {argmax_tokens.size(), 1, vocab_size});
+        std::fill_n(logits.data<float>(), logits.get_size(), 0.0f);
+        for (size_t row = 0; row < argmax_tokens.size(); ++row) {
+            logits.data<float>()[row * vocab_size + argmax_tokens[row]] = 1.0f;
+        }
+        return logits;
+    }
+
+    // Prompt of 8 tokens processed by the target in one chunk; the target sampled seed 7.
+    ov::genai::SequenceGroup::Ptr start_with_block(DraftInstance& draft, size_t num_assistant_tokens = 3) {
+        auto group = draft.add(0, {0, 1, 2, 3, 4, 5, 6, 7}, num_assistant_tokens);
+        draft.update_request(0, target_step({7}, 8, make_hidden_rows(8, 0.0f)), true);
+        return group;
+    }
+
+    static std::vector<int64_t> generated(const ov::genai::SequenceGroup::Ptr& group) {
+        return group->get_running_sequences().front()->get_generated_ids();
+    }
+};
+
+TEST_F(DFlashCBPipelineTest, PrefillChunkOffersOnlyTheExportedRows) {
+    DraftInstance draft;
+    auto group = draft.add(0, {0, 1, 2, 3, 4, 5, 6, 7}, 3);
+
+    auto result = draft.update_request(0, target_step({}, 4, make_hidden_rows(4, 0.0f)), true);
+
+    ASSERT_EQ(result.inserted_tokens_cnt, 0);
+    ASSERT_EQ(result.removed_tokens_cnt, 0);
+    ASSERT_FALSE(group->is_waiting());
+    // a window inside the prompt is scheduled in the prompt phase, capped to the exported rows
+    ASSERT_FALSE(group->can_generate_tokens());
+    ASSERT_EQ(group->get_num_processed_tokens(), 0);
+    ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 4);
+    ASSERT_EQ(draft.state(0).block_rows, 0);
+}
+
+TEST_F(DFlashCBPipelineTest, WindowCrossingThePromptEndIsOneGeneratePhaseWindow) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7, MASK_TOKEN, MASK_TOKEN, MASK_TOKEN}));
+    ASSERT_TRUE(group->can_generate_tokens());
+    ASSERT_EQ(group->get_num_processed_tokens(), 0);
+    // 8 context rows + seed + 3 masks
+    ASSERT_EQ(group->get_num_available_tokens_for_batching(), 12);
+    ASSERT_FALSE(group->requires_sampling());
+}
+
+TEST_F(DFlashCBPipelineTest, DeepSpecBlockStartsCandidatesAtTheSeed) {
+    DraftInstance draft(/*candidate_position_offset=*/0);
+    auto group = start_with_block(draft);
+
+    // 8 context rows + seed + 2 masks
+    ASSERT_EQ(group->get_num_available_tokens_for_batching(), 11);
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7, MASK_TOKEN, MASK_TOKEN}));
+}
+
+TEST_F(DFlashCBPipelineTest, CandidatesReplaceThePlaceholders) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+    draft.forward_window(group, make_logits({20, 21, 22}));
+
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7, 20, 21, 22}));
+    ASSERT_EQ(draft.state(0).committed_rows, 8);
+    ASSERT_FALSE(draft.state(0).pending_rows);
+    // the block stays in the draft KV until the next update rewinds it
+    ASSERT_EQ(group->get_num_processed_tokens(), 12);
+}
+
+TEST_F(DFlashCBPipelineTest, RejectsASplitBlock) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+
+    // 8 context rows and 2 of the 4 block rows
+    ASSERT_THROW(draft.forward_window(group, make_logits({20, 21, 22}), 10), ov::Exception);
+}
+
+TEST_F(DFlashCBPipelineTest, PrefillChunkCommitsOnlyTheForwardedRows) {
+    DraftInstance draft;
+    auto group = draft.add(0, {0, 1, 2, 3, 4, 5, 6, 7}, 3);
+    draft.update_request(0, target_step({}, 4, make_hidden_rows(4, 0.0f)), true);
+
+    // the KV cache fit only 3 of the 4 exported rows
+    draft.forward_window(group, {}, 3);
+
+    ASSERT_EQ(draft.state(0).committed_rows, 3);
+    ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 1);
+    ASSERT_TRUE(draft.state(0).owns_pending_rows);
+}
+
+TEST_F(DFlashCBPipelineTest, PartialRejectionKeepsAcceptedRowsAndRewindsTheBlock) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+    draft.forward_window(group, make_logits({20, 21, 22}));
+
+    // the target accepted 20, rejected 21 and corrected it to 30; it exported rows for [7, 20, 21, 22]
+    auto result = draft.update_request(0, target_step({7, 20, 30}, 10, make_hidden_rows(4, 100.0f)), true);
+
+    ASSERT_EQ(result.removed_tokens_cnt, 2);
+    ASSERT_EQ(result.inserted_tokens_cnt, 1);
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7, 20, 30, MASK_TOKEN, MASK_TOKEN, MASK_TOKEN}));
+    ASSERT_EQ(group->get_num_processed_tokens(), 8);
+    // rows of the seed and the accepted candidate, then the next block
+    ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 2);
+    ASSERT_EQ(draft.state(0).pending_rows.data<float>()[0], 100.0f);
+    ASSERT_EQ(group->get_num_available_tokens_for_batching(), 2 + 4);
+}
+
+TEST_F(DFlashCBPipelineTest, FullAcceptanceTakesAllValidatedRows) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+    draft.forward_window(group, make_logits({20, 21, 22}));
+
+    auto result = draft.update_request(0, target_step({7, 20, 21, 22, 23}, 12, make_hidden_rows(4, 100.0f)), true);
+
+    ASSERT_EQ(result.removed_tokens_cnt, 0);
+    ASSERT_EQ(result.inserted_tokens_cnt, 1);
+    ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 4);
+    ASSERT_EQ(group->get_num_available_tokens_for_batching(), 4 + 4);
+}
+
+TEST_F(DFlashCBPipelineTest, FullRejectionTakesOnlyTheSeedRow) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+    draft.forward_window(group, make_logits({20, 21, 22}));
+
+    auto result = draft.update_request(0, target_step({7, 30}, 9, make_hidden_rows(4, 100.0f)), true);
+
+    ASSERT_EQ(result.removed_tokens_cnt, 3);
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7, 30, MASK_TOKEN, MASK_TOKEN, MASK_TOKEN}));
+    ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 1);
+}
+
+TEST_F(DFlashCBPipelineTest, DeferredTargetPublishesNoNewRows) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+    draft.forward_window(group, make_logits({20, 21, 22}));
+
+    // the target did not run the request: it still reports 8 processed positions and stale rows
+    auto result = draft.update_request(0, target_step({7, 20, 21, 22}, 8, make_hidden_rows(8, 0.0f)), true);
+
+    ASSERT_EQ(result.removed_tokens_cnt, 0);
+    ASSERT_FALSE(draft.state(0).pending_rows);
+    ASSERT_EQ(draft.state(0).block_rows, 0);
+    ASSERT_TRUE(group->is_waiting());
+}
+
+TEST_F(DFlashCBPipelineTest, NearMaxNewTokensForwardsOnlyTheContext) {
+    DraftInstance draft;
+    auto group = draft.add(0, {0, 1, 2, 3}, 3, /*max_new_tokens=*/2);
+    draft.update_request(0, target_step({3}, 4, make_hidden_rows(4, 0.0f)), true);
+
+    // one token left for the target: no block, only the context rows are forwarded
+    ASSERT_EQ(draft.state(0).block_rows, 0);
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{3}));
+    ASSERT_EQ(group->get_num_available_tokens_for_batching(), 4);
+}
+
+TEST_F(DFlashCBPipelineTest, UnscheduledWindowDropsPlaceholdersAndOwnsItsRows) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+    ov::Tensor view = draft.state(0).pending_rows;
+
+    draft.finish_dflash_draft_step(group, draft.state(0), {}, 0);
+
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7}));
+    ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 8);
+    ASSERT_TRUE(draft.state(0).owns_pending_rows);
+    ASSERT_NE(draft.state(0).pending_rows.data(), view.data());
+}
+
+TEST_F(DFlashCBPipelineTest, ReusedRequestIdStartsFromAFreshState) {
+    DraftInstance draft;
+    auto first = start_with_block(draft);
+    draft.forward_window(first, make_logits({20, 21, 22}));
+    draft.remove(0);
+
+    auto second = draft.add(0, {5, 6, 7, 8}, 3);
+    draft.update_request(0, target_step({}, 2, make_hidden_rows(2, 0.0f)), true);
+
+    ASSERT_EQ(draft.state(0).committed_rows, 0);
+    ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 2);
+}
+
+class DFlashStrategyTest : public testing::Test, public ov::genai::ContinuousBatchingPipeline {
+protected:
+    class StrategyInstance : public DFlashDecodingImpl {
+    public:
+        using DFlashDecodingImpl::make_draft_generation_config;
+    };
+
+    static void expect_rejected(const ov::genai::GenerationConfig& config, const std::string& expected_message) {
+        // Unsupported configurations must be rejected before add_request touches the pipelines.
+        StrategyInstance strategy;
+        try {
+            strategy.add_request(0, ov::Tensor{}, config);
+            FAIL() << "Expected the DFlash request to be rejected";
+        } catch (const ov::Exception& exception) {
+            EXPECT_NE(std::string(exception.what()).find(expected_message), std::string::npos) << exception.what();
+        }
+    }
+};
+
+TEST_F(DFlashStrategyTest, RejectsSampling) {
+    auto config = ov::genai::utils::get_greedy_config();
+    config.do_sample = true;
+    expect_rejected(config, "greedy decoding only");
+}
+
+TEST_F(DFlashStrategyTest, RejectsConfidenceThreshold) {
+    auto config = ov::genai::utils::get_greedy_config();
+    config.assistant_confidence_threshold = 0.5f;
+    expect_rejected(config, "assistant_confidence_threshold must be 0.f");
+}
+
+TEST_F(DFlashStrategyTest, RejectsAdapters) {
+    auto config = ov::genai::utils::get_greedy_config();
+    config.adapters = ov::genai::AdapterConfig{};
+    expect_rejected(config, "does not support adapters");
+}
+
+TEST_F(DFlashStrategyTest, DraftConfigOnlyProposesCandidates) {
+    ov::genai::GenerationConfig config;
+    config.num_assistant_tokens = 3;
+    config.stop_strings = {"stop"};
+    config.stop_token_ids = {5};
+    config.echo = true;
+
+    const auto draft_config = StrategyInstance::make_draft_generation_config(config);
+
+    EXPECT_TRUE(draft_config.ignore_eos);
+    EXPECT_TRUE(draft_config.stop_strings.empty());
+    EXPECT_TRUE(draft_config.stop_token_ids.empty());
+    EXPECT_FALSE(draft_config.echo);
+    EXPECT_EQ(draft_config.max_new_tokens, SIZE_MAX - 1);
+    EXPECT_NO_THROW(draft_config.validate());
+}
+
+TEST_F(DFlashStrategyTest, RejectsADraftWithoutTokenTypeIds) {
+    auto make_model = [] {
+        auto input_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1, -1});
+        input_ids->output(0).set_names({"input_ids"});
+        auto result = std::make_shared<ov::op::v0::Result>(input_ids);
+        return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input_ids});
+    };
+    ov::genai::utils::dflash::DFlashRTInfo rt_info;
+    rt_info.dflash_mode = true;
+    rt_info.mask_token_id = MASK_TOKEN;
+    rt_info.target_layer_ids = {0};
+    const ov::genai::ModelDesc main_desc(make_model(), ov::genai::Tokenizer{});
+    const ov::genai::ModelDesc draft_desc(make_model(), ov::genai::Tokenizer{});
+
+    try {
+        DFlashDecodingImpl strategy(main_desc, draft_desc, rt_info);
+        FAIL() << "Expected the stateful DFlash draft to be rejected";
+    } catch (const ov::Exception& exception) {
+        EXPECT_NE(std::string(exception.what()).find("re-export the draft"), std::string::npos) << exception.what();
+    }
+}
+
