@@ -660,6 +660,19 @@ TEST_F(DFlashCBPipelineTest, UnscheduledWindowDropsPlaceholdersAndOwnsItsRows) {
     ASSERT_NE(draft.state(0).pending_rows.data(), view.data());
 }
 
+TEST_F(DFlashCBPipelineTest, RestoredPrefixIsAlreadyCommitted) {
+    DraftInstance draft;
+    auto group = draft.add(0, {0, 1, 2, 3, 4, 5, 6, 7}, 3);
+    // prefix caching restored 4 positions of both models before the first step
+    group->update_processed_tokens_num(4);
+
+    draft.update_request(0, target_step({}, 6, make_hidden_rows(2, 0.0f)), true);
+
+    ASSERT_EQ(draft.state(0).committed_rows, 4);
+    ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 2);
+    ASSERT_EQ(group->get_num_processed_tokens(), 4);
+}
+
 TEST_F(DFlashCBPipelineTest, ReusedRequestIdStartsFromAFreshState) {
     DraftInstance draft;
     auto first = start_with_block(draft);
