@@ -148,6 +148,7 @@ std::pair<std::string, Any> draft_model(
     const std::filesystem::path openvino_model_name = is_mtp ? "openvino_mtp_model.xml" : "openvino_model.xml";
     auto model = utils::singleton_core().read_model(models_path / openvino_model_name, {}, plugin_config);
     utils::dflash::apply_dflash_rt_info(model, plugin_config);
+    utils::dflash::read_markov_head(models_path, plugin_config);
     if (is_mtp) {
         plugin_config["mtp_mode"] = true;
     }
@@ -171,32 +172,6 @@ std::pair<std::string, Any> draft_model(
     utils::mtp::apply_mtp_rt_info(model, plugin_config);
     utils::eagle3::apply_eagle3_rt_info(model, plugin_config);
     return { utils::DRAFT_MODEL_ARG_NAME, Any::make<ModelDesc>(model, tokenizer, device, plugin_config, scheduler_config, generation_config) };
-}
-
-std::pair<std::string, Any> selector_model(
-    const std::filesystem::path& models_path,
-    const std::string& device,
-    const ov::AnyMap& properties) {
-    auto [plugin_config, scheduler_config] = utils::extract_scheduler_config(properties);
-    const auto model_path = std::filesystem::is_directory(models_path)
-                                ? models_path / "openvino_selector_model.xml"
-                                : models_path;
-    auto model = utils::singleton_core().read_model(model_path, {}, plugin_config);
-    utils::dflash::apply_dflash_selector_rt_info(model, plugin_config);
-    return {utils::SELECTOR_MODEL_ARG_NAME,
-            Any::make<ModelDesc>(model, Tokenizer{}, device, plugin_config, scheduler_config)};
-}
-
-std::pair<std::string, Any> selector_model(
-    std::string& model_str,
-    ov::Tensor& weights_tensor,
-    const std::string& device,
-    const ov::AnyMap& properties) {
-    auto [plugin_config, scheduler_config] = utils::extract_scheduler_config(properties);
-    auto model = utils::singleton_core().read_model(model_str, weights_tensor);
-    utils::dflash::apply_dflash_selector_rt_info(model, plugin_config);
-    return {utils::SELECTOR_MODEL_ARG_NAME,
-            Any::make<ModelDesc>(model, Tokenizer{}, device, plugin_config, scheduler_config)};
 }
 
 class StatefulPipeline {
