@@ -12,6 +12,9 @@
 
 namespace ov::genai {
 
+// DFlash speculative decoding on continuous batching: the target validates candidates and exports the
+// hidden states of the requested layers; the draft proposes each request's candidates in one forward
+// over the window [target hidden-state context rows ; seed + mask block rows].
 class ContinuousBatchingPipeline::DFlashDecodingImpl : public ContinuousBatchingPipeline::SpeculativeDecodingImpl {
 public:
     DFlashDecodingImpl(const ov::genai::ModelDesc& main_model_desc,
@@ -28,45 +31,44 @@ public:
                                  const std::string& prompt,
                                  const ov::genai::GenerationConfig& sampling_params) override;
 
-    bool has_non_finished_requests() override;
-    void step() override;
+protected:
+    DFlashDecodingImpl() = default;
+    void validate_awaiting_requests(const std::vector<SequenceGroup::Ptr>& main_awaiting_requests,
+                                    const std::vector<SequenceGroup::Ptr>& draft_awaiting_requests) const override;
+    void validate_request_config(const GenerationConfig& config) const;
+    static GenerationConfig make_draft_generation_config(const GenerationConfig& config);
 
-    std::vector<EncodedGenerationResult>
-    generate(const std::vector<ov::Tensor>& input_ids,
-             const std::vector<GenerationConfig>& sampling_params,
-             const StreamerVariant& streamer,
-             const std::optional<std::vector<std::pair<ov::Tensor, std::optional<int64_t>>>>& position_ids = std::nullopt,
-             const std::optional<std::vector<ov::Tensor>>& prompt_ids = std::nullopt,
-             const std::optional<std::vector<std::unordered_map<std::string, ov::Tensor>>>& lm_extra_inputs_list = std::nullopt) override;
-
-private:
-    class DFlashCBDraftRunner;
-
-    struct RequestState {
-        dflash_cb::HiddenDeltaBuffer pending_hidden_deltas;
-        std::vector<int64_t> generated_tokens;
-        size_t prompt_len = 0;
-        size_t generated_before_draft = 0;
-        size_t draft_generated = 0;
-        bool finished = false;
-        GenerationConfig generation_config;
-    };
-
-    GenerationConfig make_draft_generation_config(const GenerationConfig& config) const;
-    static void append_pending_hidden_delta(RequestState& state, const ov::Tensor& hidden_delta, bool copy_data);
-    static bool has_pending_hidden_delta(const RequestState& state);
-    static ov::Tensor materialize_pending_hidden_delta(const RequestState& state);
-    static void clear_pending_hidden_delta(RequestState& state);
-    void validate_hidden_prefix_length(const RequestState& state) const;
-    bool has_active_request_state() const;
-    void drop_finished_request_states();
-    void update_draft_states_from_main(const GeneratedRequests& main_generated_requests);
-    void drop_requests();
-    ov::genai::RawPerfMetrics collect_draft_raw_metrics();
-
-    std::shared_ptr<DFlashCBDraftRunner> m_draft;
     ov::genai::utils::dflash::DFlashRTInfo m_rt_info;
-    std::map<uint64_t, RequestState> m_request_states;
+};
+
+// Continuous-batching pipeline for both DFlash models. The validating main pipeline publishes its
+// processed length with the exported hidden states. The draft pipeline forwards each request's window
+// once per step; its logic is in ContinuousBatchingForSpeculativeDecodingImpl behind dflash_mode_enabled.
+class ContinuousBatchingPipeline::ContinuousBatchingForDFlashDecodingImpl
+    : public ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl {
+public:
+    ContinuousBatchingForDFlashDecodingImpl() = default;
+
+    ContinuousBatchingForDFlashDecodingImpl(const std::shared_ptr<ov::Model>& model,
+                                            const Tokenizer& tokenizer,
+                                            const GenerationConfig& generation_config,
+                                            const SchedulerConfig& scheduler_config,
+                                            const std::string& device,
+                                            const ov::AnyMap& plugin_config,
+                                            bool is_validation_mode_enabled,
+                                            int64_t mask_token_id = -1,
+                                            size_t candidate_position_offset = 1);
+
+    ContinuousBatchingForDFlashDecodingImpl(const std::shared_ptr<ov::Model>& model,
+                                            std::shared_ptr<InputsEmbedder> inputs_embedder,
+                                            const Tokenizer& tokenizer,
+                                            const GenerationConfig& generation_config,
+                                            const SchedulerConfig& scheduler_config,
+                                            const std::string& device,
+                                            const ov::AnyMap& plugin_config,
+                                            bool is_validation_mode_enabled,
+                                            int64_t mask_token_id = -1,
+                                            size_t candidate_position_offset = 1);
 };
 
 }  // namespace ov::genai
