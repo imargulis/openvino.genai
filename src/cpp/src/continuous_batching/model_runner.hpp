@@ -419,6 +419,17 @@ public:
     // MTP draft uses rank-1 sequential positions instead of VLM M-RoPE positions.
     void enable_mtp_draft_positions(bool on) { m_mtp_draft_positions = on; }
 
+    // DFlash draft: each scheduled request forwards [target hidden-state rows ; seed + mask block]. The target
+    // rows come from set_initial_hidden_state() and get token type 0; the remaining scheduled rows are the block
+    // and get token type 1. The block rows after the first `candidate_position_offset` ones are gathered.
+    void enable_dflash_draft(size_t candidate_position_offset) {
+        // the draft's hidden_states input is wider than its embeddings, so it is sized from the model
+        m_dflash_hidden_state_size = static_cast<size_t>(
+            m_request.get_compiled_model().input("hidden_states").get_partial_shape()[2].get_length());
+        m_dflash_draft = true;
+        m_dflash_candidate_position_offset = candidate_position_offset;
+    }
+
     void set_inputs_embedder(const std::shared_ptr<InputsEmbedder>& inputs_embedder) {
         m_inputs_embedder = inputs_embedder;
         m_embedding = inputs_embedder->get_embedding_model();
@@ -534,7 +545,9 @@ public:
         ov::Tensor score_aggregation_window = _get_or_resize_tensor(m_cached_score_aggregation_window, "score_aggregation_window",
             {batch_size_in_sequences}, ov::element::i32);
 
-        ov::Tensor hidden_state_input = _prepare_hidden_state_input(total_num_tokens, hidden_size);
+        ov::Tensor hidden_state_input = m_dflash_draft
+                                            ? _make_zeroed_hidden_state_input(total_num_tokens, m_dflash_hidden_state_size)
+                                            : _prepare_hidden_state_input(total_num_tokens, hidden_size);
         float* hidden_state_data = nullptr;
         if (hidden_state_input) {
             hidden_state_data = hidden_state_input.data<float>();
@@ -548,7 +561,7 @@ public:
         // get raw pointers to copy to
         float *inputs_embeds_data = nullptr;
         int64_t *input_ids_data = nullptr;
-        int64_t *token_type_ids_data = nullptr;
+        int64_t *token_type_ids_data = m_dflash_draft ? token_type_ids.data<int64_t>() : nullptr;
 
         ov::Tensor deepstack_visual_embeds;
         ov::Tensor visual_pos_masks;
@@ -740,6 +753,13 @@ public:
                             }
                         }
                     }
+                } else if (m_dflash_draft) {
+                    output_seq_len += _fill_dflash_draft_rows(sequence_group->get_request_id(),
+                                                              num_scheduled_tokens,
+                                                              current_token_idx,
+                                                              hidden_state_input,
+                                                              token_type_ids_data,
+                                                              gather_indices_values);
                 }
                 for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id, ++gathering_current_index) {
                     // compute token for current sequence
@@ -850,14 +870,13 @@ public:
                     input_ids_data += num_scheduled_tokens;
                 } else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
                     inputs_embeds_data += num_scheduled_tokens * hidden_size;
-
-                    if (have_token_type_ids)
-                        token_type_ids_data += num_scheduled_tokens;
                     
                     if (deepstack_context.have_deepstack_visual_inputs) {
                         visual_pos_masks_data += num_scheduled_tokens;
                     }
                 }
+                if (have_token_type_ids || m_dflash_draft)
+                    token_type_ids_data += num_scheduled_tokens;
 
                 if (m_is_aggregate_attention_scores) {
                     size_t seq_id = sequence->get_id();
@@ -1121,6 +1140,38 @@ private:
     // collect thinker hidden states, does not trigger an Eagle3-only tensor bind on Omni models.
     bool m_has_qq_bias_input = false;
 
+    bool m_dflash_draft = false;
+    size_t m_dflash_candidate_position_offset = 1;
+    size_t m_dflash_hidden_state_size = 0;
+
+    // Fills the rows of one DFlash draft window starting at `first_row`: the request's stored target hidden
+    // states go to the leading rows (token type 0) and the rest is the block (token type 1, hidden state
+    // left zero). Appends the block rows after the first `candidate_position_offset` ones to `gather_indices`
+    // and returns their count.
+    size_t _fill_dflash_draft_rows(uint64_t request_id,
+                                   size_t num_scheduled_tokens,
+                                   size_t first_row,
+                                   const ov::Tensor& hidden_state_input,
+                                   int64_t* token_type_ids,
+                                   std::vector<int64_t>& gather_indices) {
+        const auto it = m_initial_hidden_states.find(request_id);
+        const ov::Tensor target_hidden_states = it != m_initial_hidden_states.end() ? it->second : ov::Tensor{};
+        const size_t num_target_rows = target_hidden_states ? target_hidden_states.get_shape()[0] : 0;
+        const size_t context_rows = std::min(num_scheduled_tokens, num_target_rows);
+        const size_t block_rows = num_scheduled_tokens - context_rows;
+
+        std::fill_n(token_type_ids, context_rows, 0);
+        std::fill_n(token_type_ids + context_rows, block_rows, 1);
+        if (context_rows > 0) {
+            _copy_roi_between_tensors(target_hidden_states, 0, context_rows, hidden_state_input, first_row);
+        }
+        const size_t first_candidate = context_rows + m_dflash_candidate_position_offset;
+        for (size_t row = first_candidate; row < num_scheduled_tokens; ++row) {
+            gather_indices.push_back(static_cast<int64_t>(first_row + row));
+        }
+        return num_scheduled_tokens > first_candidate ? num_scheduled_tokens - first_candidate : 0;
+    }
+
     // Hidden state flags and helpers
     bool _is_hs_export()   const { return m_hidden_state_flags & HS_EXPORT; }
     bool _is_hs_import()   const { return m_hidden_state_flags & HS_IMPORT; }
@@ -1290,6 +1341,10 @@ private:
             return {};
         }
 
+        return _make_zeroed_hidden_state_input(total_num_tokens, hidden_size);
+    }
+
+    static ov::Tensor _make_zeroed_hidden_state_input(size_t total_num_tokens, size_t hidden_size) {
         ov::Tensor hs(ov::element::f32, {total_num_tokens, 1, hidden_size});
         std::memset(hs.data<float>(), 0, hs.get_byte_size());
         return hs;
