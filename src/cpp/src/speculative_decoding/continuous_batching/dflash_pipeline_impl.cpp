@@ -239,6 +239,8 @@ UpdateRequestResult ContinuousBatchingPipeline::ContinuousBatchingForSpeculative
     if (state.sequence_id != sequence->get_id()) {
         state = dflash_cb::DraftState{};
         state.sequence_id = sequence->get_id();
+        // a restored prefix is already committed: the draft request waits for its first window until now
+        state.committed_rows = request->get_num_processed_tokens();
     }
 
     // Keep the tokens both models agree on, then take the target's tokens: the accepted candidates stay,

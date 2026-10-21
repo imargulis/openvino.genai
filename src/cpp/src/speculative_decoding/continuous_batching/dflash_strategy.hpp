@@ -33,6 +33,7 @@ public:
 
 protected:
     DFlashDecodingImpl() = default;
+    void align_request_pair_processed_prefix(uint64_t request_id) override;
     void validate_awaiting_requests(const std::vector<SequenceGroup::Ptr>& main_awaiting_requests,
                                     const std::vector<SequenceGroup::Ptr>& draft_awaiting_requests) const override;
     void validate_request_config(const GenerationConfig& config) const;
@@ -69,6 +70,23 @@ public:
                                             bool is_validation_mode_enabled,
                                             int64_t mask_token_id = -1,
                                             size_t candidate_position_offset = 1);
+
+    bool supports_embedding_prefix_verification() const override {
+        return true;
+    }
+
+    // Only prompt blocks are published: the draft KV past the prompt holds mask and rewound block rows.
+    // DFlashDecodingImpl restores main and draft to a common prefix after both requests are added.
+    void initialize_prefix_cache(const SequenceGroup::Ptr& group) override {
+        for (const auto& sequence : group->get_sequences()) {
+            sequence->set_prefix_cache_policy(group->get_prompt_len());
+        }
+    }
+
+protected:
+    bool _can_publish_kv_only_completed_blocks() const override {
+        return true;
+    }
 };
 
 }  // namespace ov::genai

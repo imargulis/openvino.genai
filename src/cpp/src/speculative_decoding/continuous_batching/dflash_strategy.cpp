@@ -47,8 +47,6 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     : m_rt_info(rt_info) {
     OPENVINO_ASSERT(m_rt_info.dflash_mode, "DFlash continuous batching requires dflash_mode=true.");
     OPENVINO_ASSERT(!m_rt_info.target_layer_ids.empty(), "DFlash target_layer_ids cannot be empty.");
-    OPENVINO_ASSERT(!main_model_desc.scheduler_config.enable_prefix_caching,
-                    "DFlash does not support scheduler_config.enable_prefix_caching.");
     OPENVINO_ASSERT(main_model_desc.scheduler_config.dynamic_split_fuse,
                     "DFlash requires scheduler_config.dynamic_split_fuse=true.");
     auto main_model = main_model_desc.model;
@@ -87,6 +85,8 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     }
 
     auto [main_scheduler_config, draft_scheduler_config] = init_speculative_models(main_model_desc, draft_model_desc);
+    OPENVINO_ASSERT(main_scheduler_config.enable_prefix_caching == draft_scheduler_config.enable_prefix_caching,
+                    "DFlash main and draft pipelines must use the same enable_prefix_caching setting.");
     validate_target_has_no_unmanaged_state(main_model);
     utils::dflash::expose_target_hidden_states(main_model, hidden_state_locators, m_rt_info.target_layer_ids);
     const auto target_hidden_width = main_model->output("last_hidden_state").get_partial_shape()[2];
@@ -97,7 +97,6 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
 
     // A draft step forwards each request's new target rows plus one block, never split.
     draft_scheduler_config.dynamic_split_fuse = true;
-    draft_scheduler_config.enable_prefix_caching = false;
     draft_scheduler_config.num_linear_attention_blocks = 0;
     draft_scheduler_config.max_num_batched_tokens = dflash_cb::draft_max_num_batched_tokens(
         main_scheduler_config.max_num_batched_tokens, main_scheduler_config.max_num_seqs);
@@ -182,6 +181,36 @@ GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_draft_gene
     return draft_config;
 }
 
+void ContinuousBatchingPipeline::DFlashDecodingImpl::align_request_pair_processed_prefix(uint64_t request_id) {
+    if (!m_main_pipeline->is_prefix_caching_enabled()) {
+        return;
+    }
+    auto find_request = [request_id](const std::vector<SequenceGroup::Ptr>& requests) -> SequenceGroup::Ptr {
+        const auto found = std::find_if(requests.begin(), requests.end(), [request_id](const auto& group) {
+            return group->get_request_id() == request_id;
+        });
+        return found == requests.end() ? nullptr : *found;
+    };
+    const auto main_group = find_request(m_main_pipeline->get_awaiting_requests());
+    OPENVINO_ASSERT(main_group, "DFlash prefix alignment requires the awaiting target request: ", request_id);
+    // The target recomputes at least the last prompt token, which yields the first generated token.
+    size_t ceiling = main_group->get_prompt_len() - 1;
+    if (!find_request(m_draft_pipeline->get_awaiting_requests())) {
+        m_main_pipeline->restore_awaiting_prefix(request_id, ceiling);
+        return;
+    }
+    // The draft needs target hidden states from its restored length on, so both restore the same prefix.
+    while (true) {
+        const size_t main_processed = m_main_pipeline->restore_awaiting_prefix(request_id, ceiling);
+        const size_t draft_processed = m_draft_pipeline->restore_awaiting_prefix(request_id, main_processed);
+        if (main_processed == draft_processed) {
+            return;
+        }
+        OPENVINO_ASSERT(draft_processed < ceiling, "DFlash prefix alignment must select an earlier prefix.");
+        ceiling = draft_processed;
+    }
+}
+
 void ContinuousBatchingPipeline::DFlashDecodingImpl::validate_awaiting_requests(
     const std::vector<SequenceGroup::Ptr>& main_awaiting_requests,
     const std::vector<SequenceGroup::Ptr>& draft_awaiting_requests) const {
@@ -202,27 +231,35 @@ GenerationHandle ContinuousBatchingPipeline::DFlashDecodingImpl::add_request(
     std::optional<std::unordered_map<std::string, ov::Tensor>> lm_extra_inputs) {
     std::lock_guard<std::mutex> lock(m_draft_generations_mutex);
     validate_request_config(sampling_params);
+    OPENVINO_ASSERT(m_model_input_type != ModelInputType::EMBEDDINGS || !m_main_pipeline->is_prefix_caching_enabled() ||
+                        (prompt_ids.has_value() && prompt_ids->get_element_type() == ov::element::i64 &&
+                         prompt_ids->get_size() == input_ids.get_shape()[1]),
+                    "DFlash prefix caching requires built-in prompt preparation with one token ID per embedding");
     auto main_sampling_params = sampling_params;
     if (!main_sampling_params.num_assistant_tokens.has_value()) {
         main_sampling_params.num_assistant_tokens = m_main_pipeline->default_num_assistant_tokens;
     }
     const size_t num_assistant_tokens = main_sampling_params.num_assistant_tokens.value();
-    if (num_assistant_tokens == 0) {
-        // No draft for this request: the target decodes it alone.
-        return m_main_pipeline->add_request(request_id, input_ids, main_sampling_params, prompt_ids, lm_extra_inputs);
+    if (num_assistant_tokens > 0) {
+        OPENVINO_ASSERT(dflash_cb::draft_block_length(num_assistant_tokens, m_rt_info.candidate_position_offset) <=
+                            dflash_cb::MAX_DRAFT_BLOCK_ROWS,
+                        "DFlash num_assistant_tokens must be at most ",
+                        dflash_cb::MAX_DRAFT_BLOCK_ROWS - m_rt_info.candidate_position_offset, ".");
     }
-    OPENVINO_ASSERT(dflash_cb::draft_block_length(num_assistant_tokens, m_rt_info.candidate_position_offset) <=
-                        dflash_cb::MAX_DRAFT_BLOCK_ROWS,
-                    "DFlash num_assistant_tokens must be at most ",
-                    dflash_cb::MAX_DRAFT_BLOCK_ROWS - m_rt_info.candidate_position_offset, ".");
 
-    // The draft prompt is the target prompt: draft position t pairs with target hidden state t.
-    // insert_or_assign drops a stale handle a finished request may leave under the same request_id.
+    // The draft prompt is the target prompt: draft position t pairs with target hidden state t. With
+    // num_assistant_tokens == 0 the target decodes the request alone. insert_or_assign drops a stale handle
+    // a finished request may leave under the same request_id.
     try {
-        m_draft_generations.insert_or_assign(
-            request_id,
-            m_draft_pipeline->add_request(request_id, input_ids, make_draft_generation_config(main_sampling_params), prompt_ids));
-        return m_main_pipeline->add_request(request_id, input_ids, main_sampling_params, prompt_ids, lm_extra_inputs);
+        if (num_assistant_tokens > 0) {
+            m_draft_generations.insert_or_assign(
+                request_id,
+                m_draft_pipeline->add_request(request_id, input_ids, make_draft_generation_config(main_sampling_params), prompt_ids));
+        }
+        auto main_handle =
+            m_main_pipeline->add_request(request_id, input_ids, main_sampling_params, prompt_ids, lm_extra_inputs);
+        align_request_pair_processed_prefix(request_id);
+        return main_handle;
     } catch (...) {
         m_main_pipeline->discard_awaiting_request(request_id);
         m_draft_pipeline->discard_awaiting_request(request_id);
