@@ -62,7 +62,7 @@ constexpr const char* DFLASH_MARKOV_HEAD_TOP_K = "dflash_markov_head_top_k";
 constexpr const char* MARKOV_HEAD_MODEL_FILE_NAME = "openvino_markov_head_model.xml";
 constexpr const char* VANILLA_MARKOV_HEAD = "vanilla";
 // The DFlash-2 selector: its transitions are gated by the draft hidden states, so it has no dense step.
-constexpr const char* GATED_MARKOV_HEAD = "dflash2";
+constexpr const char* DFLASH2_MARKOV_HEAD = "dflash2";
 constexpr const char* MARKOV_HEAD_INTERFACE = "markov_head_v1";
 // Below this K, the candidate scorer often misses the token the Markov head would pick, and acceptance drops.
 constexpr size_t MIN_RECOMMENDED_MARKOV_HEAD_TOP_K = 8;
@@ -522,16 +522,16 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config) {
                     MARKOV_HEAD_TOP_K,
                     " applies only to drafts with a Markov head that are loaded with draft_model(<draft folder>).");
     if (info.dflash_version == 2) {
-        OPENVINO_ASSERT(info.markov_rank > 0 && info.markov_head_type == GATED_MARKOV_HEAD,
+        OPENVINO_ASSERT(info.markov_rank > 0 && info.markov_head_type == DFLASH2_MARKOV_HEAD,
                         "A DFlash v2 draft must have a '",
-                        GATED_MARKOV_HEAD,
+                        DFLASH2_MARKOV_HEAD,
                         "' Markov head. Re-export the draft with an optimum-intel version that exports ",
                         MARKOV_HEAD_MODEL_FILE_NAME,
                         ".");
     }
     if (info.markov_rank > 0) {
         OPENVINO_ASSERT(info.markov_head_type == VANILLA_MARKOV_HEAD ||
-                            (info.markov_head_type == GATED_MARKOV_HEAD && info.dflash_version == 2),
+                            (info.markov_head_type == DFLASH2_MARKOV_HEAD && info.dflash_version == 2),
                         "Unsupported markov_head_type '",
                         info.markov_head_type,
                         "' for a DFlash v",
@@ -673,7 +673,7 @@ void validate_candidate_scorer(const std::shared_ptr<ov::Model>& candidate_score
                    top_k,
                    MIN_RECOMMENDED_MARKOV_HEAD_TOP_K);
     }
-    const bool gated = info.markov_head_type == GATED_MARKOV_HEAD;
+    const bool gated = info.markov_head_type == DFLASH2_MARKOV_HEAD;
     OPENVINO_ASSERT(candidate_scorer->inputs().size() == (gated ? 4 : 3) && candidate_scorer->outputs().size() == 2,
                     "The candidate scorer must map 'draft_logits', ",
                     gated ? "'draft_hidden_states', " : "",
