@@ -56,9 +56,8 @@ constexpr const char* DFLASH_MARKOV_RANK = "dflash_markov_rank";
 constexpr const char* DFLASH_MARKOV_HEAD_TYPE = "dflash_markov_head_type";
 // The draft property that selects the Markov head computation; read_markov_head() consumes it.
 constexpr const char* MARKOV_HEAD_TOP_K = "markov_head_top_k";
-// Internal properties that carry the selected computation from draft_model() to the pipeline.
+// The internal property that carries the selected computation from draft_model() to the pipeline.
 constexpr const char* DFLASH_MARKOV_HEAD_COMPUTATION = "dflash_markov_head_computation";
-constexpr const char* DFLASH_MARKOV_HEAD_TOP_K = "dflash_markov_head_top_k";
 constexpr const char* MARKOV_HEAD_MODEL_FILE_NAME = "openvino_markov_head_model.xml";
 constexpr const char* VANILLA_MARKOV_HEAD = "vanilla";
 // The DFlash-2 selector: its transitions are gated by the draft hidden states, so it has no dense step.
@@ -514,10 +513,6 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config) {
         info.markov_head_computation = computation_it->second.as<std::shared_ptr<ov::Model>>();
         config.erase(computation_it);
     }
-    if (auto top_k_it = config.find(DFLASH_MARKOV_HEAD_TOP_K); top_k_it != config.end()) {
-        info.markov_head_top_k = top_k_it->second.as<int64_t>();
-        config.erase(top_k_it);
-    }
     OPENVINO_ASSERT(config.count(MARKOV_HEAD_TOP_K) == 0,
                     MARKOV_HEAD_TOP_K,
                     " applies only to drafts with a Markov head that are loaded with draft_model(<draft folder>).");
@@ -542,7 +537,7 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config) {
                         "draft_model(<draft folder>) so that ",
                         MARKOV_HEAD_MODEL_FILE_NAME,
                         " is read next to the draft backbone.");
-        if (info.markov_head_top_k == TOP_K_FOR_MARKOV_STEP) {
+        if (is_markov_step(info.markov_head_computation)) {
             validate_markov_step(info.markov_head_computation, info);
         } else {
             validate_candidate_scorer(info.markov_head_computation, info);
@@ -643,7 +638,10 @@ void select_markov_head_computation(const std::shared_ptr<ov::Model>& markov_hea
         computation->set_rt_info(std::to_string(selected_top_k), {"dflash", "top_k"});
     }
     properties[DFLASH_MARKOV_HEAD_COMPUTATION] = computation;
-    properties[DFLASH_MARKOV_HEAD_TOP_K] = selected_top_k;
+}
+
+bool is_markov_step(const std::shared_ptr<ov::Model>& markov_head_computation) {
+    return has_port_named(markov_head_computation->inputs(), "prev_token_ids");
 }
 
 void validate_markov_step(const std::shared_ptr<ov::Model>& markov_step, const DFlashRTInfo& info) {

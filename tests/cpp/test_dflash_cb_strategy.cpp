@@ -259,13 +259,17 @@ std::shared_ptr<ov::Model> selected_computation(const ov::AnyMap& properties) {
     return properties.at("dflash_markov_head_computation").as<std::shared_ptr<ov::Model>>();
 }
 
+// The K of the selected candidate scorer, or TOP_K_FOR_MARKOV_STEP for the dense step.
 int64_t selected_top_k(const ov::AnyMap& properties) {
-    return properties.at("dflash_markov_head_top_k").as<int64_t>();
+    const auto computation = selected_computation(properties);
+    if (ov::genai::utils::dflash::is_markov_step(computation)) {
+        return ov::genai::utils::dflash::TOP_K_FOR_MARKOV_STEP;
+    }
+    return std::stoll(computation->get_rt_info<std::string>(std::vector<std::string>{"dflash", "top_k"}));
 }
 
-void set_markov_head_computation(ov::AnyMap& properties, const std::shared_ptr<ov::Model>& computation, int64_t top_k) {
+void set_markov_head_computation(ov::AnyMap& properties, const std::shared_ptr<ov::Model>& computation) {
     properties["dflash_markov_head_computation"] = computation;
-    properties["dflash_markov_head_top_k"] = top_k;
 }
 
 std::shared_ptr<ov::Model> make_dspark_markov_step() {
@@ -451,7 +455,7 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     ASSERT_FLOAT_EQ(properties.at("dflash_gpu_min_activations_scale_factor").as<float>(), 32.0f);
     ASSERT_EQ(properties.at("dflash_markov_head_type").as<std::string>(), "dflash2");
 
-    set_markov_head_computation(properties, candidate_scorer, DSPARK_TEST_TOP_K);
+    set_markov_head_computation(properties, candidate_scorer);
     auto rt_info = ov::genai::utils::dflash::extract_dflash_info_from_config(properties);
     ASSERT_TRUE(rt_info.dflash_mode);
     ASSERT_EQ(rt_info.dflash_version, 2);
@@ -472,7 +476,7 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     ov::genai::utils::dflash::apply_dflash_rt_info(model, properties);
     ASSERT_EQ(properties.at("dflash_candidate_position_offset").as<size_t>(), 0);
 
-    set_markov_head_computation(properties, candidate_scorer, DSPARK_TEST_TOP_K);
+    set_markov_head_computation(properties, candidate_scorer);
     auto deepspec_rt_info = ov::genai::utils::dflash::extract_dflash_info_from_config(properties);
     ASSERT_EQ(deepspec_rt_info.candidate_position_offset, 0);
     ASSERT_TRUE(properties.empty());
@@ -896,13 +900,13 @@ TEST(DSparkModelTransforms, AppliesAndExtractsMarkovHeadRtInfo) {
     ASSERT_EQ(properties.at("dflash_markov_head_type").as<std::string>(), "vanilla");
 
     auto markov_step = make_dspark_markov_step();
-    set_markov_head_computation(properties, markov_step, ov::genai::utils::dflash::TOP_K_FOR_MARKOV_STEP);
+    set_markov_head_computation(properties, markov_step);
     auto rt_info = ov::genai::utils::dflash::extract_dflash_info_from_config(properties);
     ASSERT_EQ(rt_info.candidate_position_offset, 0);
     ASSERT_EQ(rt_info.markov_rank, 4);
     ASSERT_EQ(rt_info.markov_head_type, "vanilla");
     ASSERT_EQ(rt_info.markov_head_computation, markov_step);
-    ASSERT_EQ(rt_info.markov_head_top_k, ov::genai::utils::dflash::TOP_K_FOR_MARKOV_STEP);
+    ASSERT_TRUE(ov::genai::utils::dflash::is_markov_step(rt_info.markov_head_computation));
     ASSERT_TRUE(properties.empty());
 }
 
@@ -941,40 +945,27 @@ TEST(DSparkModelTransforms, RejectsMarkovHeadWithoutSelectedComputation) {
 TEST(DSparkModelTransforms, ExtractsSelectedCandidateScorer) {
     auto candidate_scorer = make_dspark_candidate_scorer();
     auto properties = make_dspark_draft_properties(4, "vanilla");
-    set_markov_head_computation(properties, candidate_scorer, DSPARK_TEST_TOP_K);
+    set_markov_head_computation(properties, candidate_scorer);
     auto rt_info = ov::genai::utils::dflash::extract_dflash_info_from_config(properties);
     ASSERT_EQ(rt_info.markov_head_computation, candidate_scorer);
-    ASSERT_EQ(rt_info.markov_head_top_k, DSPARK_TEST_TOP_K);
+    ASSERT_FALSE(ov::genai::utils::dflash::is_markov_step(rt_info.markov_head_computation));
     ASSERT_TRUE(properties.empty());
-
-    // The selected top_k decides how the computation is validated and run.
-    auto scorer_as_dense_step = make_dspark_draft_properties(4, "vanilla");
-    set_markov_head_computation(scorer_as_dense_step,
-                                candidate_scorer,
-                                ov::genai::utils::dflash::TOP_K_FOR_MARKOV_STEP);
-    EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(scorer_as_dense_step), ov::Exception);
-
-    auto dense_step_as_scorer = make_dspark_draft_properties(4, "vanilla");
-    set_markov_head_computation(dense_step_as_scorer, make_dspark_markov_step(), DSPARK_TEST_TOP_K);
-    EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(dense_step_as_scorer), ov::Exception);
 
     auto gated_candidate_scorer = make_dspark_candidate_scorer();
     gated_candidate_scorer->set_rt_info(std::string("gated"), {"dflash", "markov_head_type"});
     auto mismatched_head = make_dspark_draft_properties(4, "vanilla");
-    set_markov_head_computation(mismatched_head, gated_candidate_scorer, DSPARK_TEST_TOP_K);
+    set_markov_head_computation(mismatched_head, gated_candidate_scorer);
     EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(mismatched_head), ov::Exception);
 
     auto mismatched_rank = make_dspark_draft_properties(8, "vanilla");
-    set_markov_head_computation(mismatched_rank, make_dspark_candidate_scorer(), DSPARK_TEST_TOP_K);
+    set_markov_head_computation(mismatched_rank, make_dspark_candidate_scorer());
     EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(mismatched_rank), ov::Exception);
 }
 
 TEST(DSparkModelTransforms, RejectsUnsupportedMarkovHeadType) {
     for (const std::string head_type : {"gated", "rnn"}) {
         auto properties = make_dspark_draft_properties(4, head_type);
-        set_markov_head_computation(properties,
-                                    make_dspark_markov_step(),
-                                    ov::genai::utils::dflash::TOP_K_FOR_MARKOV_STEP);
+        set_markov_head_computation(properties, make_dspark_markov_step());
         EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(properties), ov::Exception);
     }
 }
@@ -1240,7 +1231,7 @@ TEST(DFlash2ModelTransforms, RejectsTheDenseMarkovWalkOfTheGatedMarkovHead) {
 TEST(DFlash2ModelTransforms, RequiresTheGatedMarkovHeadOnlyForV2Drafts) {
     const auto candidate_scorer = make_dflash2_candidate_scorer();
     auto properties = make_dflash2_draft_properties(DSPARK_TEST_MARKOV_RANK, "dflash2");
-    set_markov_head_computation(properties, candidate_scorer, DSPARK_TEST_TOP_K);
+    set_markov_head_computation(properties, candidate_scorer);
     const auto rt_info = ov::genai::utils::dflash::extract_dflash_info_from_config(properties);
     ASSERT_EQ(rt_info.dflash_version, 2);
     ASSERT_EQ(rt_info.markov_head_type, "dflash2");
@@ -1251,11 +1242,11 @@ TEST(DFlash2ModelTransforms, RequiresTheGatedMarkovHeadOnlyForV2Drafts) {
     EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(without_markov_head), ov::Exception);
 
     auto vanilla_markov_head = make_dflash2_draft_properties(DSPARK_TEST_MARKOV_RANK, "vanilla");
-    set_markov_head_computation(vanilla_markov_head, make_dspark_candidate_scorer(), DSPARK_TEST_TOP_K);
+    set_markov_head_computation(vanilla_markov_head, make_dspark_candidate_scorer());
     EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(vanilla_markov_head), ov::Exception);
 
     auto gated_v1 = make_dspark_draft_properties(DSPARK_TEST_MARKOV_RANK, "dflash2");
-    set_markov_head_computation(gated_v1, candidate_scorer, DSPARK_TEST_TOP_K);
+    set_markov_head_computation(gated_v1, candidate_scorer);
     EXPECT_THROW(ov::genai::utils::dflash::extract_dflash_info_from_config(gated_v1), ov::Exception);
 }
 

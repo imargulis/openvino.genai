@@ -37,14 +37,10 @@ struct DFlashRTInfo {
     float final_logit_softcapping = 0.0f;
     // A backbone with a Markov head: DSpark (vanilla head) or DFlash-2 (gated head). The head is exported as a separate
     // model, and the draft runs the computation of it selected by markov_head_top_k: the dense step or the Top-K
-    // candidate scorer.
+    // candidate scorer; see is_markov_step().
     size_t markov_rank = 0;
     std::string markov_head_type;
     std::shared_ptr<ov::Model> markov_head_computation;
-    // TOP_K_FOR_MARKOV_STEP for the dense step, otherwise the K of the candidate scorer. Without markov_head_top_k,
-    // draft_model() selects the candidate scorer with the exported K; this initial value applies only to drafts
-    // without a Markov head.
-    int64_t markov_head_top_k = TOP_K_FOR_MARKOV_STEP;
 };
 
 /**
@@ -87,8 +83,8 @@ void apply_dflash_gpu_compile_properties(const DFlashRTInfo& info,
 void read_markov_head(const std::filesystem::path& models_path, ov::AnyMap& properties);
 
 /**
- * @brief Keeps one computation of the Markov head model and stores it in properties, together with the
- * selected markov_head_top_k, for extract_dflash_info_from_config().
+ * @brief Keeps one computation of the Markov head model and stores it in properties for
+ * extract_dflash_info_from_config().
  *
  * The Markov head model holds up to two computations over the same weights:
  * - the dense step, prev_token_ids [N] -> markov_bias [N, vocab], walked once per drafted position. Only vanilla
@@ -108,6 +104,12 @@ void read_markov_head(const std::filesystem::path& models_path, ov::AnyMap& prop
 void select_markov_head_computation(const std::shared_ptr<ov::Model>& markov_head_model,
                                     std::optional<int64_t> top_k,
                                     ov::AnyMap& properties);
+
+/**
+ * @brief True when a computation kept by select_markov_head_computation() is the dense step rather than the
+ * candidate scorer. The scorer's K is its dflash/top_k RT info.
+ */
+bool is_markov_step(const std::shared_ptr<ov::Model>& markov_head_computation);
 
 /**
  * @brief Validates the dense step computation of the Markov head against the draft backbone:
