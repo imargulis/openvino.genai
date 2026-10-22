@@ -62,7 +62,6 @@ constexpr const char* MARKOV_HEAD_MODEL_FILE_NAME = "openvino_markov_head_model.
 constexpr const char* VANILLA_MARKOV_HEAD = "vanilla";
 // The DFlash-2 selector: its transitions are gated by the draft hidden states, so it has no dense step.
 constexpr const char* DFLASH2_MARKOV_HEAD = "dflash2";
-constexpr const char* MARKOV_HEAD_INTERFACE = "markov_head_v1";
 // Below this K, the candidate scorer often misses the token the Markov head would pick, and acceptance drops.
 constexpr size_t MIN_RECOMMENDED_MARKOV_HEAD_TOP_K = 8;
 
@@ -203,25 +202,11 @@ std::string read_markov_head_rt_info(const std::shared_ptr<ov::Model>& model, co
     return *value;
 }
 
-void validate_markov_head_interface(const std::shared_ptr<ov::Model>& model, const char* model_name) {
-    OPENVINO_ASSERT(model, "The ", model_name, " cannot be null.");
-    const auto model_interface = read_markov_head_rt_info(model, model_name, "interface");
-    OPENVINO_ASSERT(model_interface == MARKOV_HEAD_INTERFACE,
-                    "Unsupported ",
-                    model_name,
-                    " interface: ",
-                    model_interface,
-                    ". Re-export the draft with an optimum-intel version that exports ",
-                    MARKOV_HEAD_MODEL_FILE_NAME,
-                    ".");
-}
-
 // Checks the RT info that the dense step and the candidate scorer share with the draft backbone and returns their
 // vocabulary size.
 size_t validate_markov_head_rt_info(const std::shared_ptr<ov::Model>& model,
                                     const char* model_name,
                                     const DFlashRTInfo& info) {
-    validate_markov_head_interface(model, model_name);
     OPENVINO_ASSERT(read_markov_head_rt_info(model, model_name, "markov_head_type") == info.markov_head_type &&
                         std::stoull(read_markov_head_rt_info(model, model_name, "markov_rank")) == info.markov_rank,
                     "The ",
@@ -284,7 +269,7 @@ std::shared_ptr<ov::Model> keep_markov_head_computation(const std::shared_ptr<ov
         results.push_back(ov::as_type_ptr<ov::op::v0::Result>(result));
     }
     auto computation = std::make_shared<ov::Model>(results, parameters, markov_head_model->get_friendly_name());
-    for (const char* key : {"interface", "vocab_size", "markov_rank", "markov_head_type"}) {
+    for (const char* key : {"vocab_size", "markov_rank", "markov_head_type"}) {
         if (auto value = get_rt_info_value<std::string>(markov_head_model, {"dflash", key})) {
             computation->set_rt_info(*value, {"dflash", key});
         }
@@ -596,7 +581,6 @@ void select_markov_head_computation(const std::shared_ptr<ov::Model>& markov_hea
                                     std::optional<int64_t> top_k,
                                     ov::AnyMap& properties) {
     constexpr const char* model_name = "Markov head model";
-    validate_markov_head_interface(markov_head_model, model_name);
     const auto vocab_size = std::stoll(read_markov_head_rt_info(markov_head_model, model_name, "vocab_size"));
     const auto exported_top_k = std::stoll(read_markov_head_rt_info(markov_head_model, model_name, "top_k"));
     const auto selected_top_k = top_k.value_or(exported_top_k);

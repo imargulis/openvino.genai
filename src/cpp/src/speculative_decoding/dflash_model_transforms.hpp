@@ -95,6 +95,7 @@ void read_markov_head(const std::filesystem::path& models_path, ov::AnyMap& prop
  *   to back; block n spans rows subsequence_begins[n] to subsequence_begins[n + 1], and its anchor token precedes
  *   its first row. The graph does not check subsequence_begins; callers validate it with
  *   dflash_cb::validate_subsequence_begins().
+ * These port names are the contract with the exporter, so a port whose meaning changes needs a new name.
  *
  * top_k TOP_K_FOR_MARKOV_STEP (0) keeps the dense step. Any other top_k keeps the candidate scorer with that K,
  * replacing the exported K when it differs. Without top_k, the candidate scorer keeps the exported K.

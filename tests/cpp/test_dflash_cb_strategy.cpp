@@ -133,7 +133,6 @@ constexpr int64_t DSPARK_TEST_TOP_K = 2;
 
 void set_dspark_markov_head_rt_info(const std::shared_ptr<ov::Model>& model, const std::string& omitted_key = "") {
     const std::vector<std::pair<std::string, std::string>> rt_info = {
-        {"interface", "markov_head_v1"},
         {"top_k", std::to_string(DSPARK_TEST_TOP_K)},
         {"vocab_size", std::to_string(DSPARK_TEST_VOCAB_SIZE)},
         {"markov_rank", std::to_string(DSPARK_TEST_MARKOV_RANK)},
@@ -980,10 +979,6 @@ TEST(DSparkModelTransforms, RejectsMarkovStepThatDoesNotMatchTheBackbone) {
     EXPECT_THROW(ov::genai::utils::dflash::validate_markov_step(make_dspark_markov_step(), mismatched_rank),
                  ov::Exception);
 
-    auto wrong_interface = make_dspark_markov_step();
-    wrong_interface->set_rt_info(std::string("markov_step_v1"), {"dflash", "interface"});
-    EXPECT_THROW(ov::genai::utils::dflash::validate_markov_step(wrong_interface, info), ov::Exception);
-
     auto wrong_vocab = make_dspark_markov_step();
     wrong_vocab->set_rt_info(std::string("32"), {"dflash", "vocab_size"});
     EXPECT_THROW(ov::genai::utils::dflash::validate_markov_step(wrong_vocab, info), ov::Exception);
@@ -1113,7 +1108,7 @@ TEST(DSparkModelTransforms, SelectsDenseStepOrCandidateScorerAndReplacesTopK) {
 }
 
 TEST(DSparkModelTransforms, RejectsMarkovHeadModelWithoutSelectionRtInfo) {
-    for (const std::string key : {"interface", "top_k", "vocab_size"}) {
+    for (const std::string key : {"top_k", "vocab_size"}) {
         SCOPED_TRACE(key);
         const auto incomplete = make_dspark_markov_head_model(key);
         EXPECT_THROW(select_markov_computation(std::nullopt, incomplete), ov::Exception);
@@ -1130,10 +1125,6 @@ TEST(DSparkModelTransforms, RejectsCandidateScorerThatDoesNotMatchTheBackbone) {
     EXPECT_THROW(ov::genai::utils::dflash::validate_candidate_scorer(make_dspark_candidate_scorer(), mismatched_rank),
                  ov::Exception);
 
-    auto wrong_interface = make_dspark_candidate_scorer();
-    wrong_interface->set_rt_info(std::string("topk_lattice_v1"), {"dflash", "interface"});
-    EXPECT_THROW(ov::genai::utils::dflash::validate_candidate_scorer(wrong_interface, info), ov::Exception);
-
     auto wrong_top_k = make_dspark_candidate_scorer();
     wrong_top_k->set_rt_info(std::string("3"), {"dflash", "top_k"});
     EXPECT_THROW(ov::genai::utils::dflash::validate_candidate_scorer(wrong_top_k, info), ov::Exception);
@@ -1148,7 +1139,7 @@ TEST(DSparkModelTransforms, RejectsCandidateScorerThatDoesNotMatchTheBackbone) {
 
 TEST(DSparkModelTransforms, RejectsCandidateScorerWithIncompleteRtInfo) {
     const auto info = make_dspark_backbone_info();
-    for (const std::string key : {"interface", "top_k", "vocab_size", "markov_rank", "markov_head_type"}) {
+    for (const std::string key : {"top_k", "vocab_size", "markov_rank", "markov_head_type"}) {
         SCOPED_TRACE(key);
         const auto incomplete = make_dspark_candidate_scorer(false, key);
         EXPECT_THROW(ov::genai::utils::dflash::validate_candidate_scorer(incomplete, info), ov::Exception);
