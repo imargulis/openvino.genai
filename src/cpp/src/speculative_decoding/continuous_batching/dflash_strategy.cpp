@@ -141,7 +141,7 @@ public:
                 utils::singleton_core()
                     .compile_model(rt_info.markov_head_computation, model_desc.device, model_desc.properties)
                     .create_infer_request();
-            if (rt_info.markov_head_top_k == utils::dflash::TOP_K_FOR_MARKOV_STEP) {
+            if (utils::dflash::is_markov_step(rt_info.markov_head_computation)) {
                 m_markov_step_request = std::move(markov_head_request);
             } else {
                 m_candidate_scorer_request = std::move(markov_head_request);
