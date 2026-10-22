@@ -65,7 +65,7 @@ public:
         m_chunks.reserve(INITIAL_CHUNK_CAPACITY);
     }
 
-    void append(const ov::Tensor& hidden_delta, bool copy_data = false) {
+    void append(const ov::Tensor& hidden_delta) {
         if (!hidden_delta || hidden_delta.get_size() == 0) {
             return;
         }
@@ -77,19 +77,18 @@ public:
             return;
         }
 
-        m_chunks.push_back(copy_data ? owned_copy(hidden_delta) : hidden_delta);
-        m_owned.push_back(copy_data);
+        m_chunks.push_back(hidden_delta);
         m_token_count += token_count;
     }
 
-    // Chunks appended without copy view a target output, which the next target inference overwrites.
+    // Appended chunks view a target output, which the next target inference overwrites.
     void own_data() {
-        for (size_t idx = 0; idx < m_chunks.size(); ++idx) {
-            if (!m_owned[idx]) {
-                m_chunks[idx] = owned_copy(m_chunks[idx]);
-                m_owned[idx] = true;
-            }
+        for (size_t idx = m_num_owned; idx < m_chunks.size(); ++idx) {
+            ov::Tensor owned(m_chunks[idx].get_element_type(), m_chunks[idx].get_shape());
+            copy_tensor_bytes(m_chunks[idx], owned);
+            m_chunks[idx] = owned;
         }
+        m_num_owned = m_chunks.size();
     }
 
     bool empty() const {
@@ -134,19 +133,14 @@ public:
 
     void clear() {
         m_chunks.clear();
-        m_owned.clear();
+        m_num_owned = 0;
         m_token_count = 0;
     }
 
 private:
-    static ov::Tensor owned_copy(const ov::Tensor& chunk) {
-        ov::Tensor owned(chunk.get_element_type(), chunk.get_shape());
-        copy_tensor_bytes(chunk, owned);
-        return owned;
-    }
-
     std::vector<ov::Tensor> m_chunks;
-    std::vector<bool> m_owned;
+    // own_data() copies every chunk appended before it, so the owned chunks come first.
+    size_t m_num_owned = 0;
     size_t m_token_count = 0;
 };
 
@@ -248,10 +242,11 @@ inline void validate_subsequence_begins(const ov::Tensor& subsequence_begins, si
     }
 }
 
-// The candidate scorer computes a Top-K lattice for one draft block of S positions:
-//   candidate_ids [S, K]: the backbone's K best tokens at every position;
-//   edge_scores [S, K, K]: edge_scores[s, i, j] scores candidate j at position s after candidate i at position s - 1.
-// All rows at position 0 follow the anchor token and are identical.
+// The candidate scorer returns a Top-K lattice over the packed rows of all draft blocks:
+//   candidate_ids [rows, K]: the backbone's K best tokens at every row;
+//   edge_scores [rows, K, K]: edge_scores[s, i, j] scores candidate j at row s after candidate i at row s - 1.
+// The first row of a block follows the block's anchor instead, so edge_scores[s, i, :] is the same for every i there.
+// The walks below take the lattice of one block, whose rows are its positions.
 inline void validate_candidate_lattice(const ov::Tensor& edge_scores,
                                        const ov::Tensor& candidate_ids,
                                        size_t num_positions,
@@ -361,21 +356,22 @@ inline std::optional<size_t> find_candidate(const ov::Tensor& candidate_ids, siz
 // Walks a validated lattice through a sampler. At every position, sample_token(row) picks a token from the lattice row
 // of the candidate drafted at the previous position, spread over the vocabulary in the [1, 1, vocab] row tensor by
 // fill_candidate_row(). It returns the token, or nullopt to end the block. A token outside the position's candidates
-// ends the block as well, since the lattice has no row for it. Greedy drafts take this walk so that the request's logit
-// processors apply; sampled drafts draw from the K candidates of a row and propose that distribution to the target.
+// ends the block as well, since the lattice has no row for it. Greedy drafts take this walk when their logit processors
+// can change the argmax, so that the processors apply; sampled drafts instead draw from the K candidates of a row and
+// propose that distribution to the target.
 template <typename SampleToken>
 void walk_candidate_lattice(const ov::Tensor& backbone_logits,
                             const ov::Tensor& edge_scores,
                             const ov::Tensor& candidate_ids,
-                            size_t num_positions,
                             ov::Tensor& row,
                             SampleToken&& sample_token) {
     OPENVINO_ASSERT(backbone_logits && backbone_logits.get_element_type() == ov::element::f32 &&
                         backbone_logits.is_continuous(),
                     "DFlash draft logits must be a contiguous FP32 tensor.");
+    const size_t num_positions = candidate_ids.get_shape()[0];
     const auto logits_shape = backbone_logits.get_shape();
-    OPENVINO_ASSERT(logits_shape.size() == 3 && logits_shape[0] == 1 && num_positions <= logits_shape[1],
-                    "Candidate scorer positions exceed the DFlash draft logits [1, S, vocab].");
+    OPENVINO_ASSERT(logits_shape.size() == 3 && logits_shape[0] == 1 && logits_shape[1] == num_positions,
+                    "The DFlash draft logits must have shape [1, S, vocab] for a lattice of S positions.");
     const size_t vocab_size = logits_shape[2];
     OPENVINO_ASSERT(
         row && row.get_element_type() == ov::element::f32 && row.get_shape() == ov::Shape({1, 1, vocab_size}),

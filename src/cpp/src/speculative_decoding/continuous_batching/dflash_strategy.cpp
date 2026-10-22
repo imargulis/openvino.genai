@@ -580,7 +580,6 @@ private:
         dflash_cb::walk_candidate_lattice(apply_backbone_logit_transform(backbone_logits),
                                           edge_scores,
                                           candidate_ids,
-                                          candidate_ids.get_shape()[0],
                                           m_candidate_row,
                                           [&](const ov::Tensor& row) -> std::optional<int64_t> {
                                               const size_t num_drafted = candidates.token_ids.size();
@@ -927,25 +926,6 @@ GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_draft_gene
     return draft_config;
 }
 
-void ContinuousBatchingPipeline::DFlashDecodingImpl::append_pending_hidden_delta(RequestState& state,
-                                                                                const ov::Tensor& hidden_delta,
-                                                                                bool copy_data) {
-    state.pending_hidden_deltas.append(hidden_delta, copy_data);
-}
-
-bool ContinuousBatchingPipeline::DFlashDecodingImpl::has_pending_hidden_delta(const RequestState& state) {
-    return !state.pending_hidden_deltas.empty();
-}
-
-ov::Tensor ContinuousBatchingPipeline::DFlashDecodingImpl::materialize_pending_hidden_delta(
-    const RequestState& state) {
-    return state.pending_hidden_deltas.materialize();
-}
-
-void ContinuousBatchingPipeline::DFlashDecodingImpl::clear_pending_hidden_delta(RequestState& state) {
-    state.pending_hidden_deltas.clear();
-}
-
 void ContinuousBatchingPipeline::DFlashDecodingImpl::validate_hidden_prefix_length(uint64_t request_id,
                                                                                   const RequestState& state) const {
     OPENVINO_ASSERT(!state.generated_tokens.empty(),
@@ -980,13 +960,11 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::append_new_hidden_rows(uint
                     " from position ", num_received, ".");
     const size_t num_new_rows = num_processed_tokens - num_received;
     if (num_new_rows == num_rows) {
-        append_pending_hidden_delta(state, hidden_state, false);
+        state.pending_hidden_deltas.append(hidden_state);
         return;
     }
-    append_pending_hidden_delta(
-        state,
-        ov::Tensor(hidden_state, ov::Coordinate{num_rows - num_new_rows, 0, 0}, ov::Coordinate{num_rows, 1, shape[2]}),
-        false);
+    state.pending_hidden_deltas.append(
+        ov::Tensor(hidden_state, ov::Coordinate{num_rows - num_new_rows, 0, 0}, ov::Coordinate{num_rows, 1, shape[2]}));
 }
 
 bool ContinuousBatchingPipeline::DFlashDecodingImpl::has_active_request_state() const {
@@ -1109,23 +1087,23 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::plan_draft_inputs() {
             auto& state = state_it->second;
             const auto& config = state.generation_config;
             const size_t generated_len = state.generated_tokens.size();
-            if (!state.finished && has_pending_hidden_delta(state) && generated_len > 0) {
+            if (!state.finished && !state.pending_hidden_deltas.empty() && generated_len > 0) {
                 const size_t draft_count = dflash_cb::draft_candidate_count(config.num_assistant_tokens.value(),
                                                                             generated_len,
                                                                             config.max_new_tokens);
                 const size_t validation_count =
                     dflash_cb::validation_candidate_count(draft_count, generated_len, config.max_new_tokens);
                 if (validation_count == 0) {
-                    clear_pending_hidden_delta(state);
+                    state.pending_hidden_deltas.clear();
                 } else {
                     validate_hidden_prefix_length(request_id, state);
                     DraftInput input;
                     input.request_id = request_id;
                     input.seed_token = state.generated_tokens.back();
-                    input.hidden_delta = materialize_pending_hidden_delta(state);
+                    input.hidden_delta = state.pending_hidden_deltas.materialize();
                     input.candidate_count = draft_count;
                     input.validation_count = std::min(validation_count, token_budget - 1);
-                    clear_pending_hidden_delta(state);
+                    state.pending_hidden_deltas.clear();
                     state.processed_before_validation = progress.num_processed_tokens;
                     num_scheduled_tokens = input.validation_count + 1;
                     inputs.push_back(std::move(input));

@@ -75,10 +75,6 @@ private:
     };
 
     GenerationConfig make_draft_generation_config(const GenerationConfig& config) const;
-    static void append_pending_hidden_delta(RequestState& state, const ov::Tensor& hidden_delta, bool copy_data);
-    static bool has_pending_hidden_delta(const RequestState& state);
-    static ov::Tensor materialize_pending_hidden_delta(const RequestState& state);
-    static void clear_pending_hidden_delta(RequestState& state);
     void validate_hidden_prefix_length(uint64_t request_id, const RequestState& state) const;
     void append_new_hidden_rows(uint64_t request_id,
                                 RequestState& state,

@@ -418,14 +418,15 @@ TEST(DFlashCBHiddenDeltaBuffer, MergesChunksInOrder) {
 
 TEST(DFlashCBHiddenDeltaBuffer, OwnsViewedChunksBeforeTheirSourceIsOverwritten) {
     ov::genai::dflash_cb::HiddenDeltaBuffer buffer;
-    auto viewed = make_token_major_hidden_delta(2, 2, 0.0f);
-    auto copied = make_token_major_hidden_delta(1, 2, 4.0f);
+    auto first = make_token_major_hidden_delta(2, 2, 0.0f);
+    auto second = make_token_major_hidden_delta(1, 2, 4.0f);
 
-    buffer.append(viewed);
-    buffer.append(copied, /*copy_data=*/true);
-    std::fill_n(copied.data<float>(), copied.get_size(), -1.0f);
+    buffer.append(first);
     buffer.own_data();
-    std::fill_n(viewed.data<float>(), viewed.get_size(), -1.0f);
+    std::fill_n(first.data<float>(), first.get_size(), -1.0f);
+    buffer.append(second);
+    buffer.own_data();
+    std::fill_n(second.data<float>(), second.get_size(), -1.0f);
 
     ASSERT_EQ(tensor_values(buffer.materialize()), (std::vector<float>{0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f}));
 }
@@ -1304,7 +1305,6 @@ struct CandidateLattice {
         ov::genai::dflash_cb::walk_candidate_lattice(backbone_logits,
                                                      edge_scores,
                                                      candidate_ids,
-                                                     2,
                                                      row,
                                                      [&](const ov::Tensor& candidate_row) -> std::optional<int64_t> {
                                                          const auto token = sample_token(candidate_row);
