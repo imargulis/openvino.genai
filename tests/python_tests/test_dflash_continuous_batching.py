@@ -164,10 +164,12 @@ def _scheduler_config(max_num_batched_tokens=256):
     return config
 
 
-def _pipeline(models, draft=None, scheduler_config=None, **draft_properties):
+def _pipeline(models, draft=None, scheduler_config=None, draft_scheduler_config=None, **draft_properties):
     properties = dict(PRECISION)
     if draft is not None:
         variant, head_properties = DRAFTS[draft]
+        if draft_scheduler_config is not None:
+            draft_properties["scheduler_config"] = draft_scheduler_config
         properties["draft_model"] = ov_genai.draft_model(
             models[variant], "CPU", **PRECISION, **head_properties, **draft_properties
         )
@@ -231,6 +233,31 @@ def test_staggered_requests_match_target(dflash_models, target_outputs, draft):
 def test_token_budget_limits_drafted_candidates(dflash_models, target_outputs, draft):
     # one full validation window fits, so later requests draft fewer candidates or wait
     scheduler_config = _scheduler_config(max_num_batched_tokens=NUM_ASSISTANT_TOKENS + 3)
+    pipe = _pipeline(dflash_models, draft, scheduler_config)
+    outputs, _ = _generate(pipe, _prompts(), _generation_config())
+    assert outputs == target_outputs
+
+
+@pytest.mark.parametrize("draft", DRAFTS)
+def test_draft_kv_cache_limit_defers_drafting(dflash_models, target_outputs, draft):
+    # 3 blocks of 32 tokens hold the first drafts of the two shorter prompts, so the request with the longest prompt
+    # decodes without candidates until blocks free up
+    draft_scheduler_config = ov_genai.SchedulerConfig()
+    draft_scheduler_config.num_kv_blocks = 3
+    pipe = _pipeline(dflash_models, draft, draft_scheduler_config=draft_scheduler_config)
+    outputs, results = _generate(pipe, _prompts(), _generation_config())
+    assert outputs == target_outputs
+
+    metrics = results[0].extended_perf_metrics
+    assert metrics.get_num_draft_tokens() > 0
+    assert max(metrics.draft_step_metrics.raw_metrics.m_batch_sizes) <= 2 * NUM_ASSISTANT_TOKENS
+
+
+@pytest.mark.parametrize("draft", DRAFTS)
+def test_requests_with_fixed_target_cache_match_target(dflash_models, target_outputs, draft):
+    # the draft KV cache may hold as many tokens as the target's 16 blocks
+    scheduler_config = _scheduler_config()
+    scheduler_config.num_kv_blocks = 16
     pipe = _pipeline(dflash_models, draft, scheduler_config)
     outputs, _ = _generate(pipe, _prompts(), _generation_config())
     assert outputs == target_outputs

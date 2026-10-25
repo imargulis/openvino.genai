@@ -430,6 +430,92 @@ TEST(DFlashCBHiddenDeltaBuffer, OwnsViewedChunksBeforeTheirSourceIsOverwritten) 
     ASSERT_EQ(tensor_values(buffer.materialize()), (std::vector<float>{0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f}));
 }
 
+TEST(DFlashCBDraftBlockPool, GrowsByDoublingUpToTheLimit) {
+    std::vector<size_t> growths;
+    ov::genai::dflash_cb::DraftBlockPool pool([&](size_t num_blocks) {
+        growths.push_back(num_blocks);
+        return num_blocks;
+    });
+    pool.set_max_blocks(8);
+    std::vector<int32_t> first, second, third;
+
+    ASSERT_TRUE(pool.reserve(first, 3));
+    ASSERT_TRUE(pool.reserve(second, 2));
+    ASSERT_EQ(first, (std::vector<int32_t>{0, 1, 2}));
+    ASSERT_EQ(second, (std::vector<int32_t>{3, 4}));
+    ASSERT_EQ(growths, (std::vector<size_t>{3, 6}));
+    ASSERT_EQ(pool.get_num_free_blocks(), 1);
+
+    // 9 blocks exceed the limit: the third sequence gets none and the cache keeps its size
+    ASSERT_FALSE(pool.reserve(third, 4));
+    ASSERT_TRUE(third.empty());
+    ASSERT_EQ(growths.size(), 2);
+
+    pool.release(first);
+    ASSERT_TRUE(first.empty());
+    ASSERT_TRUE(pool.reserve(third, 4));
+    ASSERT_EQ(growths.size(), 2);
+    ASSERT_EQ(pool.get_num_free_blocks(), 0);
+    // a sequence that holds its blocks already takes no more
+    ASSERT_TRUE(pool.reserve(second, 1));
+    ASSERT_EQ(second.size(), 2);
+}
+
+TEST(DFlashCBDraftBlockPool, StopsDoublingAtTheLimit) {
+    std::vector<size_t> growths;
+    ov::genai::dflash_cb::DraftBlockPool pool([&](size_t num_blocks) {
+        growths.push_back(num_blocks);
+        return num_blocks;
+    });
+    pool.set_max_blocks(5);
+    std::vector<int32_t> first, second;
+
+    ASSERT_TRUE(pool.reserve(first, 3));
+    ASSERT_TRUE(pool.reserve(second, 1));
+    ASSERT_EQ(growths, (std::vector<size_t>{3, 5}));
+    ASSERT_EQ(pool.get_num_free_blocks(), 1);
+}
+
+TEST(DFlashCBDraftBlockPool, KeepsTheBlocksOfAGrowthThatFallsShort) {
+    size_t num_affordable_blocks = 4;
+    ov::genai::dflash_cb::DraftBlockPool pool([&](size_t num_blocks) {
+        return std::min(num_blocks, num_affordable_blocks);
+    });
+    std::vector<int32_t> first, second;
+
+    ASSERT_TRUE(pool.reserve(first, 2));
+    // memory holds 4 blocks, fewer than the 2 + 3 that both sequences need
+    ASSERT_FALSE(pool.reserve(second, 3));
+    ASSERT_TRUE(second.empty());
+    ASSERT_EQ(pool.get_num_allocated_blocks(), 4);
+    ASSERT_TRUE(pool.reserve(second, 2));
+    ASSERT_EQ(pool.get_num_free_blocks(), 0);
+}
+
+TEST(DFlashCBDraftBlockPool, RejectsALimitBelowTheAllocatedBlocks) {
+    ov::genai::dflash_cb::DraftBlockPool pool([](size_t num_blocks) {
+        return num_blocks;
+    });
+    std::vector<int32_t> blocks;
+    ASSERT_TRUE(pool.reserve(blocks, 3));
+    EXPECT_THROW(pool.set_max_blocks(2), ov::Exception);
+    EXPECT_NO_THROW(pool.set_max_blocks(0));
+}
+
+TEST(DFlashCBDraftBlockPool, LimitsTheDraftCacheByItsSchedulerConfigOrTheTarget) {
+    using ov::genai::dflash_cb::draft_kv_block_limit;
+    ov::genai::SchedulerConfig config;
+    // a target cache that grows on demand leaves the draft unlimited
+    EXPECT_EQ(draft_kv_block_limit(config, 32, 1024, 0), 0);
+    // as many tokens as the fixed target cache, in whole draft blocks
+    EXPECT_EQ(draft_kv_block_limit(config, 32, 1024, 16 * 100), 50);
+    EXPECT_EQ(draft_kv_block_limit(config, 32, 1024, 16 * 101), 51);
+    config.cache_size = 1;
+    EXPECT_EQ(draft_kv_block_limit(config, 32, 1024, 16 * 100), 1024 * 1024);
+    config.num_kv_blocks = 7;
+    EXPECT_EQ(draft_kv_block_limit(config, 32, 1024, 16 * 100), 7);
+}
+
 TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     auto model = make_annotated_stateful_sdpa_model();
     model->set_rt_info(true, "dflash_mode");
