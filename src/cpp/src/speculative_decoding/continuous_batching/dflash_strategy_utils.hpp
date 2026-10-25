@@ -4,6 +4,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -13,6 +15,7 @@
 #include <openvino/runtime/tensor.hpp>
 
 #include "openvino/genai/generation_config.hpp"
+#include "openvino/genai/scheduler_config.hpp"
 
 namespace ov::genai::dflash_cb {
 
@@ -143,6 +146,109 @@ private:
     size_t m_num_owned = 0;
     size_t m_token_count = 0;
 };
+
+// The blocks of the draft KV cache, which grows on demand, at least doubling, up to max_blocks (0: no limit).
+// grow(num_blocks) allocates the cache for up to num_blocks blocks and returns how many it holds then: fewer than
+// requested when memory runs short.
+class DraftBlockPool {
+public:
+    using Grow = std::function<size_t(size_t num_blocks)>;
+
+    explicit DraftBlockPool(Grow grow) : m_grow(std::move(grow)) {}
+
+    void set_max_blocks(size_t max_blocks) {
+        OPENVINO_ASSERT(max_blocks == 0 || max_blocks >= m_num_allocated,
+                        "The draft KV cache limit cannot be below its ",
+                        m_num_allocated,
+                        " allocated blocks.");
+        m_max_blocks = max_blocks;
+    }
+
+    // Adds free blocks to blocks until it holds num_blocks. False, with blocks unchanged, when the cache cannot
+    // provide them.
+    bool reserve(std::vector<int32_t>& blocks, size_t num_blocks) {
+        if (blocks.size() >= num_blocks) {
+            return true;
+        }
+        const size_t num_missing = num_blocks - blocks.size();
+        if (num_missing > m_free_blocks.size() && !grow(m_num_allocated + num_missing - m_free_blocks.size())) {
+            return false;
+        }
+        for (size_t idx = 0; idx < num_missing; ++idx) {
+            blocks.push_back(m_free_blocks.back());
+            m_free_blocks.pop_back();
+        }
+        return true;
+    }
+
+    void release(std::vector<int32_t>& blocks) {
+        m_free_blocks.insert(m_free_blocks.end(), blocks.begin(), blocks.end());
+        blocks.clear();
+    }
+
+    size_t get_num_allocated_blocks() const {
+        return m_num_allocated;
+    }
+
+    size_t get_num_free_blocks() const {
+        return m_free_blocks.size();
+    }
+
+private:
+    // The blocks the cache gains are free even when they are fewer than num_needed.
+    bool grow(size_t num_needed) {
+        if (m_max_blocks != 0 && num_needed > m_max_blocks) {
+            return false;
+        }
+        size_t num_wanted = std::max(num_needed, 2 * m_num_allocated);
+        if (m_max_blocks != 0) {
+            num_wanted = std::min(num_wanted, m_max_blocks);
+        }
+        const size_t num_allocated = m_grow(num_wanted);
+        OPENVINO_ASSERT(num_allocated >= m_num_allocated && num_allocated <= num_wanted,
+                        "The draft KV cache grew to ",
+                        num_allocated,
+                        " blocks, outside [",
+                        m_num_allocated,
+                        ", ",
+                        num_wanted,
+                        "].");
+        // the lowest blocks go first
+        for (size_t block = num_allocated; block > m_num_allocated; --block) {
+            m_free_blocks.push_back(static_cast<int32_t>(block - 1));
+        }
+        m_num_allocated = num_allocated;
+        return num_allocated >= num_needed;
+    }
+
+    Grow m_grow;
+    size_t m_max_blocks = 0;
+    size_t m_num_allocated = 0;
+    std::vector<int32_t> m_free_blocks;
+};
+
+// The number of blocks the draft KV cache may hold, 0 for no limit. A draft scheduler config with num_kv_blocks or
+// cache_size sets it as it does for a CB pipeline. Otherwise the draft holds as many tokens as a fixed target cache of
+// target_token_capacity tokens, since it keeps the context of every token the target keeps; a target cache that
+// grows on demand leaves the draft unlimited too.
+inline size_t draft_kv_block_limit(const SchedulerConfig& draft_config,
+                                   size_t block_size,
+                                   size_t block_size_in_bytes,
+                                   size_t target_token_capacity) {
+    OPENVINO_ASSERT(block_size > 0 && block_size_in_bytes > 0, "The draft KV cache blocks must not be empty.");
+    if (draft_config.num_kv_blocks > 0) {
+        return draft_config.num_kv_blocks;
+    }
+    if (draft_config.cache_size > 0) {
+        const size_t num_blocks = draft_config.cache_size * 1024ULL * 1024ULL * 1024ULL / block_size_in_bytes;
+        OPENVINO_ASSERT(num_blocks > 0,
+                        "The draft cache_size of ",
+                        draft_config.cache_size,
+                        " GB is smaller than one draft KV cache block.");
+        return num_blocks;
+    }
+    return (target_token_capacity + block_size - 1) / block_size;
+}
 
 inline void ensure_num_assistant_tokens_is_set(GenerationConfig& config) {
     OPENVINO_ASSERT(config.assistant_confidence_threshold == 0.f,

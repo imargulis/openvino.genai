@@ -117,6 +117,12 @@ public:
         return utils::get_compiled_kv_cache_precision(m_model_runner->get_infer_request().get_compiled_model());
     }
 
+    // The number of tokens a fixed KV cache holds, 0 when the cache grows on demand.
+    size_t get_kv_cache_token_capacity() const {
+        const size_t num_kv_blocks = m_scheduler->get_config().num_kv_blocks;
+        return num_kv_blocks == 0 ? 0 : num_kv_blocks * m_scheduler->get_block_size(CacheType::KV_CACHE);
+    }
+
     /**
      * @brief Enables/disables export of the model's `last_hidden_state`, delegating to the model runner.
      *        Shared by EAGLE3 and MTP hidden-state pairing.

@@ -180,6 +180,11 @@ Greedy decoding walks the candidates position by position, taking the best-scori
 Sampled decoding draws every drafted token from its `K` candidates, with the request temperature applied to their scores, or from the backbone distribution for drafts without a Markov head.
 The target then uses standard lossless rejection sampling: acceptance probability `min(1, p / q)`, with rejected tokens resampled from normalized `max(0, p - q)`.
 
+The draft KV cache grows on demand, in addition to the target's `SchedulerConfig.cache_size`.
+With a fixed target cache (`cache_size` or `num_kv_blocks`), the draft cache holds at most as many tokens as the target cache; with a target cache that grows on demand, the draft cache grows as far as memory allows, and on GPU only into free device memory.
+To set a limit of its own, pass a `scheduler_config` with `num_kv_blocks` or `cache_size` to `draft_model`.
+A request whose next draft does not fit is decoded by the target without draft tokens until other requests finish and free draft cache blocks.
+
 The example below uses a text target; replace `LLMPipeline` with `VLMPipeline` for a VLM target.
 
 <LanguageTabs>

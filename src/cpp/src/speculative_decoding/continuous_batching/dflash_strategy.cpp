@@ -129,6 +129,9 @@ public:
                                                rt_info)),
           m_request(m_compiled_model.create_infer_request()),
           m_kv_cache(std::make_unique<KVCacheManager>(m_request)),
+          m_blocks([this](size_t num_blocks) {
+              return grow_kv_cache(num_blocks);
+          }),
           m_sampler(tokenizer),
           m_mask_token_id(rt_info.mask_token_id),
           m_candidate_position_offset(rt_info.candidate_position_offset),
@@ -169,8 +172,7 @@ public:
         if (sequence_it == m_sequences.end()) {
             return;
         }
-        const auto& blocks = sequence_it->second.blocks;
-        m_free_blocks.insert(m_free_blocks.end(), blocks.begin(), blocks.end());
+        m_blocks.release(sequence_it->second.blocks);
         m_sampler.clear_request_info(request_id);
         m_sequences.erase(sequence_it);
     }
@@ -185,6 +187,21 @@ public:
 
     size_t get_consumed_hidden_states(uint64_t request_id) const {
         return get_sequence(request_id).committed_context_length;
+    }
+
+    void set_kv_cache_limit(const SchedulerConfig& draft_config, size_t target_token_capacity) {
+        m_blocks.set_max_blocks(dflash_cb::draft_kv_block_limit(draft_config,
+                                                                m_kv_cache->get_block_size(),
+                                                                m_kv_cache->get_block_size_in_bytes(),
+                                                                target_token_capacity));
+    }
+
+    // Gives the sequence the KV cache blocks of its next draft call: num_context_rows rows of context followed by a
+    // block of candidate_count candidates. False when the draft KV cache cannot hold them.
+    bool reserve(uint64_t request_id, size_t num_context_rows, size_t candidate_count) {
+        auto& sequence = get_sequence(request_id);
+        const size_t num_rows = num_context_rows + candidate_count + m_candidate_position_offset;
+        return m_blocks.reserve(sequence.blocks, required_blocks(sequence, num_rows));
     }
 
     std::vector<DraftCandidates> propose(const std::vector<DraftInput>& inputs) {
@@ -276,10 +293,13 @@ private:
             // every sequence brings context rows, so the block rows of a sequence never open a subsequence
             context_rows[idx] = hidden_delta_rows(inputs[idx].hidden_delta);
             num_rows[idx] = context_rows[idx] + inputs[idx].candidate_count + m_candidate_position_offset;
+            const auto& sequence = get_sequence(inputs[idx].request_id);
+            OPENVINO_ASSERT(sequence.blocks.size() >= required_blocks(sequence, num_rows[idx]),
+                            "DFlash draft call of request ", inputs[idx].request_id,
+                            " has no KV cache blocks reserved for its rows.");
             total_rows += num_rows[idx];
             total_candidates += inputs[idx].validation_count;
         }
-        reserve_blocks(inputs, num_rows);
 
         const auto& first_delta = inputs.front().hidden_delta;
         const auto hidden_type = first_delta.get_element_type();
@@ -393,32 +413,22 @@ private:
         return outputs;
     }
 
-    void reserve_blocks(const std::vector<DraftInput>& inputs, const std::vector<size_t>& num_rows) {
+    size_t required_blocks(const DraftSequence& sequence, size_t num_rows) const {
         const size_t block_size = m_kv_cache->get_block_size();
-        auto required_blocks = [&](size_t idx) {
-            const size_t context_length = get_sequence(inputs[idx].request_id).committed_context_length + num_rows[idx];
-            return (context_length + block_size - 1) / block_size;
-        };
-        size_t num_missing = 0;
-        for (size_t idx = 0; idx < inputs.size(); ++idx) {
-            const size_t num_owned = get_sequence(inputs[idx].request_id).blocks.size();
-            num_missing += std::max(required_blocks(idx), num_owned) - num_owned;
+        return (sequence.committed_context_length + num_rows + block_size - 1) / block_size;
+    }
+
+    // On GPU, the cache grows only as far as the free device memory allows, as the scheduler's cache does.
+    size_t grow_kv_cache(size_t num_blocks) {
+        const size_t num_allocated = m_kv_cache->get_num_allocated_blocks();
+        const auto device = m_kv_cache->get_device();
+        if (device.find("GPU") != std::string::npos) {
+            const size_t available_memory =
+                utils::get_available_gpu_memory(device, m_kv_cache->get_num_cache_tensors());
+            num_blocks = std::min(num_blocks, num_allocated + available_memory / m_kv_cache->get_block_size_in_bytes());
         }
-        if (num_missing > m_free_blocks.size()) {
-            const size_t num_allocated = m_kv_cache->get_num_allocated_blocks();
-            const size_t num_blocks = std::max(num_allocated + num_missing - m_free_blocks.size(), 2 * num_allocated);
-            m_kv_cache->allocate_cache_if_needed(num_blocks);
-            for (size_t block = num_blocks; block > num_allocated; --block) {
-                m_free_blocks.push_back(static_cast<int32_t>(block - 1));
-            }
-        }
-        for (size_t idx = 0; idx < inputs.size(); ++idx) {
-            auto& blocks = get_sequence(inputs[idx].request_id).blocks;
-            while (blocks.size() < required_blocks(idx)) {
-                blocks.push_back(m_free_blocks.back());
-                m_free_blocks.pop_back();
-            }
-        }
+        m_kv_cache->allocate_cache_if_needed(num_blocks);
+        return m_kv_cache->get_num_allocated_blocks();
     }
 
     DraftCandidates sample_candidates(DraftSequence& sequence, const ov::Tensor& logits) {
@@ -739,6 +749,7 @@ private:
     ov::CompiledModel m_compiled_model;
     ov::InferRequest m_request;
     std::unique_ptr<KVCacheManager> m_kv_cache;
+    dflash_cb::DraftBlockPool m_blocks;
     Sampler m_sampler;
     ov::genai::RawPerfMetrics m_raw_perf_metrics;
     uint64_t m_stage_inference_us = 0;
@@ -752,7 +763,6 @@ private:
     // reused for every lattice row walked through the sampler
     ov::Tensor m_candidate_row;
     std::map<uint64_t, DraftSequence> m_sequences;
-    std::vector<int32_t> m_free_blocks;
 };
 
 ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
@@ -896,6 +906,7 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
             true);
     }
     m_main_pipeline->set_hidden_state_export_needed(true);
+    m_draft->set_kv_cache_limit(draft_model_desc.scheduler_config, m_main_pipeline->get_kv_cache_token_capacity());
 }
 
 GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_draft_generation_config(
@@ -1089,9 +1100,10 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::plan_draft_inputs() {
                                                                             config.max_new_tokens);
                 const size_t validation_count =
                     dflash_cb::validation_candidate_count(draft_count, generated_len, config.max_new_tokens);
+                // a request whose rows the draft KV cache cannot hold decodes without candidates, keeping its deltas
                 if (validation_count == 0) {
                     state.pending_hidden_deltas.clear();
-                } else {
+                } else if (m_draft->reserve(request_id, state.pending_hidden_deltas.token_count(), draft_count)) {
                     validate_hidden_prefix_length(request_id, state);
                     DraftInput input;
                     input.request_id = request_id;
