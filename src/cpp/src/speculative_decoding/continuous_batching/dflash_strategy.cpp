@@ -127,12 +127,7 @@ public:
 
     void sync_generated_tokens(const std::vector<int64_t>& target_generated_tokens) {
         auto seq = (*m_sequence_group)[0];
-        if (seq->get_generated_len() > 0) {
-            seq->remove_last_tokens(seq->get_generated_len());
-        }
-        for (auto token : target_generated_tokens) {
-            seq->append_token(token, 0.0f);
-        }
+        detail::sync_sequence_tokens(seq, target_generated_tokens, m_sampler.get_logit_processor(1));
         m_sequence_group->update_processed_tokens_num(m_prompt_length + target_generated_tokens.size());
         seq->set_status(SequenceStatus::RUNNING);
     }
@@ -303,6 +298,8 @@ private:
         m_prompt_length = prompt_ids.size();
         // Sampler state is keyed by request_id; we reuse request_id=1, so clear per-request context.
         m_sampler.clear_request_info(1);
+        // The target's tokens enter the generated history at every sync, the first one before any draft sampling.
+        m_sampler.create_logit_processor(1, config, prompt_ids);
         m_sequence_group = std::make_shared<SequenceGroup>(1, prompt_ids, config);
         // config is the draft config, whose seed is already distinct from the target sampler's.
         m_selector_rng.seed(static_cast<std::mt19937::result_type>(config.rng_seed));
