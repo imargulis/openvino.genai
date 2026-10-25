@@ -7,6 +7,8 @@
 #include <functional>
 #include "continuous_batching/pipeline_impl.hpp"
 #include "openvino/genai/continuous_batching_pipeline.hpp"
+#include "sampling/logit_processor.hpp"
+#include "sequence_group.hpp"
 #include "update_request_structs.hpp"
 #include "utils.hpp"
 
@@ -24,6 +26,13 @@ struct MtpDraftUpdatePlan {
 // Plans the first draft forward after target validation. The target hidden-state window contains
 // one base token followed by all draft candidates; removed_draft_tokens is the rejected suffix.
 MtpDraftUpdatePlan make_mtp_draft_update_plan(size_t main_hidden_state_len, size_t removed_draft_tokens);
+
+// Makes the generated tokens of a draft sequence equal to the main model's token_ids, as update_request() does: the
+// tokens after their shared prefix leave the logit processor's generated history, the new ones enter it, and the draft
+// proposals, needed only until the main model commits the tokens, are dropped.
+void sync_sequence_tokens(Sequence::Ptr& sequence,
+                          const std::vector<int64_t>& token_ids,
+                          LogitProcessor& logit_processor);
 
 }  // namespace detail
 

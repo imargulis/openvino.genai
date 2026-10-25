@@ -293,6 +293,18 @@ insert_tokens_to_sequence(Sequence::Ptr& sequence,
     return (candidate_len - generated_len);
 }
 
+void detail::sync_sequence_tokens(Sequence::Ptr& sequence,
+                                  const std::vector<int64_t>& token_ids,
+                                  LogitProcessor& logit_processor) {
+    const auto& generated_ids = sequence->get_generated_ids();
+    const size_t prefix_len =
+        std::mismatch(generated_ids.begin(), generated_ids.end(), token_ids.begin(), token_ids.end()).first -
+        generated_ids.begin();
+    remove_tokens_from_sequence(sequence, prefix_len, logit_processor);
+    insert_tokens_to_sequence(sequence, token_ids, std::vector<float>(token_ids.size(), 0.0f), logit_processor, true, {});
+    sequence->clear_draft_proposals();
+}
+
 
 // `is_init_all_sequences_in_request` is flag to enable initialization of all sequences in case of `num_return_sequences > 1`.
 // Only first sequence from all will be initialized if flag is set to `false` state.

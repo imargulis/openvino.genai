@@ -165,6 +165,32 @@ TEST_F(CBForSDTest, DraftConfigsSampleFromAnIndependentStream) {
     EXPECT_EQ(MtpPipelineTestInstance::make_draft_generation_config(config).rng_seed, draft_seed);
 }
 
+// A draft synced to the target's tokens penalizes what the target kept and holds no proposals any more: the draft held
+// the committed token 1 and the candidates 2 and 3, and the target accepted 2, rejected 3 and emitted 4 in its place.
+TEST(SpeculativeDraftSync, PenalizesTheTargetTokensAfterSync) {
+    ov::genai::GenerationConfig config;
+    config.repetition_penalty = 2.0f;
+    ov::genai::LogitProcessor processor(config, {0});
+    auto sequence = ov::genai::Sequence::create(0);
+    for (const int64_t token : {1, 2, 3}) {
+        sequence->append_token(token, 0.0f);
+        processor.register_new_generated_token(token);
+    }
+    sequence->set_draft_proposal(1, ov::genai::DraftProposal{{}, {0.0f, 0.0f, 1.0f}});
+
+    ov::genai::detail::sync_sequence_tokens(sequence, {1, 2, 4}, processor);
+
+    EXPECT_EQ(sequence->get_generated_ids(), (std::vector<int64_t>{1, 2, 4}));
+    EXPECT_TRUE(sequence->get_draft_proposals().empty());
+    float input[]{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    ov::genai::Logits logits(input, 6);
+    processor.apply(logits);
+    const std::vector<float> expected{0.5f, 0.5f, 0.5f, 1.0f, 0.5f, 1.0f};
+    for (size_t token = 0; token < expected.size(); ++token) {
+        EXPECT_NEAR(input[token], expected[token], 1e-6f) << "token " << token;
+    }
+}
+
 TEST(MtpDraftUpdatePlan, PreservesAcceptedPrefixAfterPartialRejection) {
     struct TestCase {
         size_t removed_draft_tokens;
