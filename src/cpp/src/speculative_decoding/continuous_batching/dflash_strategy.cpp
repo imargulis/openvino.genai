@@ -167,7 +167,9 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
 }
 
 void ContinuousBatchingPipeline::DFlashDecodingImpl::validate_request_config(const GenerationConfig& config) const {
-    OPENVINO_ASSERT(config.is_greedy_decoding(), "DFlash supports greedy decoding only.");
+    OPENVINO_ASSERT(config.is_greedy_decoding() || config.is_multinomial(),
+                    "DFlash supports greedy and multinomial decoding only.");
+    OPENVINO_ASSERT(config.num_return_sequences == 1, "DFlash supports one sequence per request.");
     OPENVINO_ASSERT(!config.adapters.has_value(),
                     "DFlash does not support adapters until target and draft adapter parity is validated.");
     OPENVINO_ASSERT(config.assistant_confidence_threshold == 0.f,
@@ -180,11 +182,12 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::validate_request_config(con
 
 GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_draft_generation_config(
     const GenerationConfig& config) {
-    // The target decides when to stop and what to return; the draft only proposes candidates.
-    GenerationConfig draft_config = config;
-    draft_config.ignore_eos = true;
-    draft_config.stop_strings.clear();
+    // The target decides when to stop and what to return; the draft only proposes candidates, drawn independently
+    // of the target's draws.
+    GenerationConfig draft_config = make_draft_sampling_params(config);
     draft_config.stop_token_ids.clear();
+    // without stop tokens there is nothing to suppress
+    draft_config.min_new_tokens = 0;
     draft_config.include_stop_str_in_output = false;
     draft_config.structured_output_config.reset();
     draft_config.parsers.clear();

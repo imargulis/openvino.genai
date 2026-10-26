@@ -4,15 +4,21 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <random>
 #include <vector>
 
 #include <openvino/core/except.hpp>
 #include <openvino/runtime/tensor.hpp>
 
 #include "openvino/genai/generation_config.hpp"
+#include "sampling/draft_proposal.hpp"
 
 namespace ov::genai::dflash_cb {
 
@@ -31,6 +37,8 @@ struct DraftState {
     bool owns_pending_rows = false;
     size_t block_rows = 0;
     size_t candidate_rows = 0;
+    // Draws the candidates of a sampled request from its Top-K candidate lattice, seeded with the draft request's seed.
+    std::mt19937 lattice_rng;
 };
 
 // The rows of one request's forwarded draft block in the draft outputs, which hold the gathered rows of all
@@ -223,6 +231,135 @@ inline std::vector<int64_t> greedy_candidate_path(const ov::Tensor& edge_scores,
         path.push_back(ids[best]);
     }
     return path;
+}
+
+// True when the logit processors of a draft sampler with this config cannot change which token has the highest logit,
+// so a greedy draft can take the best token of every row without the sampler. Follows the transforms that
+// LogitProcessor adds for greedy decoding; the log-prob transforms keep the argmax.
+inline bool logit_processors_keep_argmax(const GenerationConfig& config) {
+    return config.is_greedy_decoding() && config.repetition_penalty == 1.0f && config.presence_penalty == 0.0f &&
+           config.frequency_penalty == 0.0f && config.min_new_tokens == 0 && !config.is_structured_output_generation();
+}
+
+// Tokens outside the candidates are shifted at least this far below the worst candidate.
+inline constexpr float CANDIDATE_ROW_GAP = 1.0e4f;
+
+// Spreads the lattice row at `position` that follows candidate previous_index at position - 1 over the vocabulary, so
+// the request's logit processors and sampler pick the token as they do from a full logits row. Candidate j gets
+// edge_scores[position, previous_index, j]. Every other token keeps its backbone logit, shifted below the candidates
+// by at least CANDIDATE_ROW_GAP: a candidate still wins after the usual penalties unless the processors mask all K of
+// them, and then the token comes from the remaining backbone logits. A repetition_penalty far below 1 can lift a
+// non-candidate above the candidates, as it would with the dense Markov step, and the walk then ends the block at
+// that token.
+inline void fill_candidate_row(const float* backbone_logits,
+                               size_t vocab_size,
+                               const ov::Tensor& edge_scores,
+                               const ov::Tensor& candidate_ids,
+                               size_t position,
+                               size_t previous_index,
+                               float* row) {
+    const size_t top_k = candidate_ids.get_shape()[1];
+    const auto* ids = candidate_ids.data<const int64_t>() + position * top_k;
+    const auto* scores = edge_scores.data<const float>() + (position * top_k + previous_index) * top_k;
+    // The candidates are the backbone's Top-K at this position, so its best logit is among them.
+    float best_logit = -std::numeric_limits<float>::infinity();
+    float worst_score = std::numeric_limits<float>::infinity();
+    for (size_t j = 0; j < top_k; ++j) {
+        best_logit = std::max(best_logit, backbone_logits[ids[j]]);
+        worst_score = std::min(worst_score, scores[j]);
+    }
+    const float shift = worst_score - CANDIDATE_ROW_GAP - best_logit;
+    std::transform(backbone_logits, backbone_logits + vocab_size, row, [shift](float logit) {
+        return logit + shift;
+    });
+    for (size_t j = 0; j < top_k; ++j) {
+        row[ids[j]] = scores[j];
+    }
+}
+
+inline std::optional<size_t> find_candidate(const ov::Tensor& candidate_ids, size_t position, int64_t token_id) {
+    const size_t top_k = candidate_ids.get_shape()[1];
+    const auto* ids = candidate_ids.data<const int64_t>() + position * top_k;
+    const auto* found = std::find(ids, ids + top_k, token_id);
+    if (found == ids + top_k) {
+        return std::nullopt;
+    }
+    return static_cast<size_t>(std::distance(ids, found));
+}
+
+// Walks the lattice rows [first_row, first_row + num_positions) of one block through a sampler. At every position,
+// sample_token(position, previous_index) draws a token from the lattice row that follows candidate previous_index at
+// the position before, spread over the vocabulary by fill_candidate_row(), and returns it, or nullopt to end the
+// block. A token outside the position's candidates ends the block as well, since the lattice has no row for it.
+template <typename SampleToken>
+void walk_candidate_lattice(const ov::Tensor& candidate_ids,
+                            size_t first_row,
+                            size_t num_positions,
+                            SampleToken&& sample_token) {
+    OPENVINO_ASSERT(first_row + num_positions <= candidate_ids.get_shape()[0],
+                    "The candidate walk exceeds the rows of the candidate lattice.");
+    size_t previous_index = 0;
+    for (size_t position = first_row; position < first_row + num_positions; ++position) {
+        const std::optional<int64_t> token = sample_token(position, previous_index);
+        if (!token) {
+            return;
+        }
+        const auto index = find_candidate(candidate_ids, position, *token);
+        if (!index) {
+            return;
+        }
+        previous_index = *index;
+    }
+}
+
+struct SampledCandidate {
+    int64_t token = 0;
+    float log_prob = 0.0f;
+    DraftProposalPtr proposal;
+};
+
+// Draws the candidates of the lattice rows [first_row, first_row + num_positions) of one block: every position from
+// the softmax, at `temperature`, of the row that follows the candidate drafted before it. Each candidate carries that
+// distribution over the row's K candidates, which the target verifies it against.
+inline std::vector<SampledCandidate> sample_candidate_path(const ov::Tensor& edge_scores,
+                                                           const ov::Tensor& candidate_ids,
+                                                           size_t first_row,
+                                                           size_t num_positions,
+                                                           float temperature,
+                                                           std::mt19937& rng) {
+    OPENVINO_ASSERT(temperature > 0.0f, "Sampled DFlash drafts with a Markov head require temperature > 0.");
+    OPENVINO_ASSERT(first_row + num_positions <= candidate_ids.get_shape()[0],
+                    "The candidate path exceeds the rows of the candidate lattice.");
+    const size_t top_k = candidate_ids.get_shape()[1];
+    const auto* scores = edge_scores.data<const float>();
+    const auto* ids = candidate_ids.data<const int64_t>();
+    std::vector<SampledCandidate> candidates;
+    candidates.reserve(num_positions);
+    size_t previous_index = 0;
+    for (size_t position = first_row; position < first_row + num_positions; ++position) {
+        const auto* row = scores + (position * top_k + previous_index) * top_k;
+        const float max_score = *std::max_element(row, row + top_k);
+        DraftProposal proposal;
+        proposal.token_ids.assign(ids + position * top_k, ids + (position + 1) * top_k);
+        proposal.probabilities.resize(top_k);
+        float probability_sum = 0.0f;
+        for (size_t index = 0; index < top_k; ++index) {
+            proposal.probabilities[index] = std::exp((row[index] - max_score) / temperature);
+            probability_sum += proposal.probabilities[index];
+        }
+        OPENVINO_ASSERT(probability_sum > 0.0f && std::isfinite(probability_sum),
+                        "The DFlash candidate lattice produced an invalid proposal distribution.");
+        for (auto& probability : proposal.probabilities) {
+            probability /= probability_sum;
+        }
+        std::discrete_distribution<size_t> distribution(proposal.probabilities.begin(), proposal.probabilities.end());
+        const size_t selected = distribution(rng);
+        candidates.push_back({proposal.token_ids[selected],
+                              std::log(proposal.probabilities[selected]),
+                              std::make_shared<const DraftProposal>(std::move(proposal))});
+        previous_index = selected;
+    }
+    return candidates;
 }
 
 }  // namespace ov::genai::dflash_cb

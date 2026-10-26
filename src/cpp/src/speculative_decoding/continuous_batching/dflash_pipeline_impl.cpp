@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
+#include <random>
 
+#include "sampling/sampler.hpp"
 #include "sequence_group.hpp"
 #include "speculative_decoding/continuous_batching/dflash_strategy.hpp"
 #include "utils.hpp"
@@ -39,6 +42,65 @@ ov::Tensor concat_rows(const ov::Tensor& head, const ov::Tensor& tail) {
     tail.copy_to(slice_rows(merged, head_rows, shape[0]));
     return merged;
 }
+
+// Drafts a block into its request's draft sequence. Candidates drawn with the draft sampler and candidates the selector
+// appends both enter the history of the request's logit processor, which update_dflash_draft_request keeps in step
+// with the sequence.
+class SequenceDrafter final : public dflash_cb::BlockDrafter {
+public:
+    SequenceDrafter(Sampler& sampler, SequenceGroup::Ptr request, std::mt19937& lattice_rng)
+        : m_sampler(sampler),
+          m_request(std::move(request)),
+          m_sequence(m_request->get_running_sequences().front()),
+          m_lattice_rng(lattice_rng),
+          m_processed_tokens(m_request->get_num_processed_tokens()),
+          m_generated_len(m_sequence->get_generated_len()) {}
+
+    const GenerationConfig& config() const override {
+        return m_request->get_sampling_parameters();
+    }
+
+    void append(int64_t token, float log_prob, DraftProposalPtr proposal) override {
+        m_sequence->append_token(token, log_prob);
+        if (proposal) {
+            m_sequence->set_draft_proposal(m_sequence->get_generated_len() - 1, std::move(proposal));
+        }
+        m_sampler.get_logit_processor(m_request->get_request_id()).register_new_generated_token(token);
+    }
+
+    std::optional<int64_t> sample(const ov::Tensor& row) override {
+        const size_t generated_len = m_sequence->get_generated_len();
+        // the sampler draws the token after the processed ones, appends it and advances the processed length
+        m_request->schedule_tokens(1);
+        m_request->set_num_validated_tokens(0);
+        m_sampler.sample({m_request}, row, false, false);
+        // A block has fewer candidates than max_new_tokens leaves, and the draft has no stop condition.
+        OPENVINO_ASSERT(!m_sequence->has_finished(),
+                        "The draft sampler finished DFlash draft request ", m_request->get_request_id(), ".");
+        if (m_sequence->get_generated_len() == generated_len) {
+            return std::nullopt;
+        }
+        return m_sequence->get_generated_ids().back();
+    }
+
+    std::mt19937& lattice_rng() override {
+        return m_lattice_rng;
+    }
+
+    // Restores the processed length that sampled candidates advanced. Returns the number of candidates drafted.
+    size_t finish() {
+        m_request->update_processed_tokens_num(m_processed_tokens);
+        return m_sequence->get_generated_len() - m_generated_len;
+    }
+
+private:
+    Sampler& m_sampler;
+    SequenceGroup::Ptr m_request;
+    Sequence::Ptr m_sequence;
+    std::mt19937& m_lattice_rng;
+    size_t m_processed_tokens;
+    size_t m_generated_len;
+};
 
 }  // namespace
 
@@ -175,6 +237,26 @@ size_t ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl:
     return gathered_rows;
 }
 
+size_t ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::draft_dflash_blocks(
+    const std::vector<dflash_cb::DraftBlockRows>& blocks,
+    const std::vector<SequenceGroup::Ptr>& block_requests,
+    const ov::Tensor& logits,
+    const ov::Tensor& hidden_states) {
+    std::vector<SequenceDrafter> drafters;
+    drafters.reserve(block_requests.size());
+    std::vector<dflash_cb::BlockDrafter*> block_drafters;
+    for (const auto& request : block_requests) {
+        drafters.emplace_back(*m_sampler, request, m_dflash_draft_states.at(request->get_request_id()).lattice_rng);
+        block_drafters.push_back(&drafters.back());
+    }
+    m_dflash_candidate_selector->select(blocks, logits, hidden_states, block_drafters);
+    size_t num_candidates = 0;
+    for (auto& drafter : drafters) {
+        num_candidates += drafter.finish();
+    }
+    return num_candidates;
+}
+
 void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::dflash_multistep() {
     const bool has_window = std::any_of(m_requests.begin(), m_requests.end(), [](const SequenceGroup::Ptr& request) {
         return !request->is_waiting() && !request->has_finished();
@@ -189,7 +271,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::d
     bool forwarded = false;
     size_t output_row = 0;
     std::vector<dflash_cb::DraftBlockRows> blocks;
-    std::vector<Sequence::Ptr> block_sequences;
+    std::vector<SequenceGroup::Ptr> block_requests;
     for (auto& request : m_requests) {
         const uint64_t request_id = request->get_request_id();
         auto state_it = m_dflash_draft_states.find(request_id);
@@ -207,7 +289,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::d
             output_row += finish_dflash_draft_step(request, state, output_row, block);
             if (block) {
                 blocks.push_back(*block);
-                block_sequences.push_back(request->get_running_sequences().front());
+                block_requests.push_back(request);
             }
         }
         request->pause_generation(true);
@@ -225,14 +307,8 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::d
         const ov::Tensor hidden_states = m_dflash_candidate_selector->reads_hidden_states()
                                              ? infer_request.get_tensor("last_hidden_state")
                                              : ov::Tensor{};
-        const auto candidates = m_dflash_candidate_selector->select(blocks, logits, hidden_states);
+        num_candidates = draft_dflash_blocks(blocks, block_requests, logits, hidden_states);
         selection_inference_duration = m_dflash_candidate_selector->get_inference_duration();
-        for (size_t idx = 0; idx < blocks.size(); ++idx) {
-            for (const int64_t token : candidates[idx]) {
-                block_sequences[idx]->append_token(token, 0.0f);
-            }
-            num_candidates += candidates[idx].size();
-        }
     }
     const float step_duration = PerfMetrics::get_microsec(std::chrono::steady_clock::now() - step_start);
     for (auto state_it = m_dflash_draft_states.begin(); state_it != m_dflash_draft_states.end();) {
@@ -268,16 +344,27 @@ UpdateRequestResult ContinuousBatchingPipeline::ContinuousBatchingForSpeculative
     const uint64_t request_id = request->get_request_id();
     Sequence::Ptr sequence = running_sequences.front();
     const GeneratedSequence& target = candidates.begin()->second;
-    dflash_cb::DraftState& state = m_dflash_draft_states[request_id];
-    if (state.sequence_id != sequence->get_id()) {
+    auto [state_it, is_new_state] = m_dflash_draft_states.try_emplace(request_id);
+    dflash_cb::DraftState& state = state_it->second;
+    if (is_new_state || state.sequence_id != sequence->get_id()) {
         state = dflash_cb::DraftState{};
         state.sequence_id = sequence->get_id();
         // a restored prefix is already committed: the draft request waits for its first window until now
         state.committed_rows = request->get_num_processed_tokens();
+        const auto& config = request->get_sampling_parameters();
+        state.lattice_rng.seed(static_cast<std::mt19937::result_type>(config.rng_seed));
+        // The draft sampler's history is the draft sequence, from the prompt on.
+        m_sampler->clear_request_info(request_id);
+        m_sampler->create_logit_processor(request_id, config, request->get_prompt_ids());
+        auto& logit_processor = m_sampler->get_logit_processor(request_id);
+        for (const int64_t token : sequence->get_generated_ids()) {
+            logit_processor.register_new_generated_token(token);
+        }
     }
 
     // Keep the tokens both models agree on, then take the target's tokens: the accepted candidates stay,
     // the rejected ones are replaced by the target's correction.
+    auto& logit_processor = m_sampler->get_logit_processor(request_id);
     const auto& draft_ids = sequence->get_generated_ids();
     const size_t draft_len = draft_ids.size();
     size_t common_len = 0;
@@ -285,12 +372,19 @@ UpdateRequestResult ContinuousBatchingPipeline::ContinuousBatchingForSpeculative
            draft_ids[common_len] == target.token_ids[common_len]) {
         ++common_len;
     }
+    for (size_t i = common_len; i < draft_len; ++i) {
+        logit_processor.decrease_generated_token_occurance(draft_ids[i]);
+    }
     result.removed_tokens_cnt = draft_len - common_len;
     sequence->remove_last_tokens(result.removed_tokens_cnt);
     for (size_t i = common_len; i < target.token_ids.size(); ++i) {
         sequence->append_token(target.token_ids[i], target.log_probs[i]);
+        logit_processor.register_new_generated_token(target.token_ids[i]);
     }
     result.inserted_tokens_cnt = target.token_ids.size() - common_len;
+    logit_processor.update_generated_len(sequence->get_generated_len());
+    // the target has validated the candidates the proposals came with
+    sequence->clear_draft_proposals();
 
     const auto new_rows = dflash_cb::select_new_target_rows(request_id,
                                                             state.committed_rows + num_rows(state.pending_rows),
