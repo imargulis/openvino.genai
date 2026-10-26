@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include <openvino/core/except.hpp>
 #include <openvino/runtime/tensor.hpp>
@@ -35,6 +36,8 @@ struct DraftState {
 // The rows of one request's forwarded draft block in the draft outputs, which hold the gathered rows of all
 // blocks of a step one block after another.
 struct DraftBlockRows {
+    // the token before the first candidate, the seed
+    int64_t anchor_token = 0;
     size_t first_row = 0;
     size_t num_rows = 0;
     // the leading rows the target validates, at most num_rows
@@ -134,6 +137,92 @@ inline DraftBlockPlan plan_draft_block(size_t num_assistant_tokens,
         return {};
     }
     return {draft_block_length(draft_count, candidate_position_offset), candidate_rows};
+}
+
+// The candidate scorer takes the rows of num_blocks draft blocks packed back to back: block n spans rows
+// subsequence_begins[n] to subsequence_begins[n + 1]. The graph marks the first row of every block and gives it the
+// block's anchor as predecessor, so an empty block would mark a row twice and shift the anchors of later blocks.
+inline void validate_subsequence_begins(const ov::Tensor& subsequence_begins, size_t num_blocks, size_t num_rows) {
+    OPENVINO_ASSERT(num_blocks > 0, "The candidate scorer needs at least one draft block.");
+    OPENVINO_ASSERT(subsequence_begins && subsequence_begins.get_element_type() == ov::element::i64 &&
+                        subsequence_begins.get_shape() == ov::Shape{num_blocks + 1},
+                    "The candidate scorer subsequence_begins must be an I64 tensor of shape [",
+                    num_blocks + 1,
+                    "].");
+    const auto* begins = subsequence_begins.data<const int64_t>();
+    OPENVINO_ASSERT(begins[0] == 0 && begins[num_blocks] == static_cast<int64_t>(num_rows),
+                    "The candidate scorer subsequence_begins must start at 0 and end at the number of draft rows ",
+                    num_rows,
+                    ".");
+    for (size_t block = 0; block < num_blocks; ++block) {
+        OPENVINO_ASSERT(begins[block] < begins[block + 1],
+                        "The candidate scorer subsequence_begins must be strictly increasing: draft block ",
+                        block,
+                        " is empty.");
+    }
+}
+
+// The candidate scorer returns a Top-K lattice over the packed rows of all draft blocks:
+//   candidate_ids [rows, K]: the backbone's K best tokens at every row;
+//   edge_scores [rows, K, K]: edge_scores[s, i, j] scores candidate j at row s after candidate i at row s - 1.
+// The first row of a block follows the block's anchor instead, so edge_scores[s, i, :] is the same for every i there.
+inline void validate_candidate_lattice(const ov::Tensor& edge_scores,
+                                       const ov::Tensor& candidate_ids,
+                                       size_t num_positions,
+                                       size_t vocab_size) {
+    OPENVINO_ASSERT(candidate_ids && candidate_ids.get_element_type() == ov::element::i64 &&
+                        candidate_ids.get_shape().size() == 2 && candidate_ids.get_shape()[0] == num_positions &&
+                        candidate_ids.get_shape()[1] > 0,
+                    "Candidate scorer candidate_ids must be an I64 tensor of shape [",
+                    num_positions,
+                    ", K].");
+    const size_t top_k = candidate_ids.get_shape()[1];
+    OPENVINO_ASSERT(edge_scores && edge_scores.get_element_type() == ov::element::f32 &&
+                        edge_scores.get_shape() == ov::Shape({num_positions, top_k, top_k}),
+                    "Candidate scorer edge_scores must be an FP32 tensor of shape [",
+                    num_positions,
+                    ", ",
+                    top_k,
+                    ", ",
+                    top_k,
+                    "].");
+    const auto* ids = candidate_ids.data<const int64_t>();
+    OPENVINO_ASSERT(std::all_of(ids,
+                                ids + candidate_ids.get_size(),
+                                [&](int64_t id) {
+                                    return id >= 0 && static_cast<size_t>(id) < vocab_size;
+                                }),
+                    "Candidate scorer candidate_ids must be draft vocabulary ids.");
+}
+
+// Walks the lattice rows [first_row, first_row + num_positions) of one block greedily: at every position, the best
+// candidate in the row of the candidate drafted before it. Ties go to the smaller token id, as in a greedy scan over
+// the vocabulary. A row's scores depend on that row and its predecessor only, so a walk over the leading positions of
+// a block drafts the leading tokens of a walk over the whole block.
+inline std::vector<int64_t> greedy_candidate_path(const ov::Tensor& edge_scores,
+                                                  const ov::Tensor& candidate_ids,
+                                                  size_t first_row,
+                                                  size_t num_positions) {
+    const size_t top_k = candidate_ids.get_shape()[1];
+    OPENVINO_ASSERT(first_row + num_positions <= candidate_ids.get_shape()[0],
+                    "The candidate path exceeds the rows of the candidate lattice.");
+    const auto* scores = edge_scores.data<const float>();
+    std::vector<int64_t> path;
+    path.reserve(num_positions);
+    size_t previous_index = 0;
+    for (size_t position = first_row; position < first_row + num_positions; ++position) {
+        const auto* row = scores + (position * top_k + previous_index) * top_k;
+        const auto* ids = candidate_ids.data<const int64_t>() + position * top_k;
+        size_t best = 0;
+        for (size_t j = 1; j < top_k; ++j) {
+            if (row[j] > row[best] || (row[j] == row[best] && ids[j] < ids[best])) {
+                best = j;
+            }
+        }
+        previous_index = best;
+        path.push_back(ids[best]);
+    }
+    return path;
 }
 
 }  // namespace ov::genai::dflash_cb

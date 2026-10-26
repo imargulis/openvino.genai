@@ -7,6 +7,7 @@
 #include <optional>
 
 #include "fast_draft_strategy.hpp"
+#include "speculative_decoding/continuous_batching/dflash_candidate_selector.hpp"
 #include "speculative_decoding/continuous_batching/dflash_strategy_utils.hpp"
 #include "speculative_decoding/dflash_model_transforms.hpp"
 
@@ -44,7 +45,8 @@ protected:
 
 // Continuous-batching pipeline for both DFlash models. The validating main pipeline publishes its
 // processed length with the exported hidden states. The draft pipeline forwards each request's window
-// once per step; its logic is in ContinuousBatchingForSpeculativeDecodingImpl behind dflash_mode_enabled.
+// once per step and drafts the candidates of every forwarded block with the candidate selector; its logic
+// is in ContinuousBatchingForSpeculativeDecodingImpl behind dflash_mode_enabled.
 class ContinuousBatchingPipeline::ContinuousBatchingForDFlashDecodingImpl
     : public ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl {
 public:
@@ -58,7 +60,8 @@ public:
                                             const ov::AnyMap& plugin_config,
                                             bool is_validation_mode_enabled,
                                             int64_t mask_token_id = -1,
-                                            size_t candidate_position_offset = 1);
+                                            size_t candidate_position_offset = 1,
+                                            std::shared_ptr<dflash_cb::CandidateSelector> candidate_selector = nullptr);
 
     ContinuousBatchingForDFlashDecodingImpl(const std::shared_ptr<ov::Model>& model,
                                             std::shared_ptr<InputsEmbedder> inputs_embedder,
@@ -69,7 +72,8 @@ public:
                                             const ov::AnyMap& plugin_config,
                                             bool is_validation_mode_enabled,
                                             int64_t mask_token_id = -1,
-                                            size_t candidate_position_offset = 1);
+                                            size_t candidate_position_offset = 1,
+                                            std::shared_ptr<dflash_cb::CandidateSelector> candidate_selector = nullptr);
 
     bool supports_embedding_prefix_verification() const override {
         return true;

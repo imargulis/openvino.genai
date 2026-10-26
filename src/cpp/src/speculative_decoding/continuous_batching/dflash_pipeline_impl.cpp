@@ -51,7 +51,8 @@ ContinuousBatchingPipeline::ContinuousBatchingForDFlashDecodingImpl::ContinuousB
     const ov::AnyMap& plugin_config,
     bool is_validation_mode_enabled,
     int64_t mask_token_id,
-    size_t candidate_position_offset)
+    size_t candidate_position_offset,
+    std::shared_ptr<dflash_cb::CandidateSelector> candidate_selector)
     : ContinuousBatchingForSpeculativeDecodingImpl(model,
                                                    tokenizer,
                                                    generation_config,
@@ -61,7 +62,7 @@ ContinuousBatchingPipeline::ContinuousBatchingForDFlashDecodingImpl::ContinuousB
                                                    is_validation_mode_enabled) {
     dflash_mode_enabled = true;
     if (!is_validation_mode_enabled) {
-        enable_dflash_draft(mask_token_id, candidate_position_offset);
+        enable_dflash_draft(mask_token_id, candidate_position_offset, std::move(candidate_selector));
     }
 }
 
@@ -75,7 +76,8 @@ ContinuousBatchingPipeline::ContinuousBatchingForDFlashDecodingImpl::ContinuousB
     const ov::AnyMap& plugin_config,
     bool is_validation_mode_enabled,
     int64_t mask_token_id,
-    size_t candidate_position_offset)
+    size_t candidate_position_offset,
+    std::shared_ptr<dflash_cb::CandidateSelector> candidate_selector)
     : ContinuousBatchingForSpeculativeDecodingImpl(model,
                                                    std::move(inputs_embedder),
                                                    tokenizer,
@@ -88,23 +90,31 @@ ContinuousBatchingPipeline::ContinuousBatchingForDFlashDecodingImpl::ContinuousB
     if (!is_validation_mode_enabled) {
         // The draft is a text model: sequential positions instead of the target's M-RoPE positions.
         m_model_runner->enable_mtp_draft_positions(true);
-        enable_dflash_draft(mask_token_id, candidate_position_offset);
+        enable_dflash_draft(mask_token_id, candidate_position_offset, std::move(candidate_selector));
     }
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::enable_dflash_draft(
     int64_t mask_token_id,
-    size_t candidate_position_offset) {
+    size_t candidate_position_offset,
+    std::shared_ptr<dflash_cb::CandidateSelector> candidate_selector) {
     OPENVINO_ASSERT(mask_token_id >= 0, "DFlash draft requires a valid mask token id.");
     OPENVINO_ASSERT(m_scheduler->get_config().dynamic_split_fuse,
                     "DFlash draft pipeline requires scheduler_config.dynamic_split_fuse=true.");
     // candidates are read at fixed logits rows, which needs the gathered logits
-    const auto inputs = m_model_runner->get_infer_request().get_compiled_model().inputs();
-    OPENVINO_ASSERT(std::any_of(inputs.begin(), inputs.end(),
-                                [](const ov::Output<const ov::Node>& input) {
-                                    return input.get_names().count("sampled_tokens_indices") > 0;
-                                }),
+    const auto compiled_model = m_model_runner->get_infer_request().get_compiled_model();
+    const auto has_port = [](const auto& ports, const std::string& name) {
+        return std::any_of(ports.begin(), ports.end(), [&](const ov::Output<const ov::Node>& port) {
+            return port.get_names().count(name) > 0;
+        });
+    };
+    OPENVINO_ASSERT(has_port(compiled_model.inputs(), "sampled_tokens_indices"),
                     "DFlash draft model has no 'sampled_tokens_indices' input, so its candidate logits cannot be gathered.");
+    m_dflash_candidate_selector =
+        candidate_selector ? std::move(candidate_selector) : std::make_shared<dflash_cb::CandidateSelector>();
+    OPENVINO_ASSERT(!m_dflash_candidate_selector->reads_hidden_states() ||
+                        has_port(compiled_model.outputs(), "last_hidden_state"),
+                    "A DFlash draft with a gated Markov head must return 'last_hidden_state' with its logits.");
     m_dflash_mask_token_id = mask_token_id;
     m_dflash_candidate_position_offset = candidate_position_offset;
     m_model_runner->enable_dflash_draft(candidate_position_offset);
@@ -155,7 +165,10 @@ size_t ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl:
     // A block that did not fit the cache or the batch, whole or in part, gives no candidates: the target decodes
     // the request alone this step, and the next window starts again at the committed rows.
     if (forwarded_block_rows == state.block_rows) {
-        block = dflash_cb::DraftBlockRows{first_output_row, gathered_rows, state.candidate_rows};
+        block = dflash_cb::DraftBlockRows{sequence->get_generated_ids().back(),
+                                          first_output_row,
+                                          gathered_rows,
+                                          state.candidate_rows};
     }
     state.block_rows = 0;
     state.candidate_rows = 0;
@@ -166,11 +179,9 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::d
     const bool has_window = std::any_of(m_requests.begin(), m_requests.end(), [](const SequenceGroup::Ptr& request) {
         return !request->is_waiting() && !request->has_finished();
     });
-    float step_duration = 0.0f;
+    const auto step_start = std::chrono::steady_clock::now();
     if (has_window) {
-        const auto step_start = std::chrono::steady_clock::now();
         step();
-        step_duration = PerfMetrics::get_microsec(std::chrono::steady_clock::now() - step_start);
     }
 
     // Only block windows produce output rows, and they are scheduled in request order, as the sampler
@@ -204,21 +215,26 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::d
     }
 
     size_t num_candidates = 0;
+    float selection_inference_duration = 0.0f;
     if (!blocks.empty()) {
-        const ov::Tensor logits = m_model_runner->get_infer_request().get_tensor("logits");
-        const size_t vocab_size = logits.get_shape().back();
-        OPENVINO_ASSERT(logits.get_size() == output_row * vocab_size,
-                        "DFlash draft returned ", logits.get_size() / vocab_size,
+        auto& infer_request = m_model_runner->get_infer_request();
+        const ov::Tensor logits = infer_request.get_tensor("logits");
+        OPENVINO_ASSERT(logits.get_size() == output_row * logits.get_shape().back(),
+                        "DFlash draft returned ", logits.get_size() / logits.get_shape().back(),
                         " logits rows, but its blocks gathered ", output_row, ".");
-        const float* logits_data = logits.data<const float>();
+        const ov::Tensor hidden_states = m_dflash_candidate_selector->reads_hidden_states()
+                                             ? infer_request.get_tensor("last_hidden_state")
+                                             : ov::Tensor{};
+        const auto candidates = m_dflash_candidate_selector->select(blocks, logits, hidden_states);
+        selection_inference_duration = m_dflash_candidate_selector->get_inference_duration();
         for (size_t idx = 0; idx < blocks.size(); ++idx) {
-            for (size_t candidate = 0; candidate < blocks[idx].num_candidates; ++candidate) {
-                const float* row = logits_data + (blocks[idx].first_row + candidate) * vocab_size;
-                block_sequences[idx]->append_token(std::max_element(row, row + vocab_size) - row, 0.0f);
+            for (const int64_t token : candidates[idx]) {
+                block_sequences[idx]->append_token(token, 0.0f);
             }
-            num_candidates += blocks[idx].num_candidates;
+            num_candidates += candidates[idx].size();
         }
     }
+    const float step_duration = PerfMetrics::get_microsec(std::chrono::steady_clock::now() - step_start);
     for (auto state_it = m_dflash_draft_states.begin(); state_it != m_dflash_draft_states.end();) {
         const bool is_live = std::any_of(m_requests.begin(), m_requests.end(), [&](const SequenceGroup::Ptr& request) {
             return request->get_request_id() == state_it->first;
@@ -233,7 +249,8 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::d
 
     if (forwarded) {
         raw_perf_metrics.m_durations.emplace_back(step_duration);
-        raw_perf_metrics.m_inference_durations[0] += MicroSeconds(get_metrics().inference_duration);
+        raw_perf_metrics.m_inference_durations[0] +=
+            MicroSeconds(get_metrics().inference_duration + selection_inference_duration);
         raw_perf_metrics.m_batch_sizes.emplace_back(num_candidates);
     }
 }
@@ -292,8 +309,9 @@ UpdateRequestResult ContinuousBatchingPipeline::ContinuousBatchingForSpeculative
     }
 
     const size_t known_rows = state.committed_rows + num_rows(state.pending_rows);
-    // Every block follows at least one context row. A target still recomputing preempted tokens catches up before
-    // the request drafts again.
+    // Every block follows at least one context row, which keeps the blocks of different requests apart in the
+    // packed block rows that the DFlash-2 convolutions run over. A target still recomputing preempted tokens
+    // catches up before the request drafts again.
     const auto block =
         num_rows(state.pending_rows) > 0 && target.num_processed_tokens == known_rows
             ? dflash_cb::plan_draft_block(request->get_sampling_parameters().num_assistant_tokens.value_or(0),

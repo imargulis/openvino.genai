@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <memory>
 #include <optional>
 #include "continuous_batching/pipeline_impl.hpp"
 #include "openvino/genai/continuous_batching_pipeline.hpp"
@@ -13,6 +14,10 @@
 #include "utils.hpp"
 
 namespace ov::genai {
+
+namespace dflash_cb {
+class CandidateSelector;
+}
 
 namespace detail {
 
@@ -181,7 +186,9 @@ protected:
     bool dflash_mode_enabled = false;
 
     // DFlash draft, implemented in dflash_pipeline_impl.cpp.
-    void enable_dflash_draft(int64_t mask_token_id, size_t candidate_position_offset);
+    void enable_dflash_draft(int64_t mask_token_id,
+                             size_t candidate_position_offset,
+                             std::shared_ptr<dflash_cb::CandidateSelector> candidate_selector);
     UpdateRequestResult update_dflash_draft_request(SequenceGroup::Ptr request, const GeneratedSequences& candidates);
     void dflash_multistep();
     // Applies the last forward to the request's draft state and removes its mask tokens. Returns the draft output
@@ -192,6 +199,7 @@ protected:
                                     std::optional<dflash_cb::DraftBlockRows>& block);
     int64_t m_dflash_mask_token_id = -1;
     size_t m_dflash_candidate_position_offset = 1;
+    std::shared_ptr<dflash_cb::CandidateSelector> m_dflash_candidate_selector;
     std::map<uint64_t, dflash_cb::DraftState> m_dflash_draft_states;
 };
 
