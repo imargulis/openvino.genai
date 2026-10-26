@@ -3,9 +3,10 @@
 
 """DFlash, DSpark and DFlash-2 drafts with several requests in the continuous-batching speculative pipeline.
 
-Greedy speculative decoding must reproduce the target alone, whatever the draft proposes. Tiny random drafts
-reject almost every candidate. In the constant setup every token embedding carries a large channel 0 that only
-token 0 reads out, so the target and all drafts predict token 0 and every candidate is accepted.
+Greedy speculative decoding must reproduce the target alone, whatever the draft proposes, and sampled speculative
+decoding must be reproducible from the request seed. Tiny random drafts reject almost every candidate. In the
+constant setup every token embedding carries a large channel 0 that only token 0 reads out, so the target and all
+drafts predict token 0 and every candidate is accepted.
 """
 
 import re
@@ -285,11 +286,39 @@ def test_prefix_caching_matches_target(dflash_models, target_outputs, draft):
     assert outputs == target_outputs + target_outputs
 
 
-def test_sampling_is_rejected(dflash_models):
+@pytest.mark.parametrize("draft", DRAFTS)
+def test_sampled_requests_are_reproducible(dflash_models, draft):
+    # The target accepts or replaces every sampled candidate by speculative sampling against the distribution the
+    # draft drew it from; the draws of both follow the request seed.
     config = _generation_config()
     config.do_sample = True
-    with pytest.raises(RuntimeError, match="greedy decoding only"):
-        _generate(_pipeline(dflash_models, "dflash2"), _prompts(), config)
+    config.temperature = 0.8
+    # A Top-K candidate lattice proposes only its candidates: over the whole vocabulary, the tiny target would give
+    # them too little probability to accept any.
+    config.top_k = 4
+    config.rng_seed = 3
+    outputs, results = _generate(_pipeline(dflash_models, draft), _prompts(), config)
+    assert all(len(tokens) == MAX_NEW_TOKENS for tokens in outputs)
+    metrics = results[0].extended_perf_metrics
+    assert metrics.get_num_draft_tokens() > 0
+    if dflash_models["constant"]:
+        assert metrics.get_num_accepted_tokens() > 0
+    assert _generate(_pipeline(dflash_models, draft), _prompts(), config)[0] == outputs
+
+
+@pytest.mark.parametrize("draft", DRAFTS)
+def test_greedy_requests_with_penalties_match_target(dflash_models, draft):
+    # Penalties can change the argmax, so the draft draws its candidates with its sampler, over the token history it
+    # shares with the target.
+    def penalized(config):
+        config.repetition_penalty = 1.3
+        config.presence_penalty = 0.2
+        return config
+
+    target, _ = _generate(_pipeline(dflash_models), _prompts(), penalized(_target_config()))
+    outputs, results = _generate(_pipeline(dflash_models, draft), _prompts(), penalized(_generation_config()))
+    assert outputs == target
+    _assert_drafted(dflash_models, results)
 
 
 def test_draft_without_token_type_ids_is_rejected(dflash_models, tmp_path):

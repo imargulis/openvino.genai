@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <numeric>
 
@@ -24,6 +25,10 @@ size_t row_width(const ov::Tensor& rows) {
 
 const float* row_data(const ov::Tensor& rows, size_t row) {
     return rows.data<const float>() + row * row_width(rows);
+}
+
+int64_t argmax(const float* row, size_t vocab_size) {
+    return std::max_element(row, row + vocab_size) - row;
 }
 
 bool blocks_are_packed(const std::vector<DraftBlockRows>& blocks, size_t num_rows) {
@@ -72,13 +77,15 @@ CandidateSelector::CandidateSelector(const utils::dflash::DFlashRTInfo& rt_info,
     }
 }
 
-std::vector<std::vector<int64_t>> CandidateSelector::select(const std::vector<DraftBlockRows>& blocks,
-                                                            const ov::Tensor& logits,
-                                                            const ov::Tensor& hidden_states) {
+void CandidateSelector::select(const std::vector<DraftBlockRows>& blocks,
+                               const ov::Tensor& logits,
+                               const ov::Tensor& hidden_states,
+                               const std::vector<BlockDrafter*>& drafters) {
     m_inference_duration = 0.0f;
     if (blocks.empty()) {
-        return {};
+        return;
     }
+    OPENVINO_ASSERT(drafters.size() == blocks.size(), "Every DFlash draft block needs a drafter.");
     const size_t num_rows = logits.get_size() / row_width(logits);
     for (const auto& block : blocks) {
         OPENVINO_ASSERT(block.num_candidates > 0 && block.num_candidates <= block.num_rows &&
@@ -86,41 +93,64 @@ std::vector<std::vector<int64_t>> CandidateSelector::select(const std::vector<Dr
                         "DFlash draft block rows exceed the ", num_rows, " gathered draft rows.");
     }
     if (m_candidate_scorer) {
-        return select_scored_candidates(blocks, logits, hidden_states);
+        select_scored_candidates(blocks, logits, hidden_states, drafters);
+    } else if (m_markov_step) {
+        walk_markov_steps(blocks, logits, drafters);
+    } else {
+        draft_rows(blocks, logits, drafters);
     }
-    if (m_markov_step) {
-        return walk_markov_steps(blocks, logits);
-    }
-    return select_argmax(blocks, logits);
 }
 
-std::vector<std::vector<int64_t>> CandidateSelector::select_argmax(const std::vector<DraftBlockRows>& blocks,
-                                                                   const ov::Tensor& logits) const {
-    // output_multiplier > 0 and the soft cap keep the argmax of the backbone logits
+ov::Tensor& CandidateSelector::backbone_row(const float* logits, size_t vocab_size) {
+    if (!m_row || m_row.get_size() != vocab_size) {
+        m_row = ov::Tensor(ov::element::f32, {1, 1, vocab_size});
+    }
+    float* row = m_row.data<float>();
+    for (size_t token = 0; token < vocab_size; ++token) {
+        float value = logits[token] * m_output_multiplier;
+        if (m_final_logit_softcapping > 0.0f) {
+            value = std::tanh(value / m_final_logit_softcapping) * m_final_logit_softcapping;
+        }
+        row[token] = value;
+    }
+    return m_row;
+}
+
+void CandidateSelector::draft_rows(const std::vector<DraftBlockRows>& blocks,
+                                   const ov::Tensor& logits,
+                                   const std::vector<BlockDrafter*>& drafters) {
     const size_t vocab_size = row_width(logits);
-    std::vector<std::vector<int64_t>> candidates(blocks.size());
     for (size_t idx = 0; idx < blocks.size(); ++idx) {
+        auto& drafter = *drafters[idx];
+        const bool takes_argmax = logit_processors_keep_argmax(drafter.config());
         for (size_t position = 0; position < blocks[idx].num_candidates; ++position) {
             const float* row = row_data(logits, blocks[idx].first_row + position);
-            candidates[idx].push_back(std::max_element(row, row + vocab_size) - row);
+            if (takes_argmax) {
+                // output_multiplier > 0 and the soft cap keep the argmax of the backbone logits
+                drafter.append(argmax(row, vocab_size), 0.0f, nullptr);
+            } else if (!drafter.sample(backbone_row(row, vocab_size))) {
+                break;
+            }
         }
     }
-    return candidates;
 }
 
 // Drafts one position of every block per Markov step inference: the position's logits get the Markov bias that
 // follows the token drafted before it, the anchor at the first position.
-std::vector<std::vector<int64_t>> CandidateSelector::walk_markov_steps(const std::vector<DraftBlockRows>& blocks,
-                                                                       const ov::Tensor& logits) {
+void CandidateSelector::walk_markov_steps(const std::vector<DraftBlockRows>& blocks,
+                                          const ov::Tensor& logits,
+                                          const std::vector<BlockDrafter*>& drafters) {
     const size_t vocab_size = row_width(logits);
-    std::vector<std::vector<int64_t>> candidates(blocks.size());
+    std::vector<int64_t> previous_tokens(blocks.size());
+    for (size_t idx = 0; idx < blocks.size(); ++idx) {
+        previous_tokens[idx] = blocks[idx].anchor_token;
+    }
     std::vector<size_t> walking(blocks.size());
     std::iota(walking.begin(), walking.end(), size_t{0});
     for (size_t position = 0; !walking.empty(); ++position) {
         ov::Tensor prev_token_ids(ov::element::i64, {walking.size()});
         for (size_t step = 0; step < walking.size(); ++step) {
-            const size_t idx = walking[step];
-            prev_token_ids.data<int64_t>()[step] = position == 0 ? blocks[idx].anchor_token : candidates[idx].back();
+            prev_token_ids.data<int64_t>()[step] = previous_tokens[walking[step]];
         }
         m_markov_step->set_tensor("prev_token_ids", prev_token_ids);
         infer(*m_markov_step);
@@ -131,35 +161,41 @@ std::vector<std::vector<int64_t>> CandidateSelector::walk_markov_steps(const std
         std::vector<size_t> still_walking;
         for (size_t step = 0; step < walking.size(); ++step) {
             const size_t idx = walking[step];
-            const float* backbone = row_data(logits, blocks[idx].first_row + position);
-            const float* bias = markov_bias.data<const float>() + step * vocab_size;
-            size_t best = 0;
-            float best_value = -std::numeric_limits<float>::infinity();
-            for (size_t token = 0; token < vocab_size; ++token) {
-                float value = backbone[token] * m_output_multiplier;
-                if (m_final_logit_softcapping > 0.0f) {
-                    value = std::tanh(value / m_final_logit_softcapping) * m_final_logit_softcapping;
-                }
-                value += bias[token];
-                if (value > best_value) {
-                    best_value = value;
-                    best = token;
-                }
+            auto& drafter = *drafters[idx];
+            auto& row = backbone_row(row_data(logits, blocks[idx].first_row + position), vocab_size);
+            float* corrected = row.data<float>();
+            std::transform(corrected,
+                           corrected + vocab_size,
+                           markov_bias.data<const float>() + step * vocab_size,
+                           corrected,
+                           std::plus<float>());
+            std::optional<int64_t> token;
+            if (logit_processors_keep_argmax(drafter.config())) {
+                token = argmax(corrected, vocab_size);
+                drafter.append(*token, 0.0f, nullptr);
+            } else {
+                token = drafter.sample(row);
             }
-            candidates[idx].push_back(static_cast<int64_t>(best));
+            // the next position's Markov bias needs the token drafted here
+            if (!token) {
+                continue;
+            }
+            previous_tokens[idx] = *token;
             if (position + 1 < blocks[idx].num_candidates) {
                 still_walking.push_back(idx);
             }
         }
         walking = std::move(still_walking);
     }
-    return candidates;
 }
 
-// Scores the rows of all blocks with one candidate scorer inference and walks each block's Top-K lattice greedily.
-std::vector<std::vector<int64_t>> CandidateSelector::select_scored_candidates(const std::vector<DraftBlockRows>& blocks,
-                                                                              const ov::Tensor& logits,
-                                                                              const ov::Tensor& hidden_states) {
+// Scores the rows of all blocks with one candidate scorer inference and walks each block's Top-K lattice: greedily, by
+// drawing from the K candidates of every row for a sampled request, or through the draft sampler when the request's
+// logit processors can change the argmax.
+void CandidateSelector::select_scored_candidates(const std::vector<DraftBlockRows>& blocks,
+                                                 const ov::Tensor& logits,
+                                                 const ov::Tensor& hidden_states,
+                                                 const std::vector<BlockDrafter*>& drafters) {
     const size_t vocab_size = row_width(logits);
     const size_t num_blocks = blocks.size();
     ov::Tensor anchor_token_ids(ov::element::i64, {num_blocks});
@@ -185,15 +221,42 @@ std::vector<std::vector<int64_t>> CandidateSelector::select_scored_candidates(co
     const auto edge_scores = scorer.get_tensor("edge_scores");
     const auto candidate_ids = scorer.get_tensor("candidate_ids");
     validate_candidate_lattice(edge_scores, candidate_ids, num_rows, vocab_size);
-    std::vector<std::vector<int64_t>> candidates;
-    candidates.reserve(num_blocks);
     for (size_t idx = 0; idx < num_blocks; ++idx) {
-        candidates.push_back(greedy_candidate_path(edge_scores,
-                                                   candidate_ids,
-                                                   static_cast<size_t>(begins[idx]),
-                                                   blocks[idx].num_candidates));
+        auto& drafter = *drafters[idx];
+        const auto& config = drafter.config();
+        const size_t first_row = static_cast<size_t>(begins[idx]);
+        const size_t num_candidates = blocks[idx].num_candidates;
+        if (config.is_multinomial()) {
+            for (auto& candidate : sample_candidate_path(edge_scores,
+                                                         candidate_ids,
+                                                         first_row,
+                                                         num_candidates,
+                                                         config.temperature,
+                                                         drafter.lattice_rng())) {
+                drafter.append(candidate.token, candidate.log_prob, std::move(candidate.proposal));
+            }
+        } else if (logit_processors_keep_argmax(config)) {
+            for (const int64_t token : greedy_candidate_path(edge_scores, candidate_ids, first_row, num_candidates)) {
+                drafter.append(token, 0.0f, nullptr);
+            }
+        } else {
+            walk_candidate_lattice(candidate_ids,
+                                   first_row,
+                                   num_candidates,
+                                   [&](size_t position, size_t previous_index) -> std::optional<int64_t> {
+                                       const size_t logits_row = blocks[idx].first_row + position - first_row;
+                                       auto& row = backbone_row(row_data(logits, logits_row), vocab_size);
+                                       fill_candidate_row(row.data<float>(),
+                                                          vocab_size,
+                                                          edge_scores,
+                                                          candidate_ids,
+                                                          position,
+                                                          previous_index,
+                                                          row.data<float>());
+                                       return drafter.sample(row);
+                                   });
+        }
     }
-    return candidates;
 }
 
 void CandidateSelector::infer(ov::InferRequest& request) {

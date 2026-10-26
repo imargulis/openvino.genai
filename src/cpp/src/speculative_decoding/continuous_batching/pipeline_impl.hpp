@@ -197,6 +197,11 @@ protected:
                                     dflash_cb::DraftState& state,
                                     size_t first_output_row,
                                     std::optional<dflash_cb::DraftBlockRows>& block);
+    // Drafts the candidates of every block into its request with the candidate selector; returns their number.
+    size_t draft_dflash_blocks(const std::vector<dflash_cb::DraftBlockRows>& blocks,
+                               const std::vector<SequenceGroup::Ptr>& block_requests,
+                               const ov::Tensor& logits,
+                               const ov::Tensor& hidden_states);
     int64_t m_dflash_mask_token_id = -1;
     size_t m_dflash_candidate_position_offset = 1;
     std::shared_ptr<dflash_cb::CandidateSelector> m_dflash_candidate_selector;
