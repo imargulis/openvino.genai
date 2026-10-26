@@ -1330,14 +1330,43 @@ def test_dflash_rejects_prefix_caching_mismatch(dflash_model_paths):
         )
 
 
-def test_dflash_target_preemption_fails_clearly(dflash_model_paths):
-    # The draft cannot recompute rows dropped on preemption, whether the target or the draft is preempted.
+def test_dflash_draft_kv_cache_limit_matches_main_only(dflash_model_paths):
+    # The draft never preempts: a request whose window does not fit the draft cache decodes without candidates.
+    config = _dflash_config(max_new_tokens=64)
+    reference = _main_only_ids(dflash_model_paths[0], DFLASH_PROMPTS, config)
+    target_path, draft_path = dflash_model_paths
+    draft_scheduler_config = dict_to_scheduler_config({"num_kv_blocks": 6, "dynamic_split_fuse": True})
+    pipe = ContinuousBatchingPipeline(
+        target_path,
+        SchedulerConfig(),
+        "CPU",
+        {
+            **DFLASH_PARITY_PROPERTIES,
+            "draft_model": draft_model(
+                draft_path, "CPU", scheduler_config=draft_scheduler_config, **DFLASH_PARITY_PROPERTIES
+            ),
+        },
+    )
+
+    results = pipe.generate(DFLASH_PROMPTS, [config] * len(DFLASH_PROMPTS))
+
+    assert [result.m_generation_ids for result in results] == reference
+    assert results[0].extended_perf_metrics.get_num_draft_tokens() > 0
+
+
+def test_dflash_target_preemption_completes(dflash_model_paths):
+    # The target recomputes preempted requests and the draft drafts for them again once the target catches up. Parity
+    # is not asserted: candidates validated across a target preemption can diverge from the target alone, with any
+    # speculative draft.
     config = _dflash_config(max_new_tokens=64)
     scheduler_config = dict_to_scheduler_config({"num_kv_blocks": 6, "dynamic_split_fuse": True, "max_num_batched_tokens": 256})
     pipe = _dflash_pipeline(dflash_model_paths, scheduler_config)
+    prompt_ids = [pipe.get_tokenizer().encode(prompt).input_ids for prompt in DFLASH_PROMPTS]
 
-    with pytest.raises(RuntimeError, match=r"DFlash draft (is ahead of the target|request \d+ was preempted)"):
-        pipe.generate(DFLASH_PROMPTS, [config] * len(DFLASH_PROMPTS))
+    results = pipe.generate(prompt_ids, [config] * len(prompt_ids))
+
+    assert all(len(result.m_generation_ids[0]) == config.max_new_tokens for result in results)
+    assert results[0].extended_perf_metrics.get_num_draft_tokens() > 0
 
 
 EAGLE3_FIXED_PROMPT_BASE = (
