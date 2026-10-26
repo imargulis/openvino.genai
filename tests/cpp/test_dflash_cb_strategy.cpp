@@ -398,6 +398,51 @@ TEST(DFlashCBDraftWindow, PlansBlockOnceHiddenStatesReachTheSeed) {
     ASSERT_EQ(plan_draft_block(3, 9, 10, 8, 16, 1).block_rows, 0);
 }
 
+TEST(DFlashCBCandidateSelection, ArgmaxDraftsEveryBlockFromItsOwnRows) {
+    using ov::genai::dflash_cb::DraftBlockRows;
+    // rows 0-2 belong to the first block, rows 3-4 to a split block that drafts nothing, rows 5-7 to the last block,
+    // which validates two candidates near max_new_tokens
+    const std::vector<int64_t> argmax = {10, 11, 12, 0, 0, 20, 21, 22};
+    ov::Tensor logits(ov::element::f32, {argmax.size(), 1, 32});
+    std::fill_n(logits.data<float>(), logits.get_size(), 0.0f);
+    for (size_t row = 0; row < argmax.size(); ++row) {
+        logits.data<float>()[row * 32 + argmax[row]] = 1.0f;
+    }
+    const auto candidates = ov::genai::dflash_cb::CandidateSelector{}.select(
+        {DraftBlockRows{7, 0, 3, 3}, DraftBlockRows{8, 5, 3, 2}}, logits, {});
+    ASSERT_EQ(candidates, (std::vector<std::vector<int64_t>>{{10, 11, 12}, {20, 21}}));
+}
+
+TEST(DFlashCBCandidateSelection, RejectsBlockRowsPastTheOutput) {
+    using ov::genai::dflash_cb::DraftBlockRows;
+    ov::Tensor logits(ov::element::f32, {4, 1, 8});
+    std::fill_n(logits.data<float>(), logits.get_size(), 0.0f);
+    ASSERT_THROW(ov::genai::dflash_cb::CandidateSelector{}.select({DraftBlockRows{7, 2, 3, 3}}, logits, {}),
+                 ov::Exception);
+    ASSERT_THROW(ov::genai::dflash_cb::CandidateSelector{}.select({DraftBlockRows{7, 0, 2, 3}}, logits, {}),
+                 ov::Exception);
+}
+
+TEST(DFlashCBCandidateSelection, GreedyPathWalksEachBlockFromItsAnchor) {
+    // two blocks of two rows, K = 2: edge_scores[s, i, j] scores candidate j at row s after candidate i at row s - 1
+    ov::Tensor edge_scores(ov::element::f32, {4, 2, 2});
+    ov::Tensor candidate_ids(ov::element::i64, {4, 2});
+    const std::vector<float> scores = {
+        0.0f, 1.0f, /*unused*/ 5.0f, 5.0f,  // row 0 from the anchor: candidate 1
+        3.0f, 2.0f, 0.0f, 4.0f,             // row 1 after candidate 1: candidate 1
+        2.0f, 1.0f, /*unused*/ 0.0f, 9.0f,  // row 2 from the anchor: candidate 0
+        1.0f, 1.0f, 0.0f, 0.0f,             // row 3 after candidate 0: a tie takes candidate 0
+    };
+    std::copy(scores.begin(), scores.end(), edge_scores.data<float>());
+    const std::vector<int64_t> ids = {10, 11, 12, 13, 20, 21, 22, 23};
+    std::copy(ids.begin(), ids.end(), candidate_ids.data<int64_t>());
+
+    using ov::genai::dflash_cb::greedy_candidate_path;
+    ASSERT_EQ(greedy_candidate_path(edge_scores, candidate_ids, 0, 2), (std::vector<int64_t>{11, 13}));
+    ASSERT_EQ(greedy_candidate_path(edge_scores, candidate_ids, 2, 2), (std::vector<int64_t>{20, 22}));
+    ASSERT_EQ(greedy_candidate_path(edge_scores, candidate_ids, 2, 1), (std::vector<int64_t>{20}));
+}
+
 TEST(DFlashCBDraftWindow, BoundsDraftBatchBudget) {
     using ov::genai::dflash_cb::draft_max_num_batched_tokens;
     using ov::genai::dflash_cb::MAX_DRAFT_BLOCK_ROWS;
@@ -501,11 +546,9 @@ protected:
             std::optional<ov::genai::dflash_cb::DraftBlockRows> block;
             const size_t gathered_rows = finish_dflash_draft_step(group, draft_state, 0, block);
             if (block) {
-                const size_t vocab_size = logits.get_shape().back();
-                for (size_t candidate = 0; candidate < block->num_candidates; ++candidate) {
-                    const float* row = logits.data<const float>() + (block->first_row + candidate) * vocab_size;
-                    group->get_running_sequences().front()->append_token(std::max_element(row, row + vocab_size) - row,
-                                                                         0.0f);
+                const auto candidates = ov::genai::dflash_cb::CandidateSelector{}.select({*block}, logits, {});
+                for (const int64_t token : candidates.front()) {
+                    group->get_running_sequences().front()->append_token(token, 0.0f);
                 }
             }
             return gathered_rows;

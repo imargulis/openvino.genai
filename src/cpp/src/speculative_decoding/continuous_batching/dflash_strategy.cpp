@@ -49,6 +49,9 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     OPENVINO_ASSERT(!m_rt_info.target_layer_ids.empty(), "DFlash target_layer_ids cannot be empty.");
     OPENVINO_ASSERT(main_model_desc.scheduler_config.dynamic_split_fuse,
                     "DFlash requires scheduler_config.dynamic_split_fuse=true.");
+    OPENVINO_ASSERT(m_rt_info.input_embedding_scale > 0.0f, "DFlash input_embedding_scale must be positive.");
+    OPENVINO_ASSERT(m_rt_info.output_multiplier > 0.0f, "DFlash output_multiplier must be positive.");
+    OPENVINO_ASSERT(m_rt_info.final_logit_softcapping >= 0.0f, "DFlash final_logit_softcapping cannot be negative.");
     auto main_model = main_model_desc.model;
     auto draft_model = draft_model_desc.model;
     OPENVINO_ASSERT(main_model && draft_model, "DFlash requires both target and draft models.");
@@ -77,14 +80,23 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     // The VLM draft keeps its external inputs_embeds; the LLM draft gets the target embedding grafted in.
     if (m_inputs_embedder) {
         OPENVINO_ASSERT(needs_embedding_attach, "DFlash VLM draft model must be inputs_embeds-native.");
+        utils::dflash::scale_draft_inputs_embeds(draft_model, m_rt_info.input_embedding_scale);
     } else if (needs_embedding_attach) {
-        utils::dflash::attach_target_embedding_to_draft(main_model, draft_model);
+        utils::dflash::attach_target_embedding_to_draft(main_model, draft_model, m_rt_info.input_embedding_scale);
     }
+    // A gated Markov head scores the candidates from the draft hidden states as well as from its logits.
+    const bool markov_head_reads_hidden_states =
+        m_rt_info.markov_head_computation && utils::has_input(m_rt_info.markov_head_computation, "draft_hidden_states");
     if (needs_lm_head_graft) {
-        utils::dflash::attach_target_lm_head_to_draft(main_model, draft_model);
+        utils::dflash::attach_target_lm_head_to_draft(main_model, draft_model, markov_head_reads_hidden_states);
     }
+    OPENVINO_ASSERT(!markov_head_reads_hidden_states || model_has_output(draft_model, "last_hidden_state"),
+                    "A DFlash draft with a gated Markov head must expose 'last_hidden_state'.");
 
     auto [main_scheduler_config, draft_scheduler_config] = init_speculative_models(main_model_desc, draft_model_desc);
+    if (markov_head_reads_hidden_states) {
+        utils::dflash::gather_last_hidden_state_with_logits(draft_model);
+    }
     OPENVINO_ASSERT(main_scheduler_config.enable_prefix_caching == draft_scheduler_config.enable_prefix_caching,
                     "DFlash main and draft pipelines must use the same enable_prefix_caching setting.");
     validate_target_has_no_unmanaged_state(main_model);
@@ -104,8 +116,10 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     m_tokenizer = main_model_desc.tokenizer;
     m_generation_config = main_model_desc.generation_config;
     const std::string draft_device = draft_model_desc.device.empty() ? main_model_desc.device : draft_model_desc.device;
-    const ov::AnyMap draft_properties =
+    ov::AnyMap draft_properties =
         draft_model_desc.properties.empty() ? main_model_desc.properties : draft_model_desc.properties;
+    auto candidate_selector = std::make_shared<dflash_cb::CandidateSelector>(m_rt_info, draft_device, draft_properties);
+    utils::dflash::apply_dflash_gpu_compile_properties(m_rt_info, draft_device, draft_properties);
 
     if (m_inputs_embedder) {
         m_main_pipeline = std::make_shared<ContinuousBatchingForDFlashDecodingImpl>(main_model,
@@ -125,7 +139,8 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                                                                                     draft_properties,
                                                                                     false,
                                                                                     m_rt_info.mask_token_id,
-                                                                                    m_rt_info.candidate_position_offset);
+                                                                                    m_rt_info.candidate_position_offset,
+                                                                                    candidate_selector);
     } else {
         m_main_pipeline = std::make_shared<ContinuousBatchingForDFlashDecodingImpl>(main_model,
                                                                                    m_tokenizer,
@@ -142,7 +157,8 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                                                                                     draft_properties,
                                                                                     false,
                                                                                     m_rt_info.mask_token_id,
-                                                                                    m_rt_info.candidate_position_offset);
+                                                                                    m_rt_info.candidate_position_offset,
+                                                                                    candidate_selector);
     }
     m_main_pipeline->set_hidden_state_export_needed(true);
 
