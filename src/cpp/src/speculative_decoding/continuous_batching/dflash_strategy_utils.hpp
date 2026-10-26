@@ -32,6 +32,15 @@ struct DraftState {
     size_t candidate_rows = 0;
 };
 
+// The rows of one request's forwarded draft block in the draft outputs, which hold the gathered rows of all
+// blocks of a step one block after another.
+struct DraftBlockRows {
+    size_t first_row = 0;
+    size_t num_rows = 0;
+    // the leading rows the target validates, at most num_rows
+    size_t num_candidates = 0;
+};
+
 inline void ensure_vlm_generation_config(const GenerationConfig& config) {
     // These checks cover only VLM representation/output modes that cannot be expressed faithfully with
     // row-aligned multimodal prompt IDs.
@@ -82,26 +91,23 @@ struct DraftRowSelection {
 };
 
 // Rows of the target's exported hidden states that the draft has not seen yet. The exported rows end at
-// the target's processed length, and their last `rejected_candidates` rows belong to rejected candidates.
+// the target's processed length, followed by the rows of the rejected candidates; a validation window that the
+// token budget split leaves its last candidates without rows. A target that recomputes preempted tokens replays
+// rows the draft has already seen.
 inline DraftRowSelection select_new_target_rows(uint64_t request_id,
                                                 size_t known_rows,
                                                 size_t target_rows,
                                                 size_t hidden_rows,
                                                 size_t rejected_candidates) {
-    OPENVINO_ASSERT(target_rows >= known_rows,
-                    "DFlash draft is ahead of the target for request ", request_id, " (draft ", known_rows,
-                    " positions, target ", target_rows, "). The target likely recomputed preempted tokens, "
-                    "which the DFlash draft does not support; increase the cache size or use dynamic cache allocation.");
-    const size_t new_rows = target_rows - known_rows;
-    if (new_rows == 0) {
+    if (target_rows <= known_rows) {
         return {};
     }
-    OPENVINO_ASSERT(hidden_rows >= rejected_candidates + new_rows,
+    const size_t new_rows = target_rows - known_rows;
+    OPENVINO_ASSERT(hidden_rows >= new_rows,
                     "DFlash target exported ", hidden_rows, " hidden-state rows for request ", request_id,
-                    ", but the draft needs ", new_rows, " after dropping ", rejected_candidates,
-                    " rejected candidates.");
-    const size_t kept_rows = hidden_rows - rejected_candidates;
-    return {kept_rows - new_rows, new_rows};
+                    ", but the draft needs ", new_rows, ".");
+    const size_t rejected_rows = std::min(rejected_candidates, hidden_rows - new_rows);
+    return {hidden_rows - rejected_rows - new_rows, new_rows};
 }
 
 struct DraftBlockPlan {

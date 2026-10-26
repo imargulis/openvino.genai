@@ -351,12 +351,26 @@ TEST(DFlashCBDraftWindow, SelectsUnseenTargetRows) {
 
     // the target skipped the request this step: its published rows are stale
     ASSERT_EQ(select_new_target_rows(0, 12, 12, 4, 3).count, 0);
+
+    // the token budget split the validation window [seed, c1, c2, c3, c4] after c3, and c1 was rejected: the seed
+    // row and the rows of c1-c3
+    auto split = select_new_target_rows(0, 10, 11, 4, 4);
+    ASSERT_EQ(split.begin, 0);
+    ASSERT_EQ(split.count, 1);
 }
 
-TEST(DFlashCBDraftWindow, RejectsTargetRowsBehindTheDraft) {
+TEST(DFlashCBDraftWindow, IgnoresRowsTheTargetRecomputes) {
     using ov::genai::dflash_cb::select_new_target_rows;
-    // the target recomputed preempted tokens and reports fewer positions than the draft holds
-    ASSERT_THROW(select_new_target_rows(0, 12, 10, 4, 0), ov::Exception);
+    // the target recomputes preempted tokens and replays positions the draft holds
+    ASSERT_EQ(select_new_target_rows(0, 12, 10, 4, 0).count, 0);
+    // a recompute chunk that passes the draft brings the positions after it
+    auto caught_up = select_new_target_rows(0, 12, 14, 8, 0);
+    ASSERT_EQ(caught_up.begin, 6);
+    ASSERT_EQ(caught_up.count, 2);
+}
+
+TEST(DFlashCBDraftWindow, RejectsMissingTargetRows) {
+    using ov::genai::dflash_cb::select_new_target_rows;
     // the target exported fewer rows than the draft needs
     ASSERT_THROW(select_new_target_rows(0, 4, 10, 4, 0), ov::Exception);
 }
@@ -475,15 +489,26 @@ protected:
         }
 
         // Forwards `scheduled_rows` of the request's window (all by default) and finishes the step the way the
-        // draft multistep does.
-        void forward_window(const ov::genai::SequenceGroup::Ptr& group,
-                            const ov::Tensor& logits,
-                            std::optional<size_t> scheduled_rows = std::nullopt) {
+        // draft multistep does, drafting the forwarded block with the argmax of its logits. Returns the number of
+        // output rows the forward gathered.
+        size_t forward_window(const ov::genai::SequenceGroup::Ptr& group,
+                              const ov::Tensor& logits,
+                              std::optional<size_t> scheduled_rows = std::nullopt) {
             auto& draft_state = state(group->get_request_id());
             const size_t context_rows = draft_state.pending_rows ? draft_state.pending_rows.get_shape()[0] : 0;
             group->schedule_tokens(scheduled_rows.value_or(context_rows + draft_state.block_rows));
             group->finish_iteration();
-            finish_dflash_draft_step(group, draft_state, logits, 0);
+            std::optional<ov::genai::dflash_cb::DraftBlockRows> block;
+            const size_t gathered_rows = finish_dflash_draft_step(group, draft_state, 0, block);
+            if (block) {
+                const size_t vocab_size = logits.get_shape().back();
+                for (size_t candidate = 0; candidate < block->num_candidates; ++candidate) {
+                    const float* row = logits.data<const float>() + (block->first_row + candidate) * vocab_size;
+                    group->get_running_sequences().front()->append_token(std::max_element(row, row + vocab_size) - row,
+                                                                         0.0f);
+                }
+            }
+            return gathered_rows;
         }
     };
 
@@ -558,12 +583,75 @@ TEST_F(DFlashCBPipelineTest, CandidatesReplaceThePlaceholders) {
     ASSERT_EQ(group->get_num_processed_tokens(), 12);
 }
 
-TEST_F(DFlashCBPipelineTest, RejectsASplitBlock) {
+TEST_F(DFlashCBPipelineTest, SplitBlockCommitsTheContextAndDraftsNothing) {
     DraftInstance draft;
     auto group = start_with_block(draft);
 
-    // 8 context rows and 2 of the 4 block rows
-    ASSERT_THROW(draft.forward_window(group, make_logits({20, 21, 22}), 10), ov::Exception);
+    // 8 context rows and 2 of the 4 block rows; the model runner gathered the row after the seed
+    ASSERT_EQ(draft.forward_window(group, make_logits({20}), 10), 1);
+
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7}));
+    ASSERT_EQ(draft.state(0).committed_rows, 8);
+    ASSERT_FALSE(draft.state(0).pending_rows);
+    ASSERT_EQ(draft.state(0).block_rows, 0);
+}
+
+TEST_F(DFlashCBPipelineTest, WindowThatDoesNotFitTheCacheKeepsItsRowsForTheNextStep) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+    // the draft scheduler left the window unscheduled
+    std::optional<ov::genai::dflash_cb::DraftBlockRows> block;
+    ASSERT_EQ(draft.finish_dflash_draft_step(group, draft.state(0), 0, block), 0);
+    ASSERT_FALSE(block);
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7}));
+    ASSERT_EQ(draft.state(0).committed_rows, 0);
+
+    // the target decoded the request alone and sampled 30 at position 9
+    draft.update_request(0, target_step({7, 30}, 9, make_hidden_rows(1, 100.0f)), true);
+
+    ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 9);
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7, 30, MASK_TOKEN, MASK_TOKEN, MASK_TOKEN}));
+    ASSERT_EQ(group->get_num_available_tokens_for_batching(), 9 + 4);
+    draft.forward_window(group, make_logits({40, 41, 42}));
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7, 30, 40, 41, 42}));
+    ASSERT_EQ(draft.state(0).committed_rows, 9);
+}
+
+TEST_F(DFlashCBPipelineTest, TargetRecomputeDraftsNoBlockUntilItCatchesUp) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+    draft.forward_window(group, make_logits({20, 21, 22}));
+    draft.update_request(0, target_step({7, 20, 21, 22, 23}, 12, make_hidden_rows(4, 100.0f)), true);
+    draft.forward_window(group, make_logits({24, 25, 26}));
+    ASSERT_EQ(draft.state(0).committed_rows, 12);
+
+    // the target was preempted and recomputes: it reports 6 positions and replays their rows
+    auto result = draft.update_request(0, target_step({7, 20, 21, 22, 23, 24, 25, 26}, 6, make_hidden_rows(6, 0.0f)), true);
+    ASSERT_EQ(result.removed_tokens_cnt, 0);
+    ASSERT_FALSE(draft.state(0).pending_rows);
+    ASSERT_EQ(draft.state(0).block_rows, 0);
+    ASSERT_TRUE(group->is_waiting());
+
+    // the recompute passes the draft and validates the candidates: 24 accepted, 25 corrected to 35
+    draft.update_request(0, target_step({7, 20, 21, 22, 23, 24, 35}, 14, make_hidden_rows(10, 200.0f)), true);
+    ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 2);
+    ASSERT_EQ(draft.state(0).pending_rows.data<float>()[0], 200.0f + 6 * HIDDEN_SIZE);
+    ASSERT_EQ(draft.state(0).block_rows, 4);
+}
+
+TEST_F(DFlashCBPipelineTest, BlockNeedsAContextRow) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+    // the context rows fit, the block was split
+    draft.forward_window(group, make_logits({20}), 10);
+    ASSERT_EQ(draft.state(0).committed_rows, 8);
+
+    // the target skipped the request: the draft knows the rows up to the seed but has no context row left
+    draft.update_request(0, target_step({7}, 8, make_hidden_rows(8, 0.0f)), true);
+
+    ASSERT_EQ(draft.state(0).block_rows, 0);
+    ASSERT_EQ(generated(group), (std::vector<int64_t>{7}));
+    ASSERT_TRUE(group->is_waiting());
 }
 
 TEST_F(DFlashCBPipelineTest, PrefillChunkCommitsOnlyTheForwardedRows) {
@@ -652,8 +740,10 @@ TEST_F(DFlashCBPipelineTest, UnscheduledWindowDropsPlaceholdersAndOwnsItsRows) {
     auto group = start_with_block(draft);
     ov::Tensor view = draft.state(0).pending_rows;
 
-    draft.finish_dflash_draft_step(group, draft.state(0), {}, 0);
+    std::optional<ov::genai::dflash_cb::DraftBlockRows> block;
+    ASSERT_EQ(draft.finish_dflash_draft_step(group, draft.state(0), 0, block), 0);
 
+    ASSERT_FALSE(block);
     ASSERT_EQ(generated(group), (std::vector<int64_t>{7}));
     ASSERT_EQ(draft.state(0).pending_rows.get_shape()[0], 8);
     ASSERT_TRUE(draft.state(0).owns_pending_rows);

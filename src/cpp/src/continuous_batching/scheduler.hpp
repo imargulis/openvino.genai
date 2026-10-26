@@ -81,6 +81,7 @@ public:
 
 private:
     bool m_can_use_partial_preemption;
+    bool m_preemption_enabled = true;
 
     SchedulerConfig m_config;
     std::shared_ptr<const KVPagedAttentionGlobalData> m_kv_paged_attention_global_data;
@@ -533,6 +534,12 @@ public:
         m_expected_num_scheduled_tokens.erase(request_id);
     }
 
+    // For a pipeline whose requests cannot recompute preempted tokens: a request that does not fit the cache is
+    // left unscheduled instead of evicting another one.
+    void disable_preemption() {
+        m_preemption_enabled = false;
+    }
+
 private:
     static size_t _num_running_sequence_groups(const std::vector<SequenceGroup::Ptr>& sequence_groups) {
         size_t num_running = 0;
@@ -607,6 +614,9 @@ private:
     }
 
     void _apply_preemption(size_t sequence_group_id, const std::vector<SequenceGroup::Ptr>& sequence_groups) {
+        if (!m_preemption_enabled) {
+            return;
+        }
         SequenceGroup::Ptr sequence_group = sequence_groups[sequence_group_id];
 
         // check whether current sequence requires a new slot / block
