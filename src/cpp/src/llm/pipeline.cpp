@@ -33,11 +33,27 @@ std::shared_ptr<ov::Model> peek_draft_model(const ov::AnyMap& properties) {
     return it->second.as<ov::genai::ModelDesc>().model;
 }
 
+bool is_dflash_draft(const ov::AnyMap& properties) {
+    auto it = properties.find(ov::genai::utils::DRAFT_MODEL_ARG_NAME);
+    if (it == properties.end()) {
+        return false;
+    }
+    const auto& draft = it->second.as<ov::genai::ModelDesc>();
+    auto dflash_mode = draft.properties.find("dflash_mode");
+    return dflash_mode != draft.properties.end() && dflash_mode->second.as<bool>();
+}
+
 bool should_use_stateful_pipeline(bool is_npu_requested,
                                   bool has_draft_model,
                                   const std::string& attention_backend,
                                   const std::shared_ptr<ov::Model>& main_model,
                                   const ov::AnyMap& properties) {
+    if (has_draft_model && is_dflash_draft(properties)) {
+        const auto& draft = properties.at(ov::genai::utils::DRAFT_MODEL_ARG_NAME).as<ov::genai::ModelDesc>();
+        OPENVINO_ASSERT(!is_npu_requested && !ov::genai::utils::is_npu_requested(draft.device, draft.properties),
+                        "DFlash speculative decoding requires the Continuous Batching/Paged Attention backend on CPU or GPU; "
+                        "NPU is not supported.");
+    }
     if (is_npu_requested) {
         return true;
     }
