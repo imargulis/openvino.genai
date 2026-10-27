@@ -261,7 +261,6 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::d
     const bool has_window = std::any_of(m_requests.begin(), m_requests.end(), [](const SequenceGroup::Ptr& request) {
         return !request->is_waiting() && !request->has_finished();
     });
-    const auto step_start = std::chrono::steady_clock::now();
     if (has_window) {
         step();
     }
@@ -297,7 +296,8 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::d
     }
 
     size_t num_candidates = 0;
-    float selection_inference_duration = 0.0f;
+    float markov_head_duration = 0.0f;
+    float candidate_sampling_duration = 0.0f;
     if (!blocks.empty()) {
         auto& infer_request = m_model_runner->get_infer_request();
         const ov::Tensor logits = infer_request.get_tensor("logits");
@@ -307,10 +307,13 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::d
         const ov::Tensor hidden_states = m_dflash_candidate_selector->reads_hidden_states()
                                              ? infer_request.get_tensor("last_hidden_state")
                                              : ov::Tensor{};
+        const auto selection_start = std::chrono::steady_clock::now();
         num_candidates = draft_dflash_blocks(blocks, block_requests, logits, hidden_states);
-        selection_inference_duration = m_dflash_candidate_selector->get_inference_duration();
+        const float selection_duration =
+            std::chrono::duration<float, std::micro>(std::chrono::steady_clock::now() - selection_start).count();
+        markov_head_duration = m_dflash_candidate_selector->get_inference_duration();
+        candidate_sampling_duration = selection_duration - markov_head_duration;
     }
-    const float step_duration = PerfMetrics::get_microsec(std::chrono::steady_clock::now() - step_start);
     for (auto state_it = m_dflash_draft_states.begin(); state_it != m_dflash_draft_states.end();) {
         const bool is_live = std::any_of(m_requests.begin(), m_requests.end(), [&](const SequenceGroup::Ptr& request) {
             return request->get_request_id() == state_it->first;
@@ -324,10 +327,18 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::d
     sync_generated_embeddings();
 
     if (forwarded) {
-        raw_perf_metrics.m_durations.emplace_back(step_duration);
-        raw_perf_metrics.m_inference_durations[0] +=
-            MicroSeconds(get_metrics().inference_duration + selection_inference_duration);
-        raw_perf_metrics.m_batch_sizes.emplace_back(num_candidates);
+        const auto record = [num_candidates](RawPerfMetrics& metrics, float duration) {
+            metrics.m_durations.emplace_back(duration);
+            metrics.m_inference_durations[0] += MicroSeconds(duration);
+            metrics.m_batch_sizes.emplace_back(num_candidates);
+        };
+        // the draft forward and the sampler call of step() count as the step's backbone and sampling
+        const auto step_metrics = get_metrics();
+        record(raw_perf_metrics, step_metrics.inference_duration);
+        if (m_dflash_candidate_selector->has_markov_head()) {
+            record(dflash_markov_head_perf_metrics, markov_head_duration);
+        }
+        record(dflash_sampling_perf_metrics, step_metrics.sampling_duration + candidate_sampling_duration);
     }
 }
 

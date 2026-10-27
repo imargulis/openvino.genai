@@ -54,6 +54,10 @@ public:
 
     CandidateSelector(const utils::dflash::DFlashRTInfo& rt_info, const std::string& device, const ov::AnyMap& properties);
 
+    bool has_markov_head() const {
+        return m_candidate_scorer.has_value() || m_markov_step.has_value();
+    }
+
     // A gated Markov head (DFlash-2) also scores the draft's last_hidden_state of every row.
     bool reads_hidden_states() const {
         return m_reads_hidden_states;
