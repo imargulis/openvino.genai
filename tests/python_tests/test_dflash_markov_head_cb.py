@@ -321,6 +321,25 @@ def test_greedy_requests_with_penalties_match_target(dflash_models, draft):
     _assert_drafted(dflash_models, results)
 
 
+@pytest.mark.parametrize("draft", DRAFTS)
+def test_draft_steps_report_their_parts(dflash_models, draft):
+    # Every draft step reports its backbone forward, its Markov head inferences for a draft with a Markov head, and its
+    # sampling; the rest of the step is scheduling, input preparation and candidate submission.
+    _, results = _generate(_pipeline(dflash_models, draft), _prompts(), _generation_config())
+    metrics = results[0].extended_perf_metrics
+    parts = [metrics.draft_model_metrics, metrics.draft_sampling_metrics]
+    if DRAFTS[draft][0] == "dflash":
+        assert not metrics.draft_markov_head_metrics.raw_metrics.m_durations
+    else:
+        parts.append(metrics.draft_markov_head_metrics)
+    steps = list(metrics.draft_step_metrics.raw_metrics.m_durations)
+    part_durations = [list(part.raw_metrics.m_durations) for part in parts]
+    assert steps and all(len(durations) == len(steps) for durations in part_durations)
+    for step, *step_parts in zip(steps, *part_durations):
+        # the step is truncated to whole microseconds
+        assert sum(step_parts) <= step + 0.002
+
+
 def test_draft_without_token_type_ids_is_rejected(dflash_models, tmp_path):
     draft_dir = tmp_path / "no_token_type_ids"
     shutil.copytree(dflash_models["dflash"], draft_dir)
