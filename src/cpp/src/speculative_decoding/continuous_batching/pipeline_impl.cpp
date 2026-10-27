@@ -914,9 +914,12 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::m
     if (dflash_mode_enabled && !m_is_validation_mode_enabled) {
         // A DFlash draft forwards each planned window once and drafts all its candidates from that forward.
         const bool has_windows = !m_dflash_draft_windows.empty();
-        const auto step_start = std::chrono::steady_clock::now();
+        // A step that schedules no row, when the draft KV cache is full, returns before its forward and keeps the
+        // previous step's durations, so it records no parts.
+        bool forwarded = false;
         if (has_windows) {
             step();
+            forwarded = get_metrics().scheduled_requests > 0;
         }
 
         // The model runner gathers the forwarded block rows after the candidate position offset, in request order.
@@ -966,29 +969,41 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::m
         }
         m_dflash_draft_windows.clear();
         size_t num_candidates = 0;
-        float selection_inference_duration = 0.0f;
+        float markov_head_duration = 0.0f;
+        float candidate_sampling_duration = 0.0f;
         if (!blocks.empty()) {
             auto& infer_request = m_model_runner->get_infer_request();
             const ov::Tensor hidden_states = m_dflash_candidate_selector->reads_hidden_states()
                                                  ? infer_request.get_tensor("last_hidden_state")
                                                  : ov::Tensor{};
+            const auto selection_start = std::chrono::steady_clock::now();
             num_candidates =
                 draft_dflash_blocks(blocks, block_requests, infer_request.get_tensor("logits"), hidden_states);
-            selection_inference_duration = m_dflash_candidate_selector->get_inference_duration();
+            const float selection_duration =
+                std::chrono::duration<float, std::micro>(std::chrono::steady_clock::now() - selection_start).count();
+            markov_head_duration = m_dflash_candidate_selector->get_inference_duration();
+            candidate_sampling_duration = selection_duration - markov_head_duration;
         }
         for (const auto& [request, kept_rows] : forwarded_windows) {
             // The next window rewrites the block KV.
             request->update_processed_tokens_num(kept_rows);
         }
-        const float step_duration = PerfMetrics::get_microsec(std::chrono::steady_clock::now() - step_start);
         // Candidates need embeddings before the next update can remove the rejected ones.
         sync_generated_embeddings();
 
-        if (has_windows) {
-            raw_perf_metrics.m_durations.emplace_back(step_duration);
-            raw_perf_metrics.m_inference_durations[0] +=
-                MicroSeconds(get_metrics().inference_duration + selection_inference_duration);
-            raw_perf_metrics.m_batch_sizes.emplace_back(num_candidates);
+        if (forwarded) {
+            const auto record = [num_candidates](RawPerfMetrics& metrics, float duration) {
+                metrics.m_durations.emplace_back(duration);
+                metrics.m_inference_durations[0] += MicroSeconds(duration);
+                metrics.m_batch_sizes.emplace_back(num_candidates);
+            };
+            // the draft forward and the sampler call of step() count as the step's backbone and sampling
+            const auto step_metrics = get_metrics();
+            record(raw_perf_metrics, step_metrics.inference_duration);
+            if (m_dflash_candidate_selector->has_markov_head()) {
+                record(dflash_markov_head_perf_metrics, markov_head_duration);
+            }
+            record(dflash_sampling_perf_metrics, step_metrics.sampling_duration + candidate_sampling_duration);
         }
         return;
     }
