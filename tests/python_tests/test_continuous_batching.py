@@ -1415,7 +1415,10 @@ def test_dflash_matches_main_only(dflash_model_paths, num_assistant_tokens):
     metrics = result.extended_perf_metrics
     assert metrics.get_num_draft_tokens() > 0
     assert metrics.get_num_accepted_tokens() <= metrics.get_num_draft_tokens()
-    assert 0 < metrics.draft_model_metrics.get_num_generated_tokens() <= config.max_new_tokens * num_assistant_tokens
+    num_drafted = metrics.draft_sampling_metrics.get_num_generated_tokens()
+    assert 0 < num_drafted <= config.max_new_tokens * num_assistant_tokens
+    # the backbone also forwards the context rows of every block
+    assert metrics.draft_model_metrics.get_num_generated_tokens() > num_drafted
 
 
 def test_dflash_drafts_without_properties_do_not_share_cached_blobs(dflash_model_paths, tmp_path):
