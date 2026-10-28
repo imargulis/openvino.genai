@@ -608,6 +608,9 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
 GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_draft_generation_config(
     const GenerationConfig& config) const {
     auto draft_config = make_draft_sampling_params(config);
+    // The draft's grammar matcher cannot roll back the tokens the target rejects. The target sampler enforces the
+    // grammar on every token it keeps.
+    draft_config.structured_output_config.reset();
     if (m_model_input_type == ModelInputType::EMBEDDINGS) {
         // The target sampler retains these options and sees verified token
         // history. The placeholder-backed draft sampler must not apply state
@@ -619,7 +622,6 @@ GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_draft_gene
         draft_config.min_new_tokens = 0;
         draft_config.stop_token_ids = {};
         draft_config.include_stop_str_in_output = false;
-        draft_config.structured_output_config.reset();
         draft_config.parsers.clear();
     }
     dflash_cb::add_draft_assistant_token_headroom(draft_config, config);
