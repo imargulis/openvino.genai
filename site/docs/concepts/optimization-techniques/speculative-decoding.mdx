@@ -166,6 +166,8 @@ optimum-cli export openvino --model <draft> --task text-generation-with-past --t
 The draft backbone is exported as `openvino_model.xml`, and the Markov head of DSpark and DFlash v2 drafts next to it as `openvino_markov_head_model.xml`.
 INT8 and INT4 weight formats compress only the draft backbone, so the Markov head keeps the checkpoint precision unless `--weight-format fp16` or `fp32` converts it.
 
+DSpark and DFlash v1 drafts can have a pruned vocabulary, as [openbmb/MiniCPM-OCR-1.0-DSpark](https://huggingface.co/openbmb/MiniCPM-OCR-1.0-DSpark) does: their own LM head predicts a subset of the target vocabulary, which OpenVINO GenAI maps to the target vocabulary when it loads the draft.
+
 ### Configuration and Usage
 
 `draft_model` reads the Markov head next to the draft backbone and runs it on the draft device, in one of two modes selected by the `markov_head_top_k` draft property:
