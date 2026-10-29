@@ -6,7 +6,8 @@
 Greedy speculative decoding must reproduce the target alone, whatever the draft proposes, and sampled speculative
 decoding must be reproducible from the request seed. Tiny random drafts reject almost every candidate. In the
 constant setup every token embedding carries a large channel 0 that only token 0 reads out, so the target and all
-drafts predict token 0 and every candidate is accepted.
+drafts predict token 0 and every candidate is accepted. The pruned DSpark draft predicts a random subset of the target
+vocabulary, which holds token 0, with its own lm_head.
 """
 
 import re
@@ -29,12 +30,15 @@ MAX_NEW_TOKENS = 40
 # prompts cross the 32-token blocks of the CPU draft KV cache
 PROMPT_LENGTHS = (5, 37, 70)
 PRECISION = {"INFERENCE_PRECISION_HINT": "f32", "KV_CACHE_PRECISION": "f32"}
-VARIANTS = ("dflash", "dspark", "dflash2")
+VARIANTS = ("dflash", "dspark", "dspark_pruned", "dflash2")
+PRUNED_DRAFT_VOCAB_SIZE = 512
 # draft variant and draft properties: DSpark's Markov head drafts with its candidate scorer or its dense step
 DRAFTS = {
     "dflash": ("dflash", {}),
     "dspark": ("dspark", {}),
     "dspark-markov-step": ("dspark", {"markov_head_top_k": 0}),
+    "dspark-pruned": ("dspark_pruned", {}),
+    "dspark-pruned-markov-step": ("dspark_pruned", {"markov_head_top_k": 0}),
     "dflash2": ("dflash2", {}),
 }
 
@@ -71,16 +75,17 @@ def _build_target(output_dir: Path, constant: bool):
             model.lm_head.weight[0, 0] = 1.0
         _keep_first_channel(model.model.norm)
     _save_checkpoint(model, output_dir, ["Qwen3ForCausalLM"])
-    return config
+    return model
 
 
-def _build_draft(output_dir: Path, variant: str, target_config, constant: bool):
+def _build_draft(output_dir: Path, variant: str, target, constant: bool):
     from optimum.exporters.openvino.model_patcher import (
         Qwen3DFlash2ForCausalLM,
         Qwen3DFlashForCausalLM,
         Qwen3DSparkForCausalLM,
     )
 
+    target_config = target.config
     config = deepcopy(target_config)
     num_target_layers = target_config.num_hidden_layers
     target_layer_ids = [0, num_target_layers - 1]
@@ -111,9 +116,19 @@ def _build_draft(output_dir: Path, variant: str, target_config, constant: bool):
         config.mask_token_id = mask_token_id
         config.target_layer_ids = target_layer_ids
         model_class = Qwen3DSparkForCausalLM
+        if variant == "dspark_pruned":
+            config.draft_vocab_size = PRUNED_DRAFT_VOCAB_SIZE
+            config.tie_word_embeddings = False
     config.architectures = architectures
     torch.manual_seed(0)
     model = model_class(config).eval()
+    if variant == "dspark_pruned":
+        # Draft token i is target token i + d2t[i], read out by the target LM head row of that token.
+        others = torch.randperm(config.vocab_size - 1)[: PRUNED_DRAFT_VOCAB_SIZE - 1] + 1
+        target_ids = torch.cat([others[:7], torch.zeros(1, dtype=torch.long), others[7:]])
+        with torch.no_grad():
+            model.d2t.copy_(target_ids - torch.arange(PRUNED_DRAFT_VOCAB_SIZE))
+            model.lm_head.weight.copy_(target.lm_head.weight[target_ids])
     if constant:
         # the draft reads out through the target embedding and LM head
         _keep_first_channel(model.norm)
@@ -131,10 +146,10 @@ def _export(checkpoint_dir: Path, output_dir: Path):
 def dflash_models(request, tmp_path_factory):
     constant = request.param == "constant"
     root = tmp_path_factory.mktemp(f"dflash_{request.param}")
-    target_config = _build_target(root / "target_hf", constant)
+    target = _build_target(root / "target_hf", constant)
     models = {"target": _export(root / "target_hf", root / "target"), "constant": constant}
     for variant in VARIANTS:
-        _build_draft(root / f"{variant}_hf", variant, target_config, constant)
+        _build_draft(root / f"{variant}_hf", variant, target, constant)
         models[variant] = _export(root / f"{variant}_hf", root / variant)
     return models
 

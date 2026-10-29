@@ -76,6 +76,7 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     // Resolve authoritative metadata before mutating either model so a malformed target leaves the draft reusable.
     const auto hidden_state_locators =
         utils::dflash::resolve_target_hidden_state_locators(main_model, m_rt_info.target_layer_ids);
+    const auto pruned_vocabulary = utils::dflash::extract_pruned_draft_vocabulary(main_model, draft_model, m_rt_info);
 
     // The VLM draft keeps its external inputs_embeds; the LLM draft gets the target embedding grafted in.
     if (m_inputs_embedder) {
@@ -96,6 +97,9 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     auto [main_scheduler_config, draft_scheduler_config] = init_speculative_models(main_model_desc, draft_model_desc);
     if (markov_head_reads_hidden_states) {
         utils::dflash::gather_last_hidden_state_with_logits(draft_model);
+    }
+    if (pruned_vocabulary) {
+        utils::dflash::widen_draft_logits_to_target_vocabulary(draft_model, *pruned_vocabulary);
     }
     OPENVINO_ASSERT(main_scheduler_config.enable_prefix_caching == draft_scheduler_config.enable_prefix_caching,
                     "DFlash main and draft pipelines must use the same enable_prefix_caching setting.");
