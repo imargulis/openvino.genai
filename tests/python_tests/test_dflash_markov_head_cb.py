@@ -340,6 +340,18 @@ def test_draft_steps_report_their_parts(dflash_models, draft):
         assert sum(step_parts) <= step + 0.002
 
 
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_llm_pipeline_draft_without_properties_matches_target(dflash_models, target_outputs, variant):
+    # A draft without properties compiles with the target's, to which LLMPipeline adds the GenAI-only
+    # sampler_num_threads.
+    draft = ov_genai.draft_model(dflash_models[variant], "CPU")
+    pipe = ov_genai.LLMPipeline(dflash_models["target"], "CPU", draft_model=draft, **PRECISION)
+    for prompt, target in zip(_prompts(), target_outputs):
+        result = pipe.generate(prompt, _generation_config())
+        assert list(result.tokens[0]) == target
+        assert result.extended_perf_metrics.get_num_draft_tokens() > 0
+
+
 def test_draft_without_token_type_ids_is_rejected(dflash_models, tmp_path):
     draft_dir = tmp_path / "no_token_type_ids"
     shutil.copytree(dflash_models["dflash"], draft_dir)
