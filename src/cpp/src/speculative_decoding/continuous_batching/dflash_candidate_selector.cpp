@@ -68,7 +68,11 @@ CandidateSelector::CandidateSelector(const utils::dflash::DFlashRTInfo& rt_info,
     if (!markov_head) {
         return;
     }
-    auto request = utils::singleton_core().compile_model(markov_head, device, properties).create_infer_request();
+    // A draft without properties takes the target's, to which LLMPipeline adds the GenAI-only sampler_num_threads.
+    ov::AnyMap compile_properties = properties;
+    compile_properties.erase("sampler_num_threads");
+    auto request =
+        utils::singleton_core().compile_model(markov_head, device, compile_properties).create_infer_request();
     if (utils::dflash::is_markov_step(markov_head)) {
         m_markov_step = std::move(request);
     } else {
