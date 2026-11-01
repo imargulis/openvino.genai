@@ -229,6 +229,56 @@ detail::DFlashDraftWindow detail::make_dflash_draft_window(const SequenceGroup& 
     return window;
 }
 
+namespace {
+
+// Drafts a block into its request's draft sequence. Candidates the selector appends and candidates drawn with the
+// draft sampler both enter the history of the request's logit processor, which the draft update keeps in step with
+// the sequence.
+class SequenceDrafter final : public dflash_cb::BlockDrafter {
+public:
+    SequenceDrafter(Sampler& sampler, SequenceGroup::Ptr request)
+        : m_sampler(sampler),
+          m_request(std::move(request)),
+          m_sequence(m_request->get_running_sequences().front()),
+          m_generated_len(m_sequence->get_generated_len()) {}
+
+    const GenerationConfig& config() const override {
+        return m_request->get_sampling_parameters();
+    }
+
+    void append(int64_t token) override {
+        m_sequence->append_token(token, 0.0f);
+        m_sampler.get_logit_processor(m_request->get_request_id()).register_new_generated_token(token);
+    }
+
+    std::optional<int64_t> sample(const ov::Tensor& row) override {
+        const size_t generated_len = m_sequence->get_generated_len();
+        // The sampler takes one token per request from its last scheduled row; it appends the token and advances
+        // the processed length.
+        m_request->schedule_tokens(1);
+        m_sampler.sample({m_request}, row, false, false);
+        // A block has fewer candidates than max_new_tokens leaves, and the draft has no stop condition.
+        OPENVINO_ASSERT(!m_sequence->has_finished(),
+                        "The draft sampler finished DFlash draft request ", m_request->get_request_id(), ".");
+        if (m_sequence->get_generated_len() == generated_len) {
+            return std::nullopt;
+        }
+        return m_sequence->get_generated_ids().back();
+    }
+
+    size_t num_drafted() const {
+        return m_sequence->get_generated_len() - m_generated_len;
+    }
+
+private:
+    Sampler& m_sampler;
+    SequenceGroup::Ptr m_request;
+    Sequence::Ptr m_sequence;
+    size_t m_generated_len;
+};
+
+}  // namespace
+
 // Look up a candidate for the given running sequence.
 // Tree-search drafting may produce a candidate whose grouped_id no longer matches any
 // surviving running sequence on the consuming side.
@@ -451,6 +501,8 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
             if (is_update_logit_processor) {
                 logit_processor.update_generated_len(sequence->get_generated_len());
             }
+            // The target has validated the candidates the proposals came with.
+            sequence->clear_draft_proposals();
 
             // Plan the window. The target's rows end at its processed length.
             const detail::DFlashDraftWindow window =
@@ -845,9 +897,28 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::pull_a
     m_awaiting_requests.clear();
 }
 
+size_t ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::draft_dflash_blocks(
+    const std::vector<dflash_cb::DraftBlock>& blocks,
+    const std::vector<SequenceGroup::Ptr>& block_requests,
+    const ov::Tensor& logits) {
+    std::vector<SequenceDrafter> drafters;
+    drafters.reserve(block_requests.size());
+    std::vector<dflash_cb::BlockDrafter*> block_drafters;
+    for (const auto& request : block_requests) {
+        drafters.emplace_back(*m_sampler, request);
+        block_drafters.push_back(&drafters.back());
+    }
+    m_dflash_candidate_selector->select(blocks, logits, block_drafters);
+    size_t num_candidates = 0;
+    for (const auto& drafter : drafters) {
+        num_candidates += drafter.num_drafted();
+    }
+    return num_candidates;
+}
+
 void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::multistep() {
     if (dflash_mode_enabled && !m_is_validation_mode_enabled) {
-        // A DFlash draft forwards each planned window once and samples all its candidates from that forward.
+        // A DFlash draft forwards each planned window once and drafts all its candidates from that forward.
         const bool has_windows = !m_dflash_draft_windows.empty();
         ov::Tensor logits;
         float step_duration = 0.0f;
@@ -860,7 +931,10 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::m
 
         // The model runner gathers the forwarded block rows after the candidate position offset, in request order.
         size_t logits_row = 0;
-        size_t num_candidates = 0;
+        std::vector<dflash_cb::DraftBlock> blocks;
+        std::vector<SequenceGroup::Ptr> block_requests;
+        // the requests whose window ran whole, with the rows their draft KV keeps
+        std::vector<std::pair<SequenceGroup::Ptr, size_t>> forwarded_windows;
         for (auto& request : m_requests) {
             const uint64_t request_id = request->get_request_id();
             request->pause_generation(true);
@@ -889,21 +963,23 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::m
                 request->update_processed_tokens_num(
                     std::min(processed_tokens, window.committed_rows + window.context_rows));
             } else {
-                // The sampler takes one token per request from its last scheduled row, so each candidate row is
-                // scheduled and sampled on its own.
-                const size_t vocab_size = logits.get_shape().back();
-                for (size_t candidate = 0; candidate < window.candidate_rows; ++candidate) {
-                    float* row = logits.data<float>() + (logits_row + candidate) * vocab_size;
-                    request->schedule_tokens(1);
-                    m_sampler->sample({request}, ov::Tensor(ov::element::f32, {1, 1, vocab_size}, row), false, false);
+                if (window.candidate_rows > 0) {
+                    blocks.push_back(dflash_cb::DraftBlock{running_sequences.front()->get_generated_ids().back(),
+                                                           logits_row,
+                                                           gathered_rows,
+                                                           window.candidate_rows});
+                    block_requests.push_back(request);
                 }
-                num_candidates += window.candidate_rows;
-                // The next window rewrites the block KV.
-                request->update_processed_tokens_num(window.committed_rows + window.context_rows);
+                forwarded_windows.emplace_back(request, window.committed_rows + window.context_rows);
             }
             logits_row += gathered_rows;
         }
         m_dflash_draft_windows.clear();
+        const size_t num_candidates = blocks.empty() ? 0 : draft_dflash_blocks(blocks, block_requests, logits);
+        for (const auto& [request, kept_rows] : forwarded_windows) {
+            // The next window rewrites the block KV.
+            request->update_processed_tokens_num(kept_rows);
+        }
         // Candidates need embeddings before the next update can remove the rejected ones.
         sync_generated_embeddings();
 
