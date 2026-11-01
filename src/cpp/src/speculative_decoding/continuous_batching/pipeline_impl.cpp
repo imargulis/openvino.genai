@@ -8,6 +8,7 @@
 #include <optional>
 
 #include "sequence_group.hpp"
+#include "speculative_decoding/continuous_batching/dflash_candidate_selector.hpp"
 
 namespace ov::genai {
 ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::ContinuousBatchingForSpeculativeDecodingImpl(
@@ -58,6 +59,7 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::finish
         if (m_scheduler->has_block_table(sequence->get_id())) {
             m_scheduler->free_sequence(sequence->get_id());
         }
+        m_dflash_lattice_rngs.erase(sequence->get_id());
     }
     m_sampler->clear_request_info(request->get_request_id());
     request->set_generation_status(GenerationStatus::STOP);
@@ -199,13 +201,16 @@ detail::DFlashDraftWindow detail::make_dflash_draft_window(const SequenceGroup& 
 
     // The next block is drafted once the context reaches the token before the seed, the last generated token. It
     // keeps num_assistant_tokens mask rows; near max_new_tokens only the candidates the target can still validate
-    // are sampled, since the target always generates the last token itself.
+    // are sampled, since the target always generates the last token itself. Every block follows at least one
+    // context row, which keeps the blocks of different requests apart in the packed block rows that the DFlash-2
+    // convolutions run over.
     const size_t num_assistant_tokens = request.get_sampling_parameters().num_assistant_tokens.value_or(0);
     const size_t generated_len = running_sequences.front()->get_generated_len();
     const size_t max_new_tokens = request.get_max_new_tokens();
     const size_t remaining_tokens = max_new_tokens > generated_len ? max_new_tokens - generated_len : 0;
-    const bool reaches_seed = generated_len > 0 && window.committed_rows + window.context_rows ==
-                                                       request.get_prompt_len() + generated_len - 1;
+    const bool reaches_seed =
+        generated_len > 0 && window.context_rows > 0 &&
+        window.committed_rows + window.context_rows == request.get_prompt_len() + generated_len - 1;
     if (num_assistant_tokens > 0 && reaches_seed && remaining_tokens > 1) {
         window.block_rows = num_assistant_tokens + candidate_position_offset;
         window.candidate_rows = std::min(num_assistant_tokens, remaining_tokens - 1);
@@ -220,18 +225,22 @@ namespace {
 // the sequence.
 class SequenceDrafter final : public dflash_cb::BlockDrafter {
 public:
-    SequenceDrafter(Sampler& sampler, SequenceGroup::Ptr request)
+    SequenceDrafter(Sampler& sampler, SequenceGroup::Ptr request, std::mt19937& lattice_rng)
         : m_sampler(sampler),
           m_request(std::move(request)),
           m_sequence(m_request->get_running_sequences().front()),
+          m_lattice_rng(lattice_rng),
           m_generated_len(m_sequence->get_generated_len()) {}
 
     const GenerationConfig& config() const override {
         return m_request->get_sampling_parameters();
     }
 
-    void append(int64_t token) override {
-        m_sequence->append_token(token, 0.0f);
+    void append(int64_t token, float log_prob, DraftProposalPtr proposal) override {
+        m_sequence->append_token(token, log_prob);
+        if (proposal) {
+            m_sequence->set_draft_proposal(m_sequence->get_generated_len() - 1, std::move(proposal));
+        }
         m_sampler.get_logit_processor(m_request->get_request_id()).register_new_generated_token(token);
     }
 
@@ -250,6 +259,10 @@ public:
         return m_sequence->get_generated_ids().back();
     }
 
+    std::mt19937& lattice_rng() override {
+        return m_lattice_rng;
+    }
+
     size_t num_drafted() const {
         return m_sequence->get_generated_len() - m_generated_len;
     }
@@ -258,6 +271,7 @@ private:
     Sampler& m_sampler;
     SequenceGroup::Ptr m_request;
     Sequence::Ptr m_sequence;
+    std::mt19937& m_lattice_rng;
     size_t m_generated_len;
 };
 
@@ -876,15 +890,19 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::pull_a
 size_t ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::draft_dflash_blocks(
     const std::vector<dflash_cb::DraftBlock>& blocks,
     const std::vector<SequenceGroup::Ptr>& block_requests,
-    const ov::Tensor& logits) {
+    const ov::Tensor& logits,
+    const ov::Tensor& hidden_states) {
     std::vector<SequenceDrafter> drafters;
     drafters.reserve(block_requests.size());
     std::vector<dflash_cb::BlockDrafter*> block_drafters;
     for (const auto& request : block_requests) {
-        drafters.emplace_back(*m_sampler, request);
+        const auto seed = static_cast<std::mt19937::result_type>(request->get_sampling_parameters().rng_seed);
+        auto& lattice_rng =
+            m_dflash_lattice_rngs.try_emplace(request->get_running_sequences().front()->get_id(), seed).first->second;
+        drafters.emplace_back(*m_sampler, request, lattice_rng);
         block_drafters.push_back(&drafters.back());
     }
-    m_dflash_candidate_selector->select(blocks, logits, block_drafters);
+    m_dflash_candidate_selector->select(blocks, logits, hidden_states, block_drafters);
     size_t num_candidates = 0;
     for (const auto& drafter : drafters) {
         num_candidates += drafter.num_drafted();
@@ -896,13 +914,9 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::m
     if (dflash_mode_enabled && !m_is_validation_mode_enabled) {
         // A DFlash draft forwards each planned window once and drafts all its candidates from that forward.
         const bool has_windows = !m_dflash_draft_windows.empty();
-        ov::Tensor logits;
-        float step_duration = 0.0f;
+        const auto step_start = std::chrono::steady_clock::now();
         if (has_windows) {
-            const auto step_start = std::chrono::steady_clock::now();
             step();
-            step_duration = PerfMetrics::get_microsec(std::chrono::steady_clock::now() - step_start);
-            logits = m_model_runner->get_infer_request().get_tensor("logits");
         }
 
         // The model runner gathers the forwarded block rows after the candidate position offset, in request order.
@@ -951,17 +965,29 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::m
             logits_row += gathered_rows;
         }
         m_dflash_draft_windows.clear();
-        const size_t num_candidates = blocks.empty() ? 0 : draft_dflash_blocks(blocks, block_requests, logits);
+        size_t num_candidates = 0;
+        float selection_inference_duration = 0.0f;
+        if (!blocks.empty()) {
+            auto& infer_request = m_model_runner->get_infer_request();
+            const ov::Tensor hidden_states = m_dflash_candidate_selector->reads_hidden_states()
+                                                 ? infer_request.get_tensor("last_hidden_state")
+                                                 : ov::Tensor{};
+            num_candidates =
+                draft_dflash_blocks(blocks, block_requests, infer_request.get_tensor("logits"), hidden_states);
+            selection_inference_duration = m_dflash_candidate_selector->get_inference_duration();
+        }
         for (const auto& [request, kept_rows] : forwarded_windows) {
             // The next window rewrites the block KV.
             request->update_processed_tokens_num(kept_rows);
         }
+        const float step_duration = PerfMetrics::get_microsec(std::chrono::steady_clock::now() - step_start);
         // Candidates need embeddings before the next update can remove the rejected ones.
         sync_generated_embeddings();
 
         if (has_windows) {
             raw_perf_metrics.m_durations.emplace_back(step_duration);
-            raw_perf_metrics.m_inference_durations[0] += MicroSeconds(get_metrics().inference_duration);
+            raw_perf_metrics.m_inference_durations[0] +=
+                MicroSeconds(get_metrics().inference_duration + selection_inference_duration);
             raw_perf_metrics.m_batch_sizes.emplace_back(num_candidates);
         }
         return;
