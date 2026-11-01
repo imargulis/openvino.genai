@@ -157,6 +157,10 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::validate_request_config(con
     OPENVINO_ASSERT(config.assistant_confidence_threshold == 0.f,
                     "DFlash supports num_assistant_tokens only; assistant_confidence_threshold must be 0.f.");
     OPENVINO_ASSERT(config.max_ngram_size == 0, "DFlash does not support prompt lookup decoding; max_ngram_size must be 0.");
+    if (m_model_input_type == ModelInputType::EMBEDDINGS) {
+        // Speculative decoding results carry no Omni intermediate hidden states or full token IDs.
+        OPENVINO_ASSERT(!config.return_omni_outputs, "DFlash VLM does not support Omni intermediate outputs.");
+    }
 }
 
 GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_draft_generation_config(
