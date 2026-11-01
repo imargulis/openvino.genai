@@ -7,6 +7,7 @@
 #include <functional>
 #include "continuous_batching/pipeline_impl.hpp"
 #include "openvino/genai/continuous_batching_pipeline.hpp"
+#include "speculative_decoding/continuous_batching/dflash_candidate_selector.hpp"
 #include "update_request_structs.hpp"
 #include "utils.hpp"
 
@@ -202,10 +203,16 @@ protected:
     bool eagle_mode_enabled = false;
     bool mtp_mode_enabled = false;
     bool dflash_mode_enabled = false;
+    // Drafts the candidates of every forwarded block into its request with the candidate selector; returns their
+    // number.
+    size_t draft_dflash_blocks(const std::vector<dflash_cb::DraftBlock>& blocks,
+                               const std::vector<SequenceGroup::Ptr>& block_requests,
+                               const ov::Tensor& logits);
     int64_t m_dflash_mask_token_id = -1;
     size_t m_dflash_candidate_position_offset = 1;
     // Windows planned by the DFlash draft update for the next draft forward, by sequence id.
     std::map<uint64_t, detail::DFlashDraftWindow> m_dflash_draft_windows;
+    std::shared_ptr<dflash_cb::CandidateSelector> m_dflash_candidate_selector;
 };
 
 class ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl
@@ -463,6 +470,7 @@ protected:
         m_dflash_mask_token_id = mask_token_id;
         m_dflash_candidate_position_offset = candidate_position_offset;
         m_model_runner->enable_dflash_draft(candidate_position_offset);
+        m_dflash_candidate_selector = std::make_shared<dflash_cb::CandidateSelector>();
     }
 };
 }
