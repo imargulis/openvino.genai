@@ -1407,7 +1407,9 @@ void Sampler::_validate_candidates(SequenceGroup::Ptr sequence_group,
             logit_processor.apply(logit_vector);
             num_sampled_rows = i + 1;
 
-            if (logit_token_offset == 0) {
+            // The last row predicts the token after the window, unless the token budget split the window: then it
+            // is the row of a candidate.
+            if (logit_token_offset == 0 && generated_seq_token_offset == 0) {
                 const Token sampled_token =
                     sampling_params.is_greedy_decoding()
                         ? _greedy_sample(logit_vector, sampling_params.logprobs)
@@ -1416,11 +1418,7 @@ void Sampler::_validate_candidates(SequenceGroup::Ptr sequence_group,
                                               ctx,
                                               sg_sampling_info.sampler_output);
                 append_sampled_token(sampled_token, running_sequence, logit_processor);
-                finish_at_stop_token(sampled_token,
-                                     running_sequence,
-                                     generated_seq_token_offset > 0 ? generated_seq_token_offset - 1 : 0,
-                                     sampling_params,
-                                     sg_sampling_info);
+                finish_at_stop_token(sampled_token, running_sequence, 0, sampling_params, sg_sampling_info);
                 break;
             }
 
@@ -1491,9 +1489,11 @@ SequenceGroupSamplingInfo Sampler::sample_from_sequence_group(SequenceGroup::Ptr
     LogitProcessor& logit_processor = ctx.logit_processor;
     const std::pair<size_t, std::set<std::string>>& stop_strings = ctx.stop_strings;
 
+    // A window that the token budget split validates one candidate per scheduled row and leaves the remaining
+    // candidates for the next step.
     if (num_tokens_to_process > output_seq_len - 1) {
         auto delta = num_tokens_to_process - (output_seq_len - 1);
-        assisting_pipeline_info.updated_validation_len = std::max(assisting_pipeline_info.updated_validation_len, delta);
+        assisting_pipeline_info.updated_validation_len = std::max(assisting_pipeline_info.updated_validation_len, delta - 1);
         num_tokens_to_process -= delta;
     }
 
@@ -1747,7 +1747,8 @@ SamplerOutput Sampler::sample(const std::vector<SequenceGroup::Ptr> & sequence_g
             auto& logit_processor = get_logit_processor(sequence_group->get_request_id());
             logit_processor.update_generated_len(assisting_pipeline_info.min_generated_len);
         }
-        if (assisting_pipeline_info.updated_validation_len) {
+        // A rejection removes the candidates that a split window left unvalidated.
+        if (assisting_pipeline_info.updated_validation_len && !assisting_pipeline_info.max_removed_tokens_per_request) {
             sequence_group->set_num_validated_tokens(assisting_pipeline_info.updated_validation_len);
         }
     }
