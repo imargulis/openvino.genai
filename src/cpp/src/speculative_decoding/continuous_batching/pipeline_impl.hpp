@@ -5,11 +5,16 @@
 
 #include <algorithm>
 #include <functional>
+#include <random>
 #include "continuous_batching/pipeline_impl.hpp"
 #include "openvino/genai/continuous_batching_pipeline.hpp"
-#include "speculative_decoding/continuous_batching/dflash_candidate_selector.hpp"
 #include "update_request_structs.hpp"
 #include "utils.hpp"
+
+namespace ov::genai::dflash_cb {
+struct DraftBlock;
+class CandidateSelector;
+}  // namespace ov::genai::dflash_cb
 
 namespace ov::genai {
 
@@ -209,12 +214,15 @@ protected:
     // number.
     size_t draft_dflash_blocks(const std::vector<dflash_cb::DraftBlock>& blocks,
                                const std::vector<SequenceGroup::Ptr>& block_requests,
-                               const ov::Tensor& logits);
+                               const ov::Tensor& logits,
+                               const ov::Tensor& hidden_states);
     int64_t m_dflash_mask_token_id = -1;
     size_t m_dflash_candidate_position_offset = 1;
     // Windows planned by the DFlash draft update for the next draft forward, by sequence id.
     std::map<uint64_t, detail::DFlashDraftWindow> m_dflash_draft_windows;
     std::shared_ptr<dflash_cb::CandidateSelector> m_dflash_candidate_selector;
+    // Draw the candidates of sampled requests from Top-K candidate lattices, by sequence id.
+    std::map<uint64_t, std::mt19937> m_dflash_lattice_rngs;
 };
 
 class ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl
@@ -396,8 +404,8 @@ protected:
 
 // Continuous-batching pipeline for both DFlash models. The validating main pipeline publishes its
 // processed length with the exported hidden states. The draft pipeline forwards each request's window
-// once per step; its logic is in ContinuousBatchingForSpeculativeDecodingImpl::update_request and multistep
-// behind dflash_mode_enabled.
+// once per step and drafts the candidates of every forwarded block with the candidate selector; its logic
+// is in ContinuousBatchingForSpeculativeDecodingImpl::update_request and multistep behind dflash_mode_enabled.
 class ContinuousBatchingPipeline::ContinuousBatchingForDFlashDecodingImpl
     : public ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl {
 public:
@@ -411,7 +419,8 @@ public:
                                             const ov::AnyMap& plugin_config,
                                             bool is_validation_mode_enabled,
                                             int64_t mask_token_id = -1,
-                                            size_t candidate_position_offset = 1)
+                                            size_t candidate_position_offset = 1,
+                                            std::shared_ptr<dflash_cb::CandidateSelector> candidate_selector = nullptr)
         : ContinuousBatchingForSpeculativeDecodingImpl(model,
                                                        tokenizer,
                                                        generation_config,
@@ -421,7 +430,7 @@ public:
                                                        is_validation_mode_enabled) {
         dflash_mode_enabled = true;
         if (!is_validation_mode_enabled) {
-            enable_dflash_draft(mask_token_id, candidate_position_offset);
+            enable_dflash_draft(mask_token_id, candidate_position_offset, std::move(candidate_selector));
         }
     }
 
@@ -434,7 +443,8 @@ public:
                                             const ov::AnyMap& plugin_config,
                                             bool is_validation_mode_enabled,
                                             int64_t mask_token_id = -1,
-                                            size_t candidate_position_offset = 1)
+                                            size_t candidate_position_offset = 1,
+                                            std::shared_ptr<dflash_cb::CandidateSelector> candidate_selector = nullptr)
         : ContinuousBatchingForSpeculativeDecodingImpl(model,
                                                        std::move(inputs_embedder),
                                                        tokenizer,
@@ -447,7 +457,7 @@ public:
         if (!is_validation_mode_enabled) {
             // The draft is a text model: sequential positions instead of the target's M-RoPE positions.
             m_model_runner->enable_mtp_draft_positions(true);
-            enable_dflash_draft(mask_token_id, candidate_position_offset);
+            enable_dflash_draft(mask_token_id, candidate_position_offset, std::move(candidate_selector));
         }
     }
 
@@ -468,11 +478,14 @@ protected:
         return true;
     }
 
-    void enable_dflash_draft(int64_t mask_token_id, size_t candidate_position_offset) {
+    void enable_dflash_draft(int64_t mask_token_id,
+                             size_t candidate_position_offset,
+                             std::shared_ptr<dflash_cb::CandidateSelector> candidate_selector) {
+        OPENVINO_ASSERT(candidate_selector, "A DFlash draft pipeline needs a candidate selector.");
         m_dflash_mask_token_id = mask_token_id;
         m_dflash_candidate_position_offset = candidate_position_offset;
         m_model_runner->enable_dflash_draft(candidate_position_offset);
-        m_dflash_candidate_selector = std::make_shared<dflash_cb::CandidateSelector>();
+        m_dflash_candidate_selector = std::move(candidate_selector);
     }
 };
 }
