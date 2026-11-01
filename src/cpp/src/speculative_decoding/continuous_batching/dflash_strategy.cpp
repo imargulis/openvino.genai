@@ -53,6 +53,17 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     OPENVINO_ASSERT(utils::has_input(draft_model, "token_type_ids"),
                     "DFlash draft model has no 'token_type_ids' input. It was exported for the removed stateful "
                     "DFlash draft runner; re-export the draft with the current optimum-intel.");
+    const std::string draft_device = draft_model_desc.device.empty() ? main_model_desc.device : draft_model_desc.device;
+    ov::AnyMap draft_properties =
+        draft_model_desc.properties.empty() ? main_model_desc.properties : draft_model_desc.properties;
+    // PagedAttention is the only DFlash draft backend.
+    if (auto backend_it = draft_properties.find("ATTENTION_BACKEND"); backend_it != draft_properties.end()) {
+        const auto backend = backend_it->second.as<std::string>();
+        OPENVINO_ASSERT(backend == PA_BACKEND,
+                        "DFlash drafts run on PagedAttention only; the draft ATTENTION_BACKEND must be '", PA_BACKEND,
+                        "', got '", backend, "'.");
+        draft_properties.erase(backend_it);
+    }
     if (main_model_desc.inputs_embedder) {
         m_inputs_embedder = main_model_desc.inputs_embedder;
         m_model_input_type = ModelInputType::EMBEDDINGS;
@@ -103,9 +114,6 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
 
     m_tokenizer = main_model_desc.tokenizer;
     m_generation_config = main_model_desc.generation_config;
-    const std::string draft_device = draft_model_desc.device.empty() ? main_model_desc.device : draft_model_desc.device;
-    const ov::AnyMap draft_properties =
-        draft_model_desc.properties.empty() ? main_model_desc.properties : draft_model_desc.properties;
 
     if (m_inputs_embedder) {
         m_main_pipeline = std::make_shared<ContinuousBatchingForDFlashDecodingImpl>(main_model,
