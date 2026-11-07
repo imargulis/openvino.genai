@@ -1426,6 +1426,28 @@ def test_dflash_keeps_drafting_after_a_split_window_rejection(dflash_model_paths
     assert metrics.get_num_draft_tokens() > config.num_assistant_tokens
 
 
+def test_dflash_counts_candidates_validated_in_a_later_step(dflash_model_paths):
+    # A budget of 5 splits or defers some validation windows of the 4 requests, and the target validates the rest of
+    # their candidates in a later step. The drafts and the outputs do not depend on the budget, so neither do the
+    # accepted tokens. The target accepts some candidates of the tiny DeepSpec draft, and none of the DFlash one.
+    config = _dflash_config(num_assistant_tokens=3, max_new_tokens=30)
+    prompts = DFLASH_PROMPTS[:4]
+
+    def generate(max_num_batched_tokens):
+        scheduler_config = dict_to_scheduler_config(
+            {"dynamic_split_fuse": True, "max_num_batched_tokens": max_num_batched_tokens}
+        )
+        results = _dflash_pipeline(dflash_model_paths, scheduler_config).generate(prompts, [config] * len(prompts))
+        metrics = results[0].extended_perf_metrics
+        return (
+            [result.m_generation_ids for result in results],
+            metrics.get_num_draft_tokens(),
+            metrics.get_num_accepted_tokens(),
+        )
+
+    assert generate(5) == generate(256)
+
+
 @pytest.mark.parametrize("dynamic_split_fuse", [True, False])
 def test_dflash_staggered_requests_with_mixed_assistant_tokens(dflash_model_paths, dynamic_split_fuse):
     # num_assistant_tokens=0 runs the request on the target alone
