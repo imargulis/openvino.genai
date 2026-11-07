@@ -533,6 +533,20 @@ TEST_F(DFlashCBPipelineTest, MissedWindowLeavesTheRequestToTheTarget) {
     ASSERT_EQ(group->get_num_processed_tokens(), 0);
 }
 
+TEST_F(DFlashCBPipelineTest, MissedWindowRunsWithTheRowsOfADeferredTarget) {
+    DraftInstance draft;
+    auto group = start_with_block(draft);
+    draft.drop_window(group);
+
+    // the target did not run the request either, and still publishes the rows of its last forward
+    draft.update_request(0, target_step({7}, 8, make_hidden_rows(8, 50.0f)), true);
+
+    ASSERT_FALSE(group->is_waiting());
+    ASSERT_EQ(draft.window(group).committed_rows, 0);
+    ASSERT_EQ(draft.window(group).context_rows, 8);
+    ASSERT_EQ(group->get_num_available_tokens_for_batching(), 8 + 4);
+}
+
 TEST_F(DFlashCBPipelineTest, NearMaxNewTokensForwardsOnlyTheContext) {
     DraftInstance draft;
     auto group = draft.add(0, {0, 1, 2, 3}, 3, /*max_new_tokens=*/2);
