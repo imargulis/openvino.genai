@@ -1411,6 +1411,21 @@ def test_dflash_batched_prompts_with_chunked_prefill_match_main_only(dflash_mode
     assert [result.m_generation_ids for result in results] == reference
 
 
+def test_dflash_keeps_drafting_after_a_split_window_rejection(dflash_model_paths):
+    # The token budget is below the validation window of the seed and 3 candidates, so the target runs only its first
+    # rows and rejects a candidate validated there; the draft still has the rows it needs for its next block.
+    config = _dflash_config(num_assistant_tokens=3)
+    reference = _main_only_ids(dflash_model_paths[0], DFLASH_PROMPTS[:1], config)
+    scheduler_config = dict_to_scheduler_config({"dynamic_split_fuse": True, "max_num_batched_tokens": 3})
+
+    result = _dflash_pipeline(dflash_model_paths, scheduler_config).generate(DFLASH_PROMPTS[:1], [config])[0]
+
+    assert [result.m_generation_ids] == reference
+    metrics = result.extended_perf_metrics
+    assert metrics.get_num_accepted_tokens() < metrics.get_num_draft_tokens()
+    assert metrics.get_num_draft_tokens() > config.num_assistant_tokens
+
+
 @pytest.mark.parametrize("dynamic_split_fuse", [True, False])
 def test_dflash_staggered_requests_with_mixed_assistant_tokens(dflash_model_paths, dynamic_split_fuse):
     # num_assistant_tokens=0 runs the request on the target alone
