@@ -11,7 +11,8 @@ import threading
 import numpy as np
 
 from pathlib import Path
-from shutil import rmtree
+from shutil import copytree, rmtree
+from xml.etree import ElementTree
 from optimum.intel.utils.import_utils import is_transformers_version
 
 import openvino as ov
@@ -1384,6 +1385,20 @@ def _main_only_ids(target_path: Path, prompts: list[str], config: GenerationConf
     return [result.m_generation_ids for result in pipe.generate(prompts, [config] * len(prompts))]
 
 
+def _negated_weights_copy(model_path: Path, copy_path: Path) -> Path:
+    # The graph of the model with other weights: every floating-point constant of more than one value changes sign.
+    copytree(model_path, copy_path)
+    weights = np.fromfile(model_path / "openvino_model.bin", dtype=np.uint8)
+    dtypes = {"f16": np.float16, "f32": np.float32}
+    for data in ElementTree.parse(model_path / "openvino_model.xml").iter("data"):
+        dtype = dtypes.get(data.get("element_type"))
+        if dtype is not None and "offset" in data.attrib and int(data.get("size")) > np.dtype(dtype).itemsize:
+            begin = int(data.get("offset"))
+            weights[begin : begin + int(data.get("size"))].view(dtype)[:] *= -1
+    weights.tofile(copy_path / "openvino_model.bin")
+    return copy_path
+
+
 @pytest.mark.parametrize("num_assistant_tokens", [1, 7])
 def test_dflash_matches_main_only(dflash_model_paths, num_assistant_tokens):
     config = _dflash_config(num_assistant_tokens)
@@ -1396,6 +1411,22 @@ def test_dflash_matches_main_only(dflash_model_paths, num_assistant_tokens):
     assert metrics.get_num_draft_tokens() > 0
     assert metrics.get_num_accepted_tokens() <= metrics.get_num_draft_tokens()
     assert 0 < metrics.draft_model_metrics.get_num_generated_tokens() <= config.max_new_tokens * num_assistant_tokens
+
+
+def test_dflash_drafts_without_properties_do_not_share_cached_blobs(dflash_model_paths, tmp_path):
+    # A draft without properties takes the target's, whose model path keys the cached target in place of its weights.
+    target_path, draft_path = dflash_model_paths
+    other_draft_path = _negated_weights_copy(draft_path, tmp_path / "draft")
+    cache_dir = tmp_path / "cache"
+    properties = {**DFLASH_PARITY_PROPERTIES, "CACHE_DIR": str(cache_dir)}
+
+    for path in (draft_path, other_draft_path):
+        ContinuousBatchingPipeline(
+            target_path, SchedulerConfig(), "CPU", {**properties, "draft_model": draft_model(path, "CPU")}
+        )
+
+    # each pipeline compiles its draft, and the second one loads the target the first one compiled
+    assert len(list(cache_dir.glob("*.blob"))) == 3
 
 
 def test_dflash_batched_prompts_with_chunked_prefill_match_main_only(dflash_model_paths):

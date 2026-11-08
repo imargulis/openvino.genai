@@ -54,8 +54,14 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
                     "DFlash draft model has no 'token_type_ids' input. It was exported for the removed stateful "
                     "DFlash draft runner; re-export the draft with the current optimum-intel.");
     const std::string draft_device = draft_model_desc.device.empty() ? main_model_desc.device : draft_model_desc.device;
+    const bool draft_inherits_target_properties = draft_model_desc.properties.empty();
     ov::AnyMap draft_properties =
-        draft_model_desc.properties.empty() ? main_model_desc.properties : draft_model_desc.properties;
+        draft_inherits_target_properties ? main_model_desc.properties : draft_model_desc.properties;
+    if (draft_inherits_target_properties) {
+        // The target's model path keys its model cache in place of its weights, so drafts that differ only in their
+        // weights would share a cached blob.
+        draft_properties.erase(ov::cache_model_path.name());
+    }
     // PagedAttention is the only DFlash draft backend.
     if (auto backend_it = draft_properties.find("ATTENTION_BACKEND"); backend_it != draft_properties.end()) {
         const auto backend = backend_it->second.as<std::string>();
