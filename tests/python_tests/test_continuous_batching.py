@@ -1498,6 +1498,30 @@ def test_dflash_counts_the_window_that_ends_a_request(dflash_model_paths):
     assert metrics.get_num_accepted_tokens() > 0
 
 
+def test_speculative_decoding_counts_candidates_a_stop_string_removes():
+    # The target drafts for itself, so it accepts every candidate. A stop string in the first window removes the
+    # accepted candidates after it from the output, and its own tokens unless they are included; they count all the same.
+    target_path = download_and_convert_model(DFLASH_TARGET_MODEL_ID).models_path
+    pipe = _dflash_pipeline((target_path, target_path))
+    tokenizer = pipe.get_tokenizer()
+    input_ids = tokenizer.encode(DFLASH_PROMPTS[1]).input_ids
+    config = _dflash_config(num_assistant_tokens=5, max_new_tokens=30)
+    generated_ids = pipe.generate([input_ids], [config])[0].m_generation_ids[0]
+    # the target generates the first token from the prompt, and the first window drafts the next ones
+    stop_string = tokenizer.decode(generated_ids[1:3])
+    assert stop_string.strip()
+
+    def counts(include_stop_str_in_output):
+        config.stop_strings = {stop_string}
+        config.include_stop_str_in_output = include_stop_str_in_output
+        metrics = pipe.generate([input_ids], [config])[0].extended_perf_metrics
+        return metrics.get_num_draft_tokens(), metrics.get_num_accepted_tokens()
+
+    num_drafted, num_accepted = counts(False)
+    assert num_accepted == num_drafted
+    assert counts(True) == (num_drafted, num_accepted)
+
+
 @pytest.mark.parametrize("dynamic_split_fuse", [True, False])
 def test_dflash_staggered_requests_with_mixed_assistant_tokens(dflash_model_paths, dynamic_split_fuse):
     # num_assistant_tokens=0 runs the request on the target alone
