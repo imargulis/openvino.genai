@@ -1448,6 +1448,20 @@ def test_dflash_counts_candidates_validated_in_a_later_step(dflash_model_paths):
     assert generate(5) == generate(256)
 
 
+@pytest.mark.parametrize("dflash_model_paths", ["deepspec"], indirect=True)
+def test_dflash_counts_the_window_that_ends_a_request(dflash_model_paths):
+    # With 3 new tokens, each request drafts one candidate after its first token: only one fits before the last token.
+    # A candidate the target accepts ends the request, and its window counts all the same.
+    config = _dflash_config(num_assistant_tokens=3, max_new_tokens=3)
+    prompts = DFLASH_PROMPTS[:4]
+
+    results = _dflash_pipeline(dflash_model_paths).generate(prompts, [config] * len(prompts))
+
+    metrics = results[0].extended_perf_metrics
+    assert metrics.get_num_draft_tokens() == len(prompts)
+    assert metrics.get_num_accepted_tokens() > 0
+
+
 @pytest.mark.parametrize("dynamic_split_fuse", [True, False])
 def test_dflash_staggered_requests_with_mixed_assistant_tokens(dflash_model_paths, dynamic_split_fuse):
     # num_assistant_tokens=0 runs the request on the target alone
