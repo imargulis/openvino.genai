@@ -467,18 +467,19 @@ void ContinuousBatchingPipeline::Eagle3DecodingImpl::step() {
     auto main_pipeline = std::static_pointer_cast<ContinuousBatchingForEagle3DecodingImpl>(m_main_pipeline);
     // specific step for eagle3 to update main model kv cache after validation
     {
+        // The next step updates the main requests while the KV update runs, so the rows to move are collected here.
+        std::vector<int32_t> block_update_indices, block_update_begins;
+        main_pipeline->collect_block_update_info(block_update_indices, block_update_begins);
+        if (block_update_indices.empty()) {
+            return;
+        }
+
         // Launch KV update asynchronously
-        m_sync_future = std::async(std::launch::async, [wrapper = m_kv_update_wrapper, main_pipeline = std::move(main_pipeline)]() mutable {
-            auto main_generated_requests = main_pipeline->get_generated_requests();
-            std::vector<int32_t> block_update_indices, block_update_begins;
-            main_pipeline->collect_block_update_info(main_generated_requests,
-                                                     block_update_indices,
-                                                     block_update_begins);
-
-            if (block_update_indices.empty()) {
-                return;
-            }
-
+        m_sync_future = std::async(std::launch::async,
+                                   [wrapper = m_kv_update_wrapper,
+                                    main_pipeline = std::move(main_pipeline),
+                                    block_update_indices = std::move(block_update_indices),
+                                    block_update_begins = std::move(block_update_begins)]() mutable {
             ov::Tensor block_indices_tensor = main_pipeline->get_tensor_by_name("block_indices");
             ov::Tensor block_indices_begins_tensor = main_pipeline->get_tensor_by_name("block_indices_begins");
             ov::Tensor block_update_indices_tensor(ov::element::i32,

@@ -413,6 +413,8 @@ class ModelRunner {
     // a container which uses sequence group id and request id as key to store hidden states
     std::map<SequenceKey, HiddenStateRange> m_sequence_hidden_state_mapping;
     std::unordered_map<size_t, ov::Tensor> m_initial_hidden_states; // shape: [N, seq_len, hidden_size]
+    // request ids of the sequence groups processed during the previous `forward` call, in the order of its inputs
+    std::vector<uint64_t> m_last_forward_request_ids;
 
     std::shared_ptr<InputsEmbedder> m_inputs_embedder;
 
@@ -544,6 +546,14 @@ public:
         return m_last_block_diversities;
     }
 
+    /**
+     * @return The request IDs of the sequence groups processed during the previous `forward` call, in the order of their
+     * inputs such as `block_indices_begins`.
+     */
+    const std::vector<uint64_t>& get_last_forward_request_ids() const {
+        return m_last_forward_request_ids;
+    }
+
     void set_cache_rotation_trig_lut(ov::Tensor&& rotation_trig_lut) {
         m_cache_rotation_trig_lut = std::move(rotation_trig_lut);
     }
@@ -576,6 +586,10 @@ public:
         _preserve_hidden_states_of_unscheduled_sequences(sequence_groups, scheduler_output);
         m_sequence_hidden_state_mapping.clear();
         size_t num_sequence_groups = scheduler_output.m_scheduled_sequence_groups_ids.size();
+        m_last_forward_request_ids.clear();
+        for (size_t seq_group_id : scheduler_output.m_scheduled_sequence_groups_ids) {
+            m_last_forward_request_ids.push_back(sequence_groups[seq_group_id]->get_request_id());
+        }
 
         // Speculative decoding may inject generated tokens before their embeddings are computed.
         if (m_embedding && !sequence_groups.empty() &&

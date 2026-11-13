@@ -290,8 +290,9 @@ public:
         }
     }
 
-    void collect_block_update_info(const GeneratedRequests& main_generated_requests,
-                                   std::vector<int32_t>& block_update_indices,
+    // Collects the KV rows that the validated tree paths of the last forward move, in the layout of the block tables
+    // of that forward: one range of block_update_indices per request it processed, in its order.
+    void collect_block_update_info(std::vector<int32_t>& block_update_indices,
                                    std::vector<int32_t>& block_update_begins) const;
 
     ov::Tensor get_tensor_by_name(const std::string& name) {

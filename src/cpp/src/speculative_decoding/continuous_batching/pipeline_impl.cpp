@@ -84,6 +84,10 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::f
 GeneratedRequests
 ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::get_generated_requests() {
     GeneratedRequests result;
+    // A sequence keeps the hidden state of the last forward that processed it. Eagle3 and MTP drafts pair every
+    // published row with a token of their own, so a request deferred by the last forward publishes no rows.
+    const bool publishes_last_forward_only = (eagle_mode_enabled || mtp_mode_enabled) && m_is_validation_mode_enabled;
+    const std::vector<uint64_t>& last_forward_request_ids = m_model_runner->get_last_forward_request_ids();
     for (const auto& request : m_requests) {
         const auto& request_id = request->get_request_id();
         if (!result.count(request_id)) {
@@ -91,6 +95,10 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::get_ge
         }
         auto& generated_request = result[request_id];
         auto num_processed_tokens = request->get_num_processed_tokens();
+        const bool is_deferred =
+            publishes_last_forward_only &&
+            std::find(last_forward_request_ids.begin(), last_forward_request_ids.end(), request_id) ==
+                last_forward_request_ids.end();
         const bool is_tree_search = request->get_sampling_parameters().is_tree_search();
         for (const auto& sequence : request->get_running_sequences()) {
             const auto& sequence_id = sequence->get_grouped_id();
@@ -104,7 +112,7 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::get_ge
                 num_processed_tokens = 0;
             }
             // Publish an initialized empty tensor for unscheduled sequences.
-            const ov::Tensor hidden_state = sequence->get_hidden_state();
+            const ov::Tensor hidden_state = is_deferred ? ov::Tensor{} : sequence->get_hidden_state();
             generated_request.insert({{sequence_id,
                                        {sequence->get_generated_ids(),
                                         sequence->get_generated_log_probs(),
@@ -540,7 +548,17 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
         const bool main_published_hidden_state = published_hidden_state_it != candidates.end();
         const bool should_pause_for_missing_main_hidden_state =
             requires_main_hidden_state && !main_published_hidden_state;
-        if (running_sequences.front()->get_generated_len() == 0 && !request->get_num_tokens_to_validate()) {
+        const bool is_prompt_phase_update =
+            running_sequences.front()->get_generated_len() == 0 && !request->get_num_tokens_to_validate();
+        if (should_pause_for_missing_main_hidden_state && !is_prompt_phase_update &&
+            request->get_sampling_parameters().is_tree_search()) {
+            // The last main forward deferred this request, so the main request holds the tree of the draft as it was
+            // proposed, and it waits for the next forward. It is left as it is: the positions of a tree are not
+            // consecutive, so comparing the tokens would replace the tree with itself.
+            request->pause_generation(true);
+            return result;
+        }
+        if (is_prompt_phase_update) {
             m_sampler->create_logit_processor(request_id, request->get_sampling_parameters(), request->get_prompt_ids());
             auto& logit_processor = m_sampler->get_logit_processor(request_id);
             result.inserted_tokens_cnt = init_request(request, candidates, logit_processor, is_update_logit_processor);
@@ -1006,34 +1024,31 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::m
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl::collect_block_update_info(
-    const GeneratedRequests& main_generated_requests,
     std::vector<int32_t>& block_update_indices,
     std::vector<int32_t>& block_update_begins) const {
     block_update_indices.clear();
     block_update_begins.clear();
-    block_update_begins.resize(main_generated_requests.size() + 1, 0);
+    // A request that the last forward did not process has no entry in its block tables, and its validated
+    // indices are of an earlier window.
+    const std::vector<uint64_t>& request_ids = m_model_runner->get_last_forward_request_ids();
+    block_update_begins.resize(request_ids.size() + 1, 0);
 
     std::map<size_t, std::map<size_t, size_t>> remap_indices;
     size_t total_indices_to_remap = 0;
-    size_t i = 0;
-    for (auto& request_entry : main_generated_requests) {
-        const auto request_id = request_entry.first;
-        const auto& sequences = request_entry.second;
+    for (size_t i = 0; i < request_ids.size(); ++i) {
+        const auto request_id = request_ids[i];
 
         auto seq_group_it = std::find_if(m_requests.begin(), m_requests.end(),
                                          [request_id](const SequenceGroup::Ptr& sg) { return sg->get_request_id() == request_id; });
         if (seq_group_it == m_requests.end()) {
             block_update_begins[i + 1] = static_cast<int32_t>(total_indices_to_remap);
-            i++;
             continue;
         }
 
+        const auto sequences = (*seq_group_it)->get_running_sequences();
         OPENVINO_ASSERT(sequences.size() == 1);
-        for (const auto& seq_entry : sequences) {
-            if (!seq_entry.second.tree_metadata) {
-                continue;
-            }
-            const auto& validated_indices = seq_entry.second.tree_metadata->validated_indices;
+        for (const auto& sequence : sequences) {
+            const auto& validated_indices = sequence->get_tree_metadata().validated_indices;
             if (validated_indices.empty()) {
                 continue;
             }
@@ -1065,7 +1080,6 @@ void ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl::collec
             }
         }
         block_update_begins[i + 1] = static_cast<int32_t>(total_indices_to_remap);
-        i++;
     }
 
     if (!remap_indices.empty()) {

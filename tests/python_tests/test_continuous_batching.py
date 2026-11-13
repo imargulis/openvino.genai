@@ -1703,6 +1703,56 @@ def test_eagle3_tree_vs_sequential(main_model, main_device, draft_model, draft_d
     del ov_pipe
 
 
+SPLIT_PROMPTS = [
+    "Once upon a time, there was a",
+    "The capital of France is",
+    "def fibonacci(n):",
+    "In 1905, Albert Einstein published",
+]
+
+
+def _split_prompts_scheduler_config(max_num_batched_tokens: int, cache_size: int) -> SchedulerConfig:
+    scheduler_config = SchedulerConfig()
+    scheduler_config.dynamic_split_fuse = True
+    scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    scheduler_config.max_num_seqs = len(SPLIT_PROMPTS)
+    scheduler_config.cache_size = cache_size
+    return scheduler_config
+
+
+def _assert_eagle3_matches_main_only(
+    eagle3_model_paths: tuple[Path, Path], max_num_batched_tokens: int, config: GenerationConfig
+):
+    main_model_path, draft_model_path = eagle3_model_paths
+    properties = {hints.inference_precision: ov.Type.f32, hints.kv_cache_precision: ov.Type.f32}
+    tokenizer = Tokenizer(main_model_path)
+    input_ids = [tokenizer.encode(prompt, add_special_tokens=False).input_ids for prompt in SPLIT_PROMPTS]
+    main_only = ContinuousBatchingPipeline(main_model_path, _split_prompts_scheduler_config(256, 2), "CPU", properties)
+    reference_config = GenerationConfig(max_new_tokens=config.max_new_tokens, ignore_eos=True)
+    reference = [
+        result.m_generation_ids[0]
+        for result in main_only.generate(input_ids, [reference_config] * len(input_ids))
+    ]
+    del main_only
+
+    pipe = ContinuousBatchingPipeline(
+        main_model_path,
+        _split_prompts_scheduler_config(max_num_batched_tokens, 2),
+        "CPU",
+        {**properties, "draft_model": draft_model(draft_model_path, "CPU", **properties)},
+    )
+    results = pipe.generate(input_ids, [config] * len(input_ids))
+
+    assert [result.m_generation_ids[0] for result in results] == reference
+
+
+# A budget smaller than the prompts leaves some of them out of a step of the target. Their draft requests must wait
+# for the next chunk instead of reading the hidden states that the target kept from an earlier one.
+def test_eagle3_with_deferred_prompts_matches_main_only(eagle3_model_paths: tuple[Path, Path]):
+    config = GenerationConfig(max_new_tokens=32, ignore_eos=True, num_assistant_tokens=4)
+    _assert_eagle3_matches_main_only(eagle3_model_paths, 5, config)
+
+
 def _export_with_remote_code(model_id: str) -> Path:
     model_path = get_ov_cache_converted_models_dir() / sanitize_model_id(model_id)
     AtomicDownloadManager(model_path).execute(
