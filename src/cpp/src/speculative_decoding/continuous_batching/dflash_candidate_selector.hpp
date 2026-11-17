@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <random>
 #include <string>
@@ -15,6 +16,7 @@
 #include "openvino/runtime/infer_request.hpp"
 #include "openvino/runtime/tensor.hpp"
 #include "sampling/block_row_source.hpp"
+#include "sampling/temperature_row_sampler.hpp"
 #include "speculative_decoding/dflash_model_transforms.hpp"
 
 namespace ov::genai::dflash_cb {
@@ -68,6 +70,12 @@ public:
         m_draft_request = std::move(draft_request);
     }
 
+    // A draft without a Markov head whose logits rows hold the top_k largest logits of every row, and whose
+    // draft_top_k_ids output holds their token ids.
+    void set_draft_top_k(size_t top_k) {
+        m_top_k = top_k;
+    }
+
     void prepare(const std::vector<SampledBlock>& blocks, const ov::Tensor& logits) override;
 
     bool is_position_major() const override {
@@ -84,12 +92,22 @@ public:
 
     bool fill_row(size_t block, size_t position, int64_t previous_token, float* row) const override;
 
+    bool draws_rows(size_t block, const GenerationConfig& config) const override;
+
+    std::optional<BlockToken> draw_row(size_t block,
+                                       size_t position,
+                                       const GenerationConfig& config,
+                                       double u) const override;
+
     // Microseconds the Markov head ran since the last call. The head runs during sampling, after the draft's
     // inference timer stops, so the draft reports this apart from its backbone and its sampling.
     float take_inference_duration();
 
 private:
     void score_candidates();
+    // True when draw_row() draws the rows of a request with this config: the argmax, or a temperature-only draw
+    // from the dense or the Top-K sampler.
+    bool samples_rows(const GenerationConfig& config) const;
     void infer(ov::InferRequest& request);
     const float* backbone_logits(size_t block, size_t position) const;
     float scaled_logit(float logit) const;
@@ -104,6 +122,13 @@ private:
     std::optional<ov::InferRequest> m_candidate_scorer;
     std::optional<ov::InferRequest> m_markov_step;
     std::optional<ov::InferRequest> m_draft_request;
+    // the dense sampler reads the logits in place, which the soft cap rules out
+    bool m_dense_sampler = false;
+    // the dense sampler's softmax of the vocabulary rows, compiled for the row width that prepare() sees
+    std::unique_ptr<TemperatureRowSampler> m_row_sampler;
+    bool m_parallel_rows = false;
+    size_t m_top_k = 0;
+    ov::Tensor m_top_k_ids;
 
     std::vector<SampledBlock> m_blocks;
     ov::Tensor m_logits;

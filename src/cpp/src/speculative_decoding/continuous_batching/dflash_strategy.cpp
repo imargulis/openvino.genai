@@ -11,6 +11,7 @@
 
 #include "sequence_group.hpp"
 #include "speculative_decoding/continuous_batching/dflash_candidate_selector.hpp"
+#include "speculative_decoding/continuous_batching/dflash_draft_switches.hpp"
 #include "utils.hpp"
 #include "visual_language/inputs_embedder.hpp"
 
@@ -131,6 +132,13 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     if (pruned_vocabulary) {
         utils::dflash::widen_draft_logits_to_target_vocabulary(draft_model, *pruned_vocabulary);
     }
+    // The Markov heads read the full logits rows.
+    const size_t draft_top_k = m_rt_info.markov_head_computation ? 0 : dflash_cb::draft_switches().draft_topk;
+    if (draft_top_k > 0) {
+        OPENVINO_ASSERT(dflash_cb::draft_switches().temperature_only,
+                        "OV_GENAI_DFLASH_DRAFT_TOPK needs OV_GENAI_DFLASH_DRAFT_TEMPERATURE_ONLY=1.");
+        utils::dflash::attach_draft_logits_top_k(draft_model, draft_top_k);
+    }
     validate_target_has_no_unmanaged_state(main_model);
     utils::dflash::expose_target_hidden_states(main_model, retained_hidden_state_locators, m_rt_info.target_layer_ids);
     utils::dflash::move_fc_from_draft_to_main(draft_model, main_model);
@@ -143,6 +151,7 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     m_tokenizer = main_model_desc.tokenizer;
     m_generation_config = main_model_desc.generation_config;
     auto candidate_selector = std::make_shared<dflash_cb::CandidateSelector>(m_rt_info, draft_device, draft_properties);
+    candidate_selector->set_draft_top_k(draft_top_k);
     m_rt_info.markov_head_computation.reset();
     utils::dflash::apply_dflash_gpu_compile_properties(m_rt_info,
                                                        draft_device,
@@ -229,6 +238,16 @@ GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_draft_gene
     draft_config.parsers.clear();
     draft_config.echo = false;
     draft_config.logprobs = 0;
+    if (dflash_cb::draft_switches().temperature_only) {
+        // The draft samples at the request's temperature only; the target applies the rest when it verifies.
+        draft_config.top_k = std::numeric_limits<size_t>::max();
+        draft_config.top_p = 1.0f;
+        draft_config.min_p = 0.0f;
+        draft_config.repetition_penalty = 1.0f;
+        draft_config.presence_penalty = 0.0f;
+        draft_config.frequency_penalty = 0.0f;
+        draft_config.min_new_tokens = 0;
+    }
     if (draft_config.max_new_tokens == SIZE_MAX && draft_config.max_length == SIZE_MAX) {
         // ignore_eos requires a finite generation limit.
         draft_config.max_new_tokens = SIZE_MAX - 1;

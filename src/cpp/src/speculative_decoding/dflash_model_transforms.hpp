@@ -224,6 +224,16 @@ std::optional<PrunedDraftVocabulary> extract_pruned_draft_vocabulary(const std::
 void widen_draft_logits_to_target_vocabulary(const std::shared_ptr<ov::Model>& draft_model,
                                              const PrunedDraftVocabulary& vocabulary);
 
+inline constexpr const char* DRAFT_TOP_K_IDS_OUTPUT_NAME = "draft_top_k_ids";
+
+/**
+ * @brief Replaces the draft 'logits' with the top_k largest logits of every row and adds their token ids as the i32
+ * 'draft_top_k_ids' output, so the draft returns top_k columns per row instead of the vocabulary.
+ *
+ * Run after the transforms that look for the draft lm_head right before 'logits'.
+ */
+void attach_draft_logits_top_k(const std::shared_ptr<ov::Model>& draft_model, size_t top_k);
+
 /**
  * @brief Attaches the target token embedding into the draft graph.
  *
