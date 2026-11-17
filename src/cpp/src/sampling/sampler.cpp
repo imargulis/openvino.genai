@@ -1607,14 +1607,35 @@ std::vector<SequenceGroupSamplingInfo> Sampler::_sample_blocks(const std::vector
     // The tasks reference the state above, so all of them finish before an exception leaves.
     const auto wait_all = [](auto& futures) {
         for (auto& future : futures) {
-            future.wait();
+            if (future.valid()) {
+                future.wait();
+            }
         }
+    };
+    // the uniform a row drawn by draw_row() takes from the request's rng; a greedy request leaves its rng alone
+    const auto row_uniform = [&](size_t block) {
+        std::uniform_real_distribution<double> uniform(0.0, 1.0);
+        return params(block).is_multinomial() ? uniform(contexts[block]->rng_engine) : 0.0;
     };
     std::vector<size_t> num_drawn(blocks.size(), 0);
     if (!m_block_row_source->is_position_major()) {
-        std::vector<std::future<size_t>> futures;
+        // a task per block, or per row for a block whose rows draw_row() draws
+        std::vector<std::future<size_t>> futures(blocks.size());
+        std::vector<std::vector<double>> uniforms(blocks.size());
+        std::vector<std::vector<std::future<std::optional<BlockToken>>>> row_futures(blocks.size());
         for (size_t block = 0; block < blocks.size(); ++block) {
-            futures.push_back(m_thread_pool.submit([&, block]() -> size_t {
+            if (m_block_row_source->draws_rows(block, params(block))) {
+                for (size_t position = 0; position < blocks[block].num_candidates; ++position) {
+                    uniforms[block].push_back(row_uniform(block));
+                }
+                for (size_t position = 0; position < blocks[block].num_candidates; ++position) {
+                    row_futures[block].push_back(m_thread_pool.submit([&, block, position]() {
+                        return m_block_row_source->draw_row(block, position, params(block), uniforms[block][position]);
+                    }));
+                }
+                continue;
+            }
+            futures[block] = m_thread_pool.submit([&, block]() -> size_t {
                 if (auto tokens = m_block_row_source->draw(block, params(block), contexts[block]->rng_engine)) {
                     for (const auto& token : *tokens) {
                         _append_block_token(sequences[block], token, *contexts[block]);
@@ -1636,11 +1657,25 @@ std::vector<SequenceGroupSamplingInfo> Sampler::_sample_blocks(const std::vector
                     previous_token = *token;
                 }
                 return position;
-            }));
+            });
         }
         wait_all(futures);
+        for (auto& rows : row_futures) {
+            wait_all(rows);
+        }
         for (size_t block = 0; block < blocks.size(); ++block) {
-            num_drawn[block] = futures[block].get();
+            if (futures[block].valid()) {
+                num_drawn[block] = futures[block].get();
+                continue;
+            }
+            for (auto& row : row_futures[block]) {
+                const auto token = row.get();
+                if (!token) {
+                    break;
+                }
+                _append_block_token(sequences[block], *token, *contexts[block]);
+                ++num_drawn[block];
+            }
         }
     } else {
         std::vector<int64_t> previous_tokens(blocks.size());
@@ -1659,7 +1694,18 @@ std::vector<SequenceGroupSamplingInfo> Sampler::_sample_blocks(const std::vector
             m_block_row_source->step(position, walking, walking_tokens);
             std::vector<std::future<bool>> futures;
             for (const size_t block : walking) {
-                futures.push_back(m_thread_pool.submit([&, block, position]() -> bool {
+                const bool draws_row = m_block_row_source->draws_rows(block, params(block));
+                const double u = draws_row ? row_uniform(block) : 0.0;
+                futures.push_back(m_thread_pool.submit([&, block, position, draws_row, u]() -> bool {
+                    if (draws_row) {
+                        const auto token = m_block_row_source->draw_row(block, position, params(block), u);
+                        if (!token) {
+                            return false;
+                        }
+                        _append_block_token(sequences[block], *token, *contexts[block]);
+                        previous_tokens[block] = token->token;
+                        return true;
+                    }
                     if (auto token = m_block_row_source->draw_token(block, position, params(block))) {
                         _append_block_token(sequences[block], *token, *contexts[block]);
                         previous_tokens[block] = token->token;

@@ -72,6 +72,22 @@ public:
         return std::nullopt;
     }
 
+    // True when draw_row() draws the tokens of the block for the request's config, each from one uniform the sampler
+    // takes from the request's rng in row order. The rows of a request-major block then do not depend on each other
+    // and are drawn in parallel; a position-major block draws one row per position after step().
+    virtual bool draws_rows(size_t block, const GenerationConfig& config) const {
+        return false;
+    }
+
+    // The token of the block's `position` from the uniform u in [0, 1), or nullopt to end the block before the
+    // position. Called concurrently.
+    virtual std::optional<BlockToken> draw_row(size_t block,
+                                               size_t position,
+                                               const GenerationConfig& config,
+                                               double u) const {
+        return std::nullopt;
+    }
+
     // Writes the vocabulary row of the block's `position` that follows previous_token, the anchor at position 0, or
     // returns false to end the block before the position. Called concurrently for different blocks.
     virtual bool fill_row(size_t block, size_t position, int64_t previous_token, float* row) const = 0;
