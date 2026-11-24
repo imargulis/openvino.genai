@@ -44,6 +44,20 @@ inline bool logit_processors_only_apply_temperature(const GenerationConfig& conf
            (config.top_k == 0 || config.top_k >= num_row_candidates) && config.top_p == 1.0f && config.min_p == 0.0f;
 }
 
+// How a draft draws its rows besides its Markov head: the prototype's dense sampler and Top-K head
+// (dflash_draft_switches.hpp). The defaults draw them as #4848 does.
+struct DraftRowOptions {
+    // the width of the draft logits rows, which the dense sampler is compiled for
+    size_t row_width = 0;
+    // a draft without a Markov head whose logits rows hold its top_k best logits, and whose draft_top_k_ids output
+    // holds their token ids
+    size_t top_k = 0;
+    // the temperature-only vocabulary rows of a draft without a soft cap are drawn from a softmax on the CPU plugin
+    bool dense_sampler = false;
+    // the CPU plugin streams of the dense sampler, which softmaxes as many rows of a block at once
+    size_t dense_sampler_streams = 1;
+};
+
 // The rows that the DFlash draft sampler draws its candidates from: the backbone logits scaled by output_multiplier and
 // soft-capped, and, for a draft with a Markov head (DSpark, DFlash-2), rows that make every candidate depend on the one
 // drafted before it. The Markov head runs once for the blocks of all requests: the Top-K candidate scorer scores every
@@ -59,21 +73,22 @@ public:
     // rt_info holds the Markov head computation, if any, that read_markov_head() selected.
     CandidateSelector(const utils::dflash::DFlashRTInfo& rt_info,
                       const std::string& device,
-                      const ov::AnyMap& properties);
+                      const ov::AnyMap& properties,
+                      const DraftRowOptions& row_options = {});
 
     bool has_markov_head() const {
         return m_candidate_scorer.has_value() || m_markov_step.has_value();
     }
 
+    // True when the selector draws the rows of a temperature-only request without the sampler: from the candidate
+    // scorer's lattice, the Top-K head's logits or the dense sampler.
+    bool draws_temperature_only_rows() const {
+        return m_candidate_scorer.has_value() || m_top_k > 0 || m_row_sampler != nullptr;
+    }
+
     // The draft request whose last_hidden_state holds the hidden state of every logits row.
     void set_draft_request(ov::InferRequest draft_request) {
         m_draft_request = std::move(draft_request);
-    }
-
-    // A draft without a Markov head whose logits rows hold the top_k largest logits of every row, and whose
-    // draft_top_k_ids output holds their token ids.
-    void set_draft_top_k(size_t top_k) {
-        m_top_k = top_k;
     }
 
     void prepare(const std::vector<SampledBlock>& blocks, const ov::Tensor& logits) override;
@@ -105,9 +120,13 @@ public:
 
 private:
     void score_candidates();
-    // True when draw_row() draws the rows of a request with this config: the argmax, or a temperature-only draw
-    // from the dense or the Top-K sampler.
+    // True when draw() or draw_row() draws the rows of a request with this config without the sampler: the greedy and
+    // temperature-only rows of a Top-K draft, the dense sampler's temperature-only rows.
     bool samples_rows(const GenerationConfig& config) const;
+    // The tokens of the block's rows from their uniforms, up to the first row without mass.
+    std::vector<BlockToken> draw_rows(size_t block,
+                                      const GenerationConfig& config,
+                                      const std::vector<double>& uniforms) const;
     void infer(ov::InferRequest& request);
     const float* backbone_logits(size_t block, size_t position) const;
     float scaled_logit(float logit) const;
@@ -122,11 +141,8 @@ private:
     std::optional<ov::InferRequest> m_candidate_scorer;
     std::optional<ov::InferRequest> m_markov_step;
     std::optional<ov::InferRequest> m_draft_request;
-    // the dense sampler reads the logits in place, which the soft cap rules out
-    bool m_dense_sampler = false;
-    // the dense sampler's softmax of the vocabulary rows, compiled for the row width that prepare() sees
+    // the dense sampler's softmax of the vocabulary rows
     std::unique_ptr<TemperatureRowSampler> m_row_sampler;
-    bool m_parallel_rows = false;
     size_t m_top_k = 0;
     ov::Tensor m_top_k_ids;
 

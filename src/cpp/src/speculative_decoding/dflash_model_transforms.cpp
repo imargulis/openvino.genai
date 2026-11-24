@@ -1020,17 +1020,25 @@ void widen_draft_logits_to_target_vocabulary(const std::shared_ptr<ov::Model>& d
     draft_model->validate_nodes_and_infer_types();
 }
 
+size_t draft_logits_width(const std::shared_ptr<ov::Model>& draft_model) {
+    return logits_width(draft_model, "draft model");
+}
+
 void attach_draft_logits_top_k(const std::shared_ptr<ov::Model>& draft_model, size_t top_k) {
     OPENVINO_ASSERT(draft_model && top_k > 0, "The DFlash draft logits Top-K needs a draft model and K > 0.");
+    const size_t width = draft_logits_width(draft_model);
+    OPENVINO_ASSERT(top_k <= width,
+                    "The DFlash draft logits Top-K keeps at most the ",
+                    width,
+                    " logits of a row, got K = ",
+                    top_k,
+                    ".");
     const auto logits_result = find_result_named(draft_model, "logits");
-    OPENVINO_ASSERT(logits_result, "The DFlash draft model has no 'logits' output.");
     const auto logits = logits_result->input_value(0);
-    const auto rank = logits.get_partial_shape().rank();
-    OPENVINO_ASSERT(rank.is_static() && rank.get_length() > 0, "The DFlash draft 'logits' must have a static rank.");
     const auto topk = std::make_shared<ov::op::v11::TopK>(
         logits,
         ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {static_cast<int64_t>(top_k)}),
-        rank.get_length() - 1,
+        logits.get_partial_shape().rank().get_length() - 1,
         ov::op::TopKMode::MAX,
         ov::op::TopKSortType::SORT_VALUES,
         ov::element::i32);

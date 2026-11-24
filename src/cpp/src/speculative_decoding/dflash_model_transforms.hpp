@@ -227,8 +227,14 @@ void widen_draft_logits_to_target_vocabulary(const std::shared_ptr<ov::Model>& d
 inline constexpr const char* DRAFT_TOP_K_IDS_OUTPUT_NAME = "draft_top_k_ids";
 
 /**
+ * @brief The width of the rows of the draft 'logits' output, which must be static.
+ */
+size_t draft_logits_width(const std::shared_ptr<ov::Model>& draft_model);
+
+/**
  * @brief Replaces the draft 'logits' with the top_k largest logits of every row and adds their token ids as the i32
- * 'draft_top_k_ids' output, so the draft returns top_k columns per row instead of the vocabulary.
+ * 'draft_top_k_ids' output, so the draft returns top_k columns per row instead of the vocabulary. top_k is at most
+ * the row width.
  *
  * Run after the transforms that look for the draft lm_head right before 'logits'.
  */

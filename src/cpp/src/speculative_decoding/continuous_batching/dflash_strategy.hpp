@@ -53,9 +53,12 @@ protected:
     void validate_request_config(const GenerationConfig& config) const;
     // An unset num_assistant_tokens takes the default; an explicit 0 runs the request on the target alone.
     GenerationConfig make_main_generation_config(const GenerationConfig& config) const;
-    static GenerationConfig make_draft_generation_config(const GenerationConfig& config);
+    // With temperature_only, the draft keeps only the request's temperature and seed.
+    static GenerationConfig make_draft_generation_config(const GenerationConfig& config, bool temperature_only = false);
 
     ov::genai::utils::dflash::DFlashRTInfo m_rt_info;
+    // OV_GENAI_DFLASH_DRAFT_TEMPERATURE_ONLY=1 for a draft that draws temperature-only rows without the sampler
+    bool m_draft_temperature_only = false;
 };
 
 }  // namespace ov::genai

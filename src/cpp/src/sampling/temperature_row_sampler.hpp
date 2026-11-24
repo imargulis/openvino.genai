@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -21,13 +23,24 @@ struct RowDraw {
     DraftProposalPtr proposal;
 };
 
+class ProposalBufferPool;
+
 // Draws from softmax((multiplier * logits + bias) / temperature) over full vocabulary rows the way the sampler draws a
-// row whose logit processors only apply the temperature. The softmax and the sums of its blocks run on the OpenVINO
-// CPU plugin, which picks its kernels for the host's instruction set; the draw scans the block sums, then one block.
-// The probabilities go to a pooled buffer that the dense proposal returns to the pool when it is released.
+// row whose logit processors only apply the temperature. The softmax runs on the OpenVINO CPU plugin, which picks its
+// kernels for the host's instruction set, into pooled buffers that the dense proposals give back when they are
+// released. A row's token is drawn from the proposal it records, to double precision.
 class TemperatureRowSampler {
 public:
-    // with_bias: every row takes a bias row. num_streams: the rows the CPU plugin softmaxes at once, one thread each.
+    struct Row {
+        const float* logits = nullptr;
+        // null unless with_bias()
+        const float* bias = nullptr;
+        // the uniform in [0, 1) that SamplingDistribution::draw() takes from the request's rng
+        double u = 0.0;
+    };
+
+    // with_bias: every row takes a bias row. num_streams: the CPU plugin streams, which softmax as many rows at once;
+    // the plugin keeps at most one per performance core.
     TemperatureRowSampler(size_t vocab_size, bool with_bias, size_t num_streams);
 
     size_t vocab_size() const {
@@ -38,30 +51,45 @@ public:
         return m_with_bias;
     }
 
-    // u is the uniform in [0, 1) that SamplingDistribution::draw() takes from the request's rng. bias is null unless
-    // with_bias(); multiplier > 0. nullopt when the row has no mass. Callable concurrently: each call takes an infer
-    // request of its own.
-    std::optional<RowDraw> sample(const float* logits,
-                                  const float* bias,
-                                  float multiplier,
-                                  float temperature,
-                                  double u);
+    // the rows the CPU plugin softmaxes at once
+    size_t num_streams() const {
+        return m_num_streams;
+    }
+
+    // Draws every row from its uniform, with multiplier > 0, on as many streams as are free; nullopt for a row without
+    // mass. Callable concurrently.
+    std::vector<std::optional<RowDraw>> sample(const std::vector<Row>& rows, float multiplier, float temperature);
+
+    // Keeps at most num_buffers of the buffers that released proposals give back, for the next rows.
+    void keep_buffers(size_t num_buffers);
 
 private:
-    ov::InferRequest take_request();
-    void give_request(ov::InferRequest&& request);
+    class Lease;
+
+    std::optional<RowDraw> draw(std::vector<float>&& probabilities, double u);
 
     size_t m_vocab_size = 0;
     bool m_with_bias = false;
-    // the probabilities per block sum
-    size_t m_block = 0;
     ov::CompiledModel m_compiled;
+    // shared with the proposals, which can outlive the sampler
+    std::shared_ptr<ProposalBufferPool> m_buffers;
     std::mutex m_mutex;
+    std::condition_variable m_request_returned;
     std::vector<ov::InferRequest> m_free_requests;
+    // the requests that exist, free or leased, at most one per stream
+    size_t m_num_requests = 0;
+    size_t m_num_streams = 0;
 };
 
-// The first index of the largest multiplier * logits + bias, multiplier > 0. bias may be null.
-int64_t row_argmax(const float* logits, const float* bias, size_t size, float multiplier);
+struct WeightedDraw {
+    size_t index = 0;
+    double total = 0.0;
+};
+
+// The index at u of the distribution proportional to the weights, which SamplingDistribution::draw() draws with one
+// running sum, from sums of blocks to double precision, and the total weight. A u at which the threshold rounds up to
+// the total takes the last weight with mass. nullopt when the weights have no positive finite mass.
+std::optional<WeightedDraw> draw_weighted(const float* weights, size_t size, double u);
 
 // Draws from softmax(values / temperature) over k candidates, values[i] the logit of token ids[i]. The proposal is
 // sparse over the k ids. nullopt when the candidates have no mass.

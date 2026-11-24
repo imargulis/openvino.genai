@@ -1618,35 +1618,14 @@ std::vector<SequenceGroupSamplingInfo> Sampler::_sample_blocks(const std::vector
     // The tasks reference the state above, so all of them finish before an exception leaves.
     const auto wait_all = [](auto& futures) {
         for (auto& future : futures) {
-            if (future.valid()) {
-                future.wait();
-            }
+            future.wait();
         }
-    };
-    // the uniform a row drawn by draw_row() takes from the request's rng; a greedy request leaves its rng alone
-    const auto row_uniform = [&](size_t block) {
-        std::uniform_real_distribution<double> uniform(0.0, 1.0);
-        return params(block).is_multinomial() ? uniform(contexts[block]->rng_engine) : 0.0;
     };
     std::vector<size_t> num_drawn(blocks.size(), 0);
     if (!m_block_row_source->is_position_major()) {
-        // a task per block, or per row for a block whose rows draw_row() draws
-        std::vector<std::future<size_t>> futures(blocks.size());
-        std::vector<std::vector<double>> uniforms(blocks.size());
-        std::vector<std::vector<std::future<std::optional<BlockToken>>>> row_futures(blocks.size());
+        std::vector<std::future<size_t>> futures;
         for (size_t block = 0; block < blocks.size(); ++block) {
-            if (m_block_row_source->draws_rows(block, params(block))) {
-                for (size_t position = 0; position < blocks[block].num_candidates; ++position) {
-                    uniforms[block].push_back(row_uniform(block));
-                }
-                for (size_t position = 0; position < blocks[block].num_candidates; ++position) {
-                    row_futures[block].push_back(m_thread_pool.submit([&, block, position]() {
-                        return m_block_row_source->draw_row(block, position, params(block), uniforms[block][position]);
-                    }));
-                }
-                continue;
-            }
-            futures[block] = m_thread_pool.submit([&, block]() -> size_t {
+            futures.push_back(m_thread_pool.submit([&, block]() -> size_t {
                 if (auto tokens = m_block_row_source->draw(block, params(block), contexts[block]->rng_engine)) {
                     for (const auto& token : *tokens) {
                         _append_block_token(sequences[block], token, *contexts[block]);
@@ -1668,27 +1647,18 @@ std::vector<SequenceGroupSamplingInfo> Sampler::_sample_blocks(const std::vector
                     previous_token = *token;
                 }
                 return position;
-            });
+            }));
         }
         wait_all(futures);
-        for (auto& rows : row_futures) {
-            wait_all(rows);
-        }
         for (size_t block = 0; block < blocks.size(); ++block) {
-            if (futures[block].valid()) {
-                num_drawn[block] = futures[block].get();
-                continue;
-            }
-            for (auto& row : row_futures[block]) {
-                const auto token = row.get();
-                if (!token) {
-                    break;
-                }
-                _append_block_token(sequences[block], *token, *contexts[block]);
-                ++num_drawn[block];
-            }
+            num_drawn[block] = futures[block].get();
         }
     } else {
+        // the uniform a row drawn by draw_row() takes from the request's rng
+        const auto row_uniform = [&](size_t block) {
+            std::uniform_real_distribution<double> uniform(0.0, 1.0);
+            return uniform(contexts[block]->rng_engine);
+        };
         std::vector<int64_t> previous_tokens(blocks.size());
         // allocated on the first fill_row() of a block; draw_token() needs no row
         std::vector<std::vector<float>> rows(blocks.size());

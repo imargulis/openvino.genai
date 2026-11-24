@@ -8,12 +8,10 @@
 #include <cmath>
 #include <functional>
 #include <limits>
-#include <thread>
 #include <utility>
 
 #include "openvino/genai/perf_metrics.hpp"
 #include "speculative_decoding/continuous_batching/dflash_candidate_lattice.hpp"
-#include "speculative_decoding/continuous_batching/dflash_draft_switches.hpp"
 #include "utils.hpp"
 
 namespace ov::genai::dflash_cb {
@@ -54,38 +52,40 @@ ov::Tensor packed_rows(const ov::Tensor& rows, const std::vector<SampledBlock>& 
     return packed;
 }
 
-size_t row_sampler_streams() {
-    if (draft_switches().row_streams > 0) {
-        return draft_switches().row_streams;
-    }
-    return std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 8);
-}
-
 }  // namespace
 
 CandidateSelector::CandidateSelector(const utils::dflash::DFlashRTInfo& rt_info,
                                      const std::string& device,
-                                     const ov::AnyMap& properties)
+                                     const ov::AnyMap& properties,
+                                     const DraftRowOptions& row_options)
     : m_output_multiplier(rt_info.output_multiplier),
-      m_final_logit_softcapping(rt_info.final_logit_softcapping) {
-    m_dense_sampler = draft_switches().dense_sampler && m_final_logit_softcapping <= 0.0f;
-    m_parallel_rows = draft_switches().parallel_rows;
+      m_final_logit_softcapping(rt_info.final_logit_softcapping),
+      m_top_k(row_options.top_k) {
     const auto& markov_head = rt_info.markov_head_computation;
-    if (!markov_head) {
-        return;
+    OPENVINO_ASSERT(m_top_k == 0 || !markov_head,
+                    "The Markov heads of a DFlash draft read full logits rows, not a Top-K.");
+    if (markov_head) {
+        // A draft without properties takes the target's, which can carry a MODEL_PROPERTIES overlay and the GenAI-only
+        // sampler_num_threads that LLMPipeline adds. The head compiles with the language model's properties, as the
+        // backbone does.
+        ov::AnyMap compile_properties = utils::get_model_properties(properties, "language_model", device);
+        compile_properties.erase("sampler_num_threads");
+        auto request =
+            utils::singleton_core().compile_model(markov_head, device, compile_properties).create_infer_request();
+        if (utils::dflash::is_markov_step(markov_head)) {
+            m_markov_step = std::move(request);
+        } else {
+            m_reads_hidden_states = utils::has_input(markov_head, "draft_hidden_states");
+            m_candidate_scorer = std::move(request);
+        }
     }
-    // A draft without properties takes the target's, which can carry a MODEL_PROPERTIES overlay and the GenAI-only
-    // sampler_num_threads that LLMPipeline adds. The head compiles with the language model's properties, as the
-    // backbone does.
-    ov::AnyMap compile_properties = utils::get_model_properties(properties, "language_model", device);
-    compile_properties.erase("sampler_num_threads");
-    auto request =
-        utils::singleton_core().compile_model(markov_head, device, compile_properties).create_infer_request();
-    if (utils::dflash::is_markov_step(markov_head)) {
-        m_markov_step = std::move(request);
-    } else {
-        m_reads_hidden_states = utils::has_input(markov_head, "draft_hidden_states");
-        m_candidate_scorer = std::move(request);
+    // the dense sampler scales the logits linearly, which the soft cap rules out
+    if (row_options.dense_sampler && m_final_logit_softcapping <= 0.0f && !m_candidate_scorer && m_top_k == 0) {
+        OPENVINO_ASSERT(row_options.row_width > 0,
+                        "The DFlash dense sampler needs the width of the draft logits rows.");
+        m_row_sampler = std::make_unique<TemperatureRowSampler>(row_options.row_width,
+                                                                m_markov_step.has_value(),
+                                                                row_options.dense_sampler_streams);
     }
 }
 
@@ -111,10 +111,19 @@ void CandidateSelector::prepare(const std::vector<SampledBlock>& blocks, const o
                         " logits per row.");
         m_top_k_ids = ov::Tensor(ids.get_element_type(), ids.get_shape(), ids.data());
     }
-    if (m_dense_sampler && !m_candidate_scorer && m_top_k == 0 &&
-        (!m_row_sampler || m_row_sampler->vocab_size() != m_vocab_size)) {
-        m_row_sampler =
-            std::make_unique<TemperatureRowSampler>(m_vocab_size, m_markov_step.has_value(), row_sampler_streams());
+    if (m_row_sampler) {
+        OPENVINO_ASSERT(m_row_sampler->vocab_size() == m_vocab_size,
+                        "The DFlash dense sampler was compiled for rows of ",
+                        m_row_sampler->vocab_size(),
+                        " logits, the draft returned rows of ",
+                        m_vocab_size,
+                        ".");
+        size_t num_candidates = 0;
+        for (const auto& block : blocks) {
+            num_candidates += block.num_candidates;
+        }
+        // the proposals of a step are released before the next step draws
+        m_row_sampler->keep_buffers(num_candidates);
     }
     if (m_candidate_scorer && !m_blocks.empty()) {
         score_candidates();
@@ -200,16 +209,15 @@ std::optional<std::vector<BlockToken>> CandidateSelector::draw(size_t block,
         return std::nullopt;
     }
     if (samples_rows(config)) {
-        std::uniform_real_distribution<double> uniform(0.0, 1.0);
-        std::vector<BlockToken> tokens;
-        for (size_t position = 0; position < num_candidates; ++position) {
-            auto token = draw_row(block, position, config, config.is_multinomial() ? uniform(rng) : 0.0);
-            if (!token) {
-                break;
+        // a uniform for every candidate, also those after a row without mass, since the rows are drawn at once
+        std::vector<double> uniforms(num_candidates, 0.0);
+        if (config.is_multinomial()) {
+            std::uniform_real_distribution<double> uniform(0.0, 1.0);
+            for (double& u : uniforms) {
+                u = uniform(rng);
             }
-            tokens.push_back(std::move(*token));
         }
-        return tokens;
+        return draw_rows(block, config, uniforms);
     }
     OPENVINO_ASSERT(m_top_k == 0, "A draft logits Top-K draws greedy and temperature-only requests only.");
     if (!logit_processors_keep_argmax(config)) {
@@ -247,63 +255,75 @@ std::optional<BlockToken> CandidateSelector::draw_token(size_t block,
 }
 
 bool CandidateSelector::samples_rows(const GenerationConfig& config) const {
-    if (m_candidate_scorer || (!m_dense_sampler && m_top_k == 0)) {
-        return false;
+    if (m_top_k > 0) {
+        // a request top_k at or above the vocabulary keeps a full row only
+        return logit_processors_keep_argmax(config) ||
+               logit_processors_only_apply_temperature(config, std::numeric_limits<size_t>::max());
     }
-    if (logit_processors_keep_argmax(config)) {
-        return true;
-    }
-    // a request top_k at or above the row width keeps a full row only
-    const size_t num_row_candidates = m_top_k > 0 ? std::numeric_limits<size_t>::max() : m_vocab_size;
-    return logit_processors_only_apply_temperature(config, num_row_candidates);
+    return m_row_sampler && logit_processors_only_apply_temperature(config, m_row_sampler->vocab_size());
 }
 
 bool CandidateSelector::draws_rows(size_t, const GenerationConfig& config) const {
-    return samples_rows(config) && (m_markov_step.has_value() || m_parallel_rows);
+    return m_markov_step.has_value() && samples_rows(config);
+}
+
+std::vector<BlockToken> CandidateSelector::draw_rows(size_t block,
+                                                     const GenerationConfig& config,
+                                                     const std::vector<double>& uniforms) const {
+    std::vector<BlockToken> tokens;
+    if (m_top_k > 0) {
+        const bool greedy = logit_processors_keep_argmax(config);
+        std::vector<float> scaled(m_top_k);
+        for (size_t position = 0; position < uniforms.size(); ++position) {
+            const float* logits = backbone_logits(block, position);
+            const int32_t* ids = m_top_k_ids.data<const int32_t>() + (m_blocks[block].first_row + position) * m_top_k;
+            if (greedy) {
+                // the argmax of the full row, the smallest id of equal logits
+                size_t best = 0;
+                for (size_t idx = 1; idx < m_top_k; ++idx) {
+                    if (logits[idx] > logits[best] || (logits[idx] == logits[best] && ids[idx] < ids[best])) {
+                        best = idx;
+                    }
+                }
+                tokens.push_back({ids[best], 0.0f, nullptr});
+                continue;
+            }
+            std::transform(logits, logits + m_top_k, scaled.begin(), [this](float logit) {
+                return scaled_logit(logit);
+            });
+            auto draw =
+                sample_temperature_candidates(scaled.data(), ids, m_top_k, config.temperature, uniforms[position]);
+            if (!draw) {
+                break;
+            }
+            tokens.push_back({draw->token, draw->log_prob, std::move(draw->proposal)});
+        }
+        return tokens;
+    }
+    std::vector<TemperatureRowSampler::Row> rows;
+    for (size_t position = 0; position < uniforms.size(); ++position) {
+        rows.push_back({backbone_logits(block, position), nullptr, uniforms[position]});
+    }
+    for (auto& draw : m_row_sampler->sample(rows, m_output_multiplier, config.temperature)) {
+        if (!draw) {
+            break;
+        }
+        tokens.push_back({draw->token, draw->log_prob, std::move(draw->proposal)});
+    }
+    return tokens;
 }
 
 std::optional<BlockToken> CandidateSelector::draw_row(size_t block,
                                                       size_t position,
                                                       const GenerationConfig& config,
                                                       double u) const {
-    const float* logits = backbone_logits(block, position);
-    const bool greedy = logit_processors_keep_argmax(config);
-    if (m_top_k > 0) {
-        const int32_t* ids = m_top_k_ids.data<const int32_t>() + (m_blocks[block].first_row + position) * m_top_k;
-        if (greedy) {
-            // the argmax of the full row, the smallest id of equal logits
-            size_t best = 0;
-            for (size_t idx = 1; idx < m_top_k; ++idx) {
-                if (logits[idx] > logits[best] || (logits[idx] == logits[best] && ids[idx] < ids[best])) {
-                    best = idx;
-                }
-            }
-            return BlockToken{ids[best], 0.0f, nullptr};
-        }
-        thread_local std::vector<float> scaled;
-        scaled.resize(m_top_k);
-        std::transform(logits, logits + m_top_k, scaled.begin(), [this](float logit) {
-            return scaled_logit(logit);
-        });
-        auto draw = sample_temperature_candidates(scaled.data(), ids, m_top_k, config.temperature, u);
-        if (!draw) {
-            return std::nullopt;
-        }
-        return BlockToken{draw->token, draw->log_prob, std::move(draw->proposal)};
-    }
-    const float* bias = m_markov_step ? markov_bias(block) : nullptr;
-    if (greedy) {
-        // the token draw() takes from the backbone logits, or draw_token() from the row fill_row() writes
-        const int64_t token = m_markov_step ? row_argmax(logits, bias, m_vocab_size, m_output_multiplier)
-                                            : row_argmax(logits, nullptr, m_vocab_size, 1.0f);
-        return BlockToken{token, 0.0f, nullptr};
-    }
-    OPENVINO_ASSERT(m_row_sampler, "The DFlash dense sampler was not compiled for the draft rows.");
-    auto draw = m_row_sampler->sample(logits, bias, m_output_multiplier, config.temperature, u);
-    if (!draw) {
+    auto draws = m_row_sampler->sample({{backbone_logits(block, position), markov_bias(block), u}},
+                                       m_output_multiplier,
+                                       config.temperature);
+    if (!draws.front()) {
         return std::nullopt;
     }
-    return BlockToken{draw->token, draw->log_prob, std::move(draw->proposal)};
+    return BlockToken{draws.front()->token, draws.front()->log_prob, std::move(draws.front()->proposal)};
 }
 
 bool CandidateSelector::fill_row(size_t block, size_t position, int64_t previous_token, float* row) const {

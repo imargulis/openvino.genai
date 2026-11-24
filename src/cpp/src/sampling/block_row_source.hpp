@@ -38,8 +38,8 @@ struct BlockToken {
 // with the blocks of all requests, so the source can run a model once for all of them, and then draws the tokens of
 // each block in order:
 // - by request: draw(), or fill_row() for one position after another, in parallel across blocks;
-// - by position when is_position_major(): step() for the blocks that draw a token at the position, then draw_token(),
-//   or fill_row(), for each of them in parallel.
+// - by position when is_position_major(): step() for the blocks that draw a token at the position, then draw_row(),
+//   draw_token() or fill_row() for each of them in parallel.
 // The sampler applies the request's logit processors to a filled row and samples it as a logits row.
 class BlockRowSource {
 public:
@@ -72,15 +72,14 @@ public:
         return std::nullopt;
     }
 
-    // True when draw_row() draws the tokens of the block for the request's config, each from one uniform the sampler
-    // takes from the request's rng in row order. The rows of a request-major block then do not depend on each other
-    // and are drawn in parallel; a position-major block draws one row per position after step().
+    // Position-major only: true when draw_row() draws the tokens of the block for the request's config, each from one
+    // uniform that the sampler takes from the request's rng.
     virtual bool draws_rows(size_t block, const GenerationConfig& config) const {
         return false;
     }
 
     // The token of the block's `position` from the uniform u in [0, 1), or nullopt to end the block before the
-    // position. Called concurrently.
+    // position. Called concurrently for different blocks.
     virtual std::optional<BlockToken> draw_row(size_t block,
                                                size_t position,
                                                const GenerationConfig& config,

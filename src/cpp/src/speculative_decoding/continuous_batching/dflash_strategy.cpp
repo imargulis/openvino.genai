@@ -132,12 +132,13 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     if (pruned_vocabulary) {
         utils::dflash::widen_draft_logits_to_target_vocabulary(draft_model, *pruned_vocabulary);
     }
-    // The Markov heads read the full logits rows.
-    const size_t draft_top_k = m_rt_info.markov_head_computation ? 0 : dflash_cb::draft_switches().draft_topk;
-    if (draft_top_k > 0) {
-        OPENVINO_ASSERT(dflash_cb::draft_switches().temperature_only,
-                        "OV_GENAI_DFLASH_DRAFT_TOPK needs OV_GENAI_DFLASH_DRAFT_TEMPERATURE_ONLY=1.");
-        utils::dflash::attach_draft_logits_top_k(draft_model, draft_top_k);
+    const auto& switches = dflash_cb::draft_switches();
+    if (switches.draft_topk > 0) {
+        // The Markov heads read the full logits rows.
+        OPENVINO_ASSERT(switches.temperature_only && !m_rt_info.markov_head_computation,
+                        "OV_GENAI_DFLASH_DRAFT_TOPK needs OV_GENAI_DFLASH_DRAFT_TEMPERATURE_ONLY=1 and a draft without "
+                        "a Markov head.");
+        utils::dflash::attach_draft_logits_top_k(draft_model, switches.draft_topk);
     }
     validate_target_has_no_unmanaged_state(main_model);
     utils::dflash::expose_target_hidden_states(main_model, retained_hidden_state_locators, m_rt_info.target_layer_ids);
@@ -150,8 +151,16 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
 
     m_tokenizer = main_model_desc.tokenizer;
     m_generation_config = main_model_desc.generation_config;
-    auto candidate_selector = std::make_shared<dflash_cb::CandidateSelector>(m_rt_info, draft_device, draft_properties);
-    candidate_selector->set_draft_top_k(draft_top_k);
+    dflash_cb::DraftRowOptions row_options;
+    row_options.top_k = switches.draft_topk;
+    row_options.dense_sampler = switches.dense_sampler;
+    row_options.dense_sampler_streams = switches.dense_sampler_streams();
+    if (switches.dense_sampler) {
+        row_options.row_width = utils::dflash::draft_logits_width(draft_model);
+    }
+    auto candidate_selector =
+        std::make_shared<dflash_cb::CandidateSelector>(m_rt_info, draft_device, draft_properties, row_options);
+    m_draft_temperature_only = switches.temperature_only && candidate_selector->draws_temperature_only_rows();
     m_rt_info.markov_head_computation.reset();
     utils::dflash::apply_dflash_gpu_compile_properties(m_rt_info,
                                                        draft_device,
@@ -228,7 +237,8 @@ GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_main_gener
 }
 
 GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_draft_generation_config(
-    const GenerationConfig& config) {
+    const GenerationConfig& config,
+    bool temperature_only) {
     // The target decides when to stop and what to return; the draft only proposes candidates, drawn independently
     // of the target's draws. ignore_eos disables the stop tokens; they stay because validate() requires
     // eos_token_id among them.
@@ -238,7 +248,7 @@ GenerationConfig ContinuousBatchingPipeline::DFlashDecodingImpl::make_draft_gene
     draft_config.parsers.clear();
     draft_config.echo = false;
     draft_config.logprobs = 0;
-    if (dflash_cb::draft_switches().temperature_only) {
+    if (temperature_only) {
         // The draft samples at the request's temperature only; the target applies the rest when it verifies.
         draft_config.top_k = std::numeric_limits<size_t>::max();
         draft_config.top_p = 1.0f;
@@ -305,9 +315,11 @@ GenerationHandle ContinuousBatchingPipeline::DFlashDecodingImpl::add_request(
     // insert_or_assign drops a stale handle a finished request may leave under the same request_id.
     try {
         if (has_draft_request(main_sampling_params)) {
+            const auto draft_sampling_params =
+                make_draft_generation_config(main_sampling_params, m_draft_temperature_only);
             m_draft_generations.insert_or_assign(
                 request_id,
-                m_draft_pipeline->add_request(request_id, input_ids, make_draft_generation_config(main_sampling_params), prompt_ids));
+                m_draft_pipeline->add_request(request_id, input_ids, draft_sampling_params, prompt_ids));
         }
         auto main_handle =
             m_main_pipeline->add_request(request_id, input_ids, main_sampling_params, prompt_ids, lm_extra_inputs);
@@ -358,9 +370,10 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::validate_request(
                     "DFlash speculative decoding of models with linear-attention state supports greedy decoding only "
                     "when prefix caching is enabled; set enable_prefix_caching to false to use multinomial sampling.");
     if (has_draft_request(main_sampling_params)) {
-        m_draft_pipeline->validate_request(request_id,
-                                           input_shape[1],
-                                           make_draft_generation_config(main_sampling_params));
+        m_draft_pipeline->validate_request(
+            request_id,
+            input_shape[1],
+            make_draft_generation_config(main_sampling_params, m_draft_temperature_only));
     }
     m_main_pipeline->validate_request(request_id, input_ids, main_sampling_params, prompt_ids, lm_extra_inputs);
 }
