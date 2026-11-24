@@ -15,6 +15,8 @@
 #include "openvino/runtime/infer_request.hpp"
 #include "sampling/draft_proposal.hpp"
 
+class ThreadPool;
+
 namespace ov::genai {
 
 struct RowDraw {
@@ -40,8 +42,9 @@ public:
     };
 
     // with_bias: every row takes a bias row. num_streams: the CPU plugin streams, which softmax as many rows at once;
-    // the plugin keeps at most one per performance core.
+    // the plugin keeps at most one per performance core. With more than one stream, as many threads draw the rows.
     TemperatureRowSampler(size_t vocab_size, bool with_bias, size_t num_streams);
+    ~TemperatureRowSampler();
 
     size_t vocab_size() const {
         return m_vocab_size;
@@ -79,6 +82,8 @@ private:
     // the requests that exist, free or leased, at most one per stream
     size_t m_num_requests = 0;
     size_t m_num_streams = 0;
+    // null with one stream. Destroyed first: it finishes the draws it holds, which use the members above.
+    std::unique_ptr<ThreadPool> m_draw_threads;
 };
 
 struct WeightedDraw {

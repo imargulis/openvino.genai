@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <future>
 #include <limits>
 #include <numeric>
 #include <utility>
@@ -17,6 +18,7 @@
 #include "openvino/op/softmax.hpp"
 #include "openvino/runtime/properties.hpp"
 #include "sampling/logit_transformers.hpp"
+#include "sampling/threadpool.hpp"
 #include "utils.hpp"
 
 namespace ov::genai {
@@ -264,7 +266,13 @@ TemperatureRowSampler::TemperatureRowSampler(size_t vocab_size, bool with_bias, 
         m_free_requests.push_back(m_compiled.create_infer_request());
     }
     m_num_requests = m_num_streams;
+    // One thread keeps up with the draws of one stream, which overlap its next softmax, but not with those of several.
+    if (m_num_streams > 1) {
+        m_draw_threads = std::make_unique<ThreadPool>(m_num_streams);
+    }
 }
+
+TemperatureRowSampler::~TemperatureRowSampler() = default;
 
 void TemperatureRowSampler::keep_buffers(size_t num_buffers) {
     m_buffers->set_capacity(num_buffers);
@@ -286,6 +294,9 @@ std::vector<std::optional<RowDraw>> TemperatureRowSampler::sample(const std::vec
     const ov::Shape row_shape{1, m_vocab_size};
     // the buffer each request softmaxes into, which outlives the lease's inferences
     std::vector<std::vector<float>> probabilities;
+    // the draws of the draw threads, in row order. Each owns its row's buffer, so a call that unwinds leaves them
+    // nothing to free.
+    std::vector<std::future<std::optional<RowDraw>>> threaded_draws;
     Lease lease(*this, rows.size());
     probabilities.resize(lease.size());
     // row r runs on request r % lease.size(), so the rows finish in their order
@@ -306,6 +317,8 @@ std::vector<std::optional<RowDraw>> TemperatureRowSampler::sample(const std::vec
     for (size_t row = 0; row < std::min(lease.size(), rows.size()); ++row) {
         start(row);
     }
+    // a call that holds one request draws each row while the next one's softmax runs
+    const bool threaded = m_draw_threads && lease.size() > 1;
     for (size_t row = 0; row < rows.size(); ++row) {
         const size_t slot = row % lease.size();
         lease[slot].wait();
@@ -313,9 +326,19 @@ std::vector<std::optional<RowDraw>> TemperatureRowSampler::sample(const std::vec
         if (row + lease.size() < rows.size()) {
             start(row + lease.size());
         }
-        draws[row] = draw(std::move(row_probabilities), rows[row].u);
+        if (threaded) {
+            threaded_draws.push_back(
+                m_draw_threads->submit([this, buffer = std::move(row_probabilities), u = rows[row].u]() mutable {
+                    return draw(std::move(buffer), u);
+                }));
+        } else {
+            draws[row] = draw(std::move(row_probabilities), rows[row].u);
+        }
     }
     lease.give_back();
+    for (size_t row = 0; row < threaded_draws.size(); ++row) {
+        draws[row] = threaded_draws[row].get();
+    }
     return draws;
 }
 

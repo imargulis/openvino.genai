@@ -27,7 +27,7 @@ struct DraftSwitches {
     // pooled proposal buffers.
     bool dense_sampler = false;
     // OV_GENAI_DFLASH_PARALLEL_ROWS=1: the dense sampler softmaxes the rows of a DFlash v1 block at once, on CPU
-    // plugin streams.
+    // plugin streams, and draws them on as many threads.
     bool parallel_rows = false;
     // OV_GENAI_DFLASH_DRAFT_TOPK=K: a DFlash v1 draft returns its K best logits per row and their ids. Needs
     // OV_GENAI_DFLASH_DRAFT_TEMPERATURE_ONLY=1.
