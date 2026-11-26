@@ -223,8 +223,9 @@ def test_target_and_draft_preemption_complete(dflash_models, target_outputs, dra
 
 @pytest.mark.parametrize("draft", DRAFTS)
 def test_greedy_requests_with_penalties_accept_every_candidate(dflash_models, draft):
-    # Penalties can change the argmax, so the draft draws its candidates with its sampler, over the token history it
-    # shares with the target.
+    # Penalties can change the argmax. A draft with a candidate scorer leaves them to the target, which here keeps
+    # predicting token 0; any other draft draws its candidates with its sampler, over the token history it shares
+    # with the target.
     def penalized(config):
         config.repetition_penalty = 1.3
         config.presence_penalty = 0.2

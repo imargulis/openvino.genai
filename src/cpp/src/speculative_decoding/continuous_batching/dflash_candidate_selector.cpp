@@ -74,6 +74,7 @@ CandidateSelector::CandidateSelector(const utils::dflash::DFlashRTInfo& rt_info,
         m_markov_step = std::move(request);
     } else {
         m_reads_hidden_states = utils::has_input(markov_head, "draft_hidden_states");
+        m_candidate_vocab_size = utils::dflash::markov_head_vocab_size(markov_head);
         m_candidate_scorer = std::move(request);
     }
 }
@@ -124,7 +125,7 @@ void CandidateSelector::score_candidates() {
 
     ov::Tensor edge_scores = scorer.get_tensor("edge_scores");
     ov::Tensor candidate_ids = scorer.get_tensor("candidate_ids");
-    validate_candidate_lattice(edge_scores, candidate_ids, num_rows, m_vocab_size);
+    validate_candidate_lattice(edge_scores, candidate_ids, num_rows, m_candidate_vocab_size);
     // The sampler reads the lattice from several threads at once, and a plugin tensor rebuilds the shape that
     // get_shape() returns on every call. Views over the scorer outputs keep a fixed shape.
     m_edge_scores = ov::Tensor(edge_scores.get_element_type(), edge_scores.get_shape(), edge_scores.data());
@@ -152,16 +153,13 @@ std::optional<std::vector<BlockToken>> CandidateSelector::draw(size_t block,
                                                                std::mt19937& rng) const {
     const size_t num_candidates = m_blocks[block].num_candidates;
     if (m_candidate_scorer) {
-        if (logit_processors_only_apply_temperature(config, m_candidate_ids.get_shape()[1])) {
+        if (config.is_multinomial()) {
             return sample_candidate_path(m_edge_scores,
                                          m_candidate_ids,
                                          m_lattice_begins[block],
                                          num_candidates,
                                          config.temperature,
                                          rng);
-        }
-        if (!logit_processors_keep_argmax(config)) {
-            return std::nullopt;
         }
         std::vector<BlockToken> tokens;
         for (const int64_t token :
@@ -204,29 +202,13 @@ std::optional<BlockToken> CandidateSelector::draw_token(size_t block,
     return BlockToken{token, 0.0f, nullptr};
 }
 
-bool CandidateSelector::fill_row(size_t block, size_t position, int64_t previous_token, float* row) const {
-    size_t previous_index = 0;
-    if (m_candidate_scorer && position > 0) {
-        // the lattice has no row after a token outside the candidates
-        const auto index = find_candidate(m_candidate_ids, m_lattice_begins[block] + position - 1, previous_token);
-        if (!index) {
-            return false;
-        }
-        previous_index = *index;
-    }
+bool CandidateSelector::fill_row(size_t block, size_t position, int64_t, float* row) const {
+    OPENVINO_ASSERT(!m_candidate_scorer, "A draft with a candidate scorer drafts every block from its lattice.");
     const float* logits = backbone_logits(block, position);
     std::transform(logits, logits + m_vocab_size, row, [this](float logit) {
         return scaled_logit(logit);
     });
-    if (m_candidate_scorer) {
-        fill_candidate_row(row,
-                           m_vocab_size,
-                           m_edge_scores,
-                           m_candidate_ids,
-                           m_lattice_begins[block] + position,
-                           previous_index,
-                           row);
-    } else if (m_markov_step) {
+    if (m_markov_step) {
         const float* bias = markov_bias(block);
         std::transform(row, row + m_vocab_size, bias, row, std::plus<float>());
     }

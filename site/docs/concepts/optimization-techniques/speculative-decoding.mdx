@@ -11,7 +11,7 @@ import OptimumCLI from '@site/src/components/OptimumCLI';
 Speculative decoding (also referred to as [assisted-generation](https://huggingface.co/blog/assisted-generation#understanding-text-generation-latency)) is a latency-oriented optimization for autoregressive text generation.
 A small, cheap *drafter* proposes one or more candidate continuations, and the larger *target* (main) model validates them in a single forward pass.
 With greedy decoding, candidates that match the target's own choice are accepted; the first mismatch is replaced by the target's token, and drafting resumes from there.
-With multinomial sampling (`do_sample=true`), validation follows [speculative sampling](https://arxiv.org/abs/2211.17192): a candidate is accepted with probability `min(1, p/q)`, where `p` and `q` are the probabilities the target and the drafter assign to it after penalties, temperature, top-k, top-p and min-p.
+With multinomial sampling (`do_sample=true`), validation follows [speculative sampling](https://arxiv.org/abs/2211.17192): a candidate is accepted with probability `min(1, p/q)`, where `p` is the probability the target assigns to it after penalties, temperature, top-k, top-p and min-p, and `q` is the probability the drafter proposed it with.
 The first rejected candidate is replaced by a sample from the normalized residual `max(0, p - q)`, and drafting resumes from there.
 
 Because validation is parallel over the candidate length, each accepted draft token replaces a sequential decode step of the target model with (a fraction of) one batched step.
@@ -541,7 +541,7 @@ The target verifies every drafted token either way, so the mode changes neither 
 
 ### Candidate Selection
 
-- With the Top-K candidate scorer, the draft picks every token among the `K` candidates of its position, scored after the token drafted before it: a greedy request takes the best-scoring candidate, and a sampled request draws one at its temperature. The request's penalties and `min_new_tokens` apply to these scores; if they rule out every candidate, the draft draws a token outside them from the backbone logits, and the block ends at that token.
+- With the Top-K candidate scorer, the draft picks every token among the `K` candidates of its position, scored after the token drafted before it: a greedy request takes the best-scoring candidate, and a sampled request draws one at its temperature. The request's penalties, `top_k`, `top_p`, `min_p` and `min_new_tokens` do not apply to the draft: the target applies them when it validates the candidates, so the generated text follows them as it does without a draft.
 - With the dense Markov walk, the draft takes every token from the backbone logits corrected by the Markov head, after the request's logit processors.
 
-A draft with a pruned vocabulary has no token outside it to draw, so in either mode the request's logit processors can rule out every token the draft can propose at a position, for example when `min_new_tokens` masks all of them. The block then ends before that position, and the target generates the next token on its own.
+A draft with a pruned vocabulary that applies the request's logit processors, in the dense Markov walk or without a Markov head, can have every token it can propose ruled out at a position, for example when `min_new_tokens` masks all of them. The block then ends before that position, and the target generates the next token on its own.

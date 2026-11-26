@@ -125,6 +125,12 @@ void select_markov_head_computation(const std::shared_ptr<ov::Model>& markov_hea
 bool is_markov_step(const std::shared_ptr<ov::Model>& markov_head_computation);
 
 /**
+ * @brief The vocabulary size of the Markov head of a computation kept by select_markov_head_computation(), its
+ * dflash/vocab_size RT info. The candidates of its candidate scorer are token ids below it.
+ */
+size_t markov_head_vocab_size(const std::shared_ptr<ov::Model>& markov_head_computation);
+
+/**
  * @brief Validates the dense step computation of the Markov head against the draft backbone:
  * prev_token_ids [N] -> markov_bias [N, vocab].
  */
@@ -208,7 +214,7 @@ struct PrunedDraftVocabulary {
  *
  * Such a draft exports 'logits' over its own vocabulary and, as Eagle-3 drafts do, a constant 'd2t' output: draft token
  * i is target token i + d2t[i]. The target token ids must be distinct and below the target logits width. A Markov head
- * must score target-vocabulary logits, and its candidate scorer's K must not exceed the draft vocabulary size.
+ * must be exported over the target vocabulary, and its candidate scorer's K must not exceed the draft vocabulary size.
  */
 std::optional<PrunedDraftVocabulary> extract_pruned_draft_vocabulary(const std::shared_ptr<ov::Model>& main_model,
                                                                      const std::shared_ptr<ov::Model>& draft_model,
@@ -216,13 +222,23 @@ std::optional<PrunedDraftVocabulary> extract_pruned_draft_vocabulary(const std::
 
 /**
  * @brief Widens the draft 'logits' to the target vocabulary: each draft logit moves to the column of its target token,
- * and the target tokens outside the draft vocabulary get -inf, so neither the Markov head nor the draft sampler
- * proposes them.
+ * and the target tokens outside the draft vocabulary get -inf, so neither the dense Markov step nor the draft sampler
+ * proposes them. For a draft whose rows the draft sampler or the dense Markov step reads; a candidate scorer takes
+ * map_candidate_scorer_to_target_vocabulary() instead.
  *
  * Run after apply_gather_before_matmul_transformation(), which looks for the draft lm_head right before 'logits'.
  */
 void widen_draft_logits_to_target_vocabulary(const std::shared_ptr<ov::Model>& draft_model,
                                              const PrunedDraftVocabulary& vocabulary);
+
+/**
+ * @brief Makes a candidate scorer read the 'logits' rows of a draft with a pruned vocabulary as they are:
+ * 'draft_logits' takes rows over the draft vocabulary, and the scorer maps the candidates of its TopK to their target
+ * token ids, which its Markov head and its 'candidate_ids' output read. Only the scorer reads the rows of such a
+ * draft, so they need no widening.
+ */
+void map_candidate_scorer_to_target_vocabulary(const std::shared_ptr<ov::Model>& candidate_scorer,
+                                               const PrunedDraftVocabulary& vocabulary);
 
 /**
  * @brief Attaches the target token embedding into the draft graph.

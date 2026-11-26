@@ -129,7 +129,13 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
         utils::dflash::gather_last_hidden_state_with_logits(draft_model);
     }
     if (pruned_vocabulary) {
-        utils::dflash::widen_draft_logits_to_target_vocabulary(draft_model, *pruned_vocabulary);
+        // Only the candidate scorer reads the rows of a draft that has one, so they stay over the draft vocabulary.
+        if (m_rt_info.markov_head_computation && !utils::dflash::is_markov_step(m_rt_info.markov_head_computation)) {
+            utils::dflash::map_candidate_scorer_to_target_vocabulary(m_rt_info.markov_head_computation,
+                                                                     *pruned_vocabulary);
+        } else {
+            utils::dflash::widen_draft_logits_to_target_vocabulary(draft_model, *pruned_vocabulary);
+        }
     }
     validate_target_has_no_unmanaged_state(main_model);
     utils::dflash::expose_target_hidden_states(main_model, retained_hidden_state_locators, m_rt_info.target_layer_ids);

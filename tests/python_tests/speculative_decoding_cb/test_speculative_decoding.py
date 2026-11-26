@@ -827,8 +827,8 @@ def test_sampled_requests_are_reproducible(model_pair):
 
 @pytest.mark.parametrize("model_pair", PAIRS, indirect=True)
 def test_greedy_requests_with_penalties_match_target(model_pair):
-    # Penalties can change the argmax, so the draft draws its candidates with its sampler, over the token history it
-    # shares with the target.
+    # Penalties can change the argmax. A DFlash draft with a candidate scorer leaves them to the target; any other
+    # draft draws its candidates with its sampler, over the token history it shares with the target.
     def penalized(config):
         config.repetition_penalty = 1.3
         config.presence_penalty = 0.2

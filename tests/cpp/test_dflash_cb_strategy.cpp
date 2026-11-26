@@ -1988,18 +1988,6 @@ std::pair<ov::Tensor, ov::Tensor> make_two_block_lattice() {
     return {edge_scores, candidate_ids};
 }
 
-// A one-block lattice over two positions with K = 2: position 0 keeps tokens {1, 3}, position 1 tokens {0, 4}. The
-// best path drafts 3 then 4; after token 1, token 0 is the better candidate at position 1.
-std::pair<ov::Tensor, ov::Tensor> make_one_block_lattice(
-    const std::vector<float>& scores = {2.0f, 3.0f, 2.0f, 3.0f, 8.0f, 1.0f, 0.0f, 9.0f},
-    const std::vector<int64_t>& ids = {1, 3, 0, 4}) {
-    ov::Tensor edge_scores(ov::element::f32, {2, 2, 2});
-    ov::Tensor candidate_ids(ov::element::i64, {2, 2});
-    std::copy(scores.begin(), scores.end(), edge_scores.data<float>());
-    std::copy(ids.begin(), ids.end(), candidate_ids.data<int64_t>());
-    return {edge_scores, candidate_ids};
-}
-
 std::shared_ptr<ov::op::v0::Parameter> add_named_input(ov::ParameterVector& params,
                                                        const std::string& name,
                                                        const ov::element::Type& type,
@@ -2008,6 +1996,14 @@ std::shared_ptr<ov::op::v0::Parameter> add_named_input(ov::ParameterVector& para
     parameter->output(0).set_names({name});
     params.push_back(parameter);
     return parameter;
+}
+
+// A candidate scorer of a Markov head over the SELECTOR_VOCAB_SIZE tokens of the selector's rows.
+std::shared_ptr<ov::Model> make_selector_candidate_scorer(const ov::ResultVector& results,
+                                                          const ov::ParameterVector& params) {
+    auto scorer = std::make_shared<ov::Model>(results, params);
+    scorer->set_rt_info(std::to_string(SELECTOR_VOCAB_SIZE), {"dflash", "vocab_size"});
+    return scorer;
 }
 
 // A candidate scorer that scores any rows with the given lattice. A gated one adds the draft hidden state of row s,
@@ -2038,7 +2034,7 @@ std::shared_ptr<ov::Model> make_fixed_candidate_scorer(const ov::Tensor& edge_sc
     scores_result->output(0).set_names({"edge_scores"});
     auto ids_result = std::make_shared<ov::op::v0::Result>(std::make_shared<ov::op::v0::Constant>(candidate_ids));
     ids_result->output(0).set_names({"candidate_ids"});
-    return std::make_shared<ov::Model>(ov::ResultVector{scores_result, ids_result}, params);
+    return make_selector_candidate_scorer(ov::ResultVector{scores_result, ids_result}, params);
 }
 
 // A dense Markov step whose bias after token p is 10 at token p + 1 and 0 elsewhere.
@@ -2266,7 +2262,8 @@ TEST(DFlashCBCandidateSelection, SamplerDrawsFromTheScaledAndSoftCappedBackboneL
 
 TEST(DFlashCBCandidateSelection, BlockEndsWhereTheLogitProcessorsMaskTheWholePrunedDraftVocabulary) {
     // A pruned draft vocabulary of the stop tokens 1 and 2 alone, which min_new_tokens masks: no row has a token left
-    // to draft, with any row source or none, so the block drafts nothing and the target generates on its own.
+    // to draft, with any source of vocabulary rows or none, so the block drafts nothing and the target generates on
+    // its own.
     // Without a row source the logit processors mask the rows in place, so every case drafts from rows of its own.
     const auto make_logits = [] {
         ov::Tensor logits(ov::element::f32, {2, 1, SELECTOR_VOCAB_SIZE});
@@ -2283,12 +2280,9 @@ TEST(DFlashCBCandidateSelection, BlockEndsWhereTheLogitProcessorsMaskTheWholePru
     auto sampled = greedy;
     sampled.do_sample = true;
     sampled.rng_seed = 5;
-    // the candidates of a scorer are K tokens of the draft vocabulary, so all of it here
-    const auto [edge_scores, candidate_ids] = make_one_block_lattice(std::vector<float>(8, 0.0f), {1, 2, 1, 2});
     const std::vector<std::shared_ptr<ov::genai::BlockRowSource>> sources = {
         make_selector(nullptr),
         make_selector(make_successor_markov_step()),
-        make_selector(make_fixed_candidate_scorer(edge_scores, candidate_ids)),
         nullptr,
     };
     for (const auto& config : {greedy, sampled}) {
@@ -2303,7 +2297,11 @@ TEST(DFlashCBCandidateSelection, BlockEndsWhereTheLogitProcessorsMaskTheWholePru
 TEST(DFlashCBCandidateSelection, CandidateScorerDraftsTheGreedyLatticePathOfEveryBlock) {
     const auto [edge_scores, candidate_ids] = make_two_block_lattice();
     auto first = make_block_request(0, 7, 2, block_config());
-    auto second = make_block_request(1, 8, 2, block_config());
+    // The target applies the request's penalties when it validates the candidates; the draft does not penalize the
+    // anchor 20, the best candidate of the second block's first row.
+    auto penalized = block_config();
+    penalized.repetition_penalty = 4.0f;
+    auto second = make_block_request(1, 20, 2, penalized);
 
     draft_blocks(make_selector(make_fixed_candidate_scorer(edge_scores, candidate_ids)),
                  {first, second},
@@ -2340,7 +2338,7 @@ TEST(DFlashCBCandidateSelection, CandidateScorerReadsTheUnscaledBackboneLogits) 
     auto ids_result = std::make_shared<ov::op::v0::Result>(
         ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2, SELECTOR_TOP_K}, {3, 5, 3, 5}));
     ids_result->output(0).set_names({"candidate_ids"});
-    const auto scorer = std::make_shared<ov::Model>(ov::ResultVector{scores_result, ids_result}, params);
+    const auto scorer = make_selector_candidate_scorer(ov::ResultVector{scores_result, ids_result}, params);
     ov::Tensor logits = make_zero_logits(2);
     for (size_t row = 0; row < 2; ++row) {
         logits.data<float>()[row * SELECTOR_VOCAB_SIZE + 3] = 4.0f;
@@ -2375,6 +2373,8 @@ TEST(DFlashCBCandidateSelection, SampledRequestsDrawFromTheCandidatesOfEveryLatt
     auto config = block_config();
     config.do_sample = true;
     config.temperature = 0.5f;
+    // the target applies the request's filters when it validates the candidates; the draft keeps both candidates
+    config.top_k = 1;
     config.rng_seed = 3;
     auto first = make_block_request(0, 7, 2, config);
     auto second = make_block_request(1, 8, 2, config);
@@ -2399,82 +2399,36 @@ TEST(DFlashCBCandidateSelection, SampledRequestsDrawFromTheCandidatesOfEveryLatt
     }
 }
 
-TEST(DFlashCBCandidateSelection, SampledRequestsApplyTheirTopKToTheLatticeRows) {
-    // top_k = 1 keeps the best candidate of every row: the draft takes the greedy lattice path, and proposes every
-    // candidate with probability 1.
-    const auto [edge_scores, candidate_ids] = make_one_block_lattice();
+TEST(DFlashCBCandidateSelection, CandidateScorerDraftsTargetTokensFromTheRowsOfAPrunedDraftVocabulary) {
+    // Draft tokens 0 to 3 are the target tokens 9, 4, 12 and 0 of the Markov head's vocabulary. The scorer reads rows
+    // over the draft vocabulary and scores a candidate with its draft logit.
+    const ov::genai::utils::dflash::PrunedDraftVocabulary vocabulary{{9, 4, 12, 0}, DSPARK_TEST_VOCAB_SIZE};
+    using ov::genai::utils::dflash::map_candidate_scorer_to_target_vocabulary;
+    const auto scorer = make_dspark_candidate_scorer();
+    map_candidate_scorer_to_target_vocabulary(scorer, vocabulary);
+    ASSERT_EQ(scorer->input("draft_logits").get_partial_shape(), ov::PartialShape({-1, 4}));
+    // the dense step reads no logits rows
+    EXPECT_THROW(map_candidate_scorer_to_target_vocabulary(make_dspark_markov_step(), vocabulary), ov::Exception);
+
+    ov::Tensor logits(ov::element::f32, {2, 1, 4});
+    const std::vector<float> rows = {0.0f, 1.0f, 5.0f, 2.0f, 7.0f, 0.0f, 3.0f, 1.0f};
+    std::copy(rows.begin(), rows.end(), logits.data<float>());
     auto config = block_config();
+    auto greedy = make_block_request(0, 7, 2, config);
     config.do_sample = true;
-    config.temperature = 0.5f;
-    config.top_k = 1;
-    auto request = make_block_request(0, 2, 2, config);
+    config.rng_seed = 3;
+    auto sampled = make_block_request(0, 7, 2, config);
+    const auto selector = make_selector(scorer);
 
-    draft_blocks(make_selector(make_fixed_candidate_scorer(edge_scores, candidate_ids)), {request}, make_zero_logits(2));
-
-    const auto tokens = drafted(request);
-    ASSERT_EQ(tokens, ov::genai::dflash_cb::greedy_candidate_path(edge_scores, candidate_ids, 0, 2));
-    const auto sequence = request->get_running_sequences().front();
-    for (size_t position = 0; position < 2; ++position) {
-        EXPECT_FLOAT_EQ(
-            ov::genai::detail::proposal_probability(sequence->get_draft_proposal(position + 1), tokens[position]),
-            1.0f);
-    }
-}
-
-TEST(DFlashCBCandidateSelection, DraftSamplerAppliesTheRequestLogitProcessorsToTheLatticeRows) {
-    const auto [edge_scores, candidate_ids] = make_one_block_lattice();
-    const auto selector = make_selector(make_fixed_candidate_scorer(edge_scores, candidate_ids));
-    std::vector<float> backbone = {1.0f, 5.0f, 0.0f, 4.0f, 2.0f, 3.0f};
-    backbone.resize(SELECTOR_VOCAB_SIZE, 0.0f);
-    std::vector<float> second_row = {6.0f, 0.0f, 2.0f, 1.0f, 5.0f, 3.0f};
-    second_row.resize(SELECTOR_VOCAB_SIZE, 0.0f);
-    backbone.insert(backbone.end(), second_row.begin(), second_row.end());
-    ov::Tensor logits(ov::element::f32, {2, 1, SELECTOR_VOCAB_SIZE});
-    std::copy(backbone.begin(), backbone.end(), logits.data<float>());
-
-    auto greedy = make_block_request(0, 2, 2, block_config());
     draft_blocks(selector, {greedy}, logits);
-    EXPECT_EQ(drafted(greedy), (std::vector<int64_t>{3, 4}));
+    draft_blocks(selector, {sampled}, logits);
 
-    // The penalty halves the score of the prompt token 3 (3 -> 1.5), so token 1 (2) wins and token 0 follows it.
-    auto penalized_config = block_config();
-    penalized_config.repetition_penalty = 2.0f;
-    auto penalized = make_block_request(0, 2, 2, penalized_config);
-    draft_blocks(selector, {penalized}, logits);
-    EXPECT_EQ(drafted(penalized), (std::vector<int64_t>{1, 0}));
-}
-
-TEST(DFlashCBCandidateSelection, DraftSamplerBreaksTiesByTheSmallerTokenIdLikeTheGreedyPath) {
-    // Position 0 ties tokens 3 and 1, listed in that order; token 1 then leads to token 4, token 3 to token 0.
-    const auto [edge_scores, candidate_ids] =
-        make_one_block_lattice({5.0f, 5.0f, 5.0f, 5.0f, 9.0f, 0.0f, 0.0f, 9.0f}, {3, 1, 0, 4});
-    ASSERT_EQ(ov::genai::dflash_cb::greedy_candidate_path(edge_scores, candidate_ids, 0, 2),
-              (std::vector<int64_t>{1, 4}));
-
-    // min_new_tokens without stop tokens changes no logit but sends the request through the draft sampler
-    auto config = block_config();
-    config.min_new_tokens = 1;
-    ASSERT_FALSE(ov::genai::dflash_cb::logit_processors_keep_argmax(config));
-    auto request = make_block_request(0, 2, 2, config);
-    draft_blocks(make_selector(make_fixed_candidate_scorer(edge_scores, candidate_ids)),
-                 {request},
-                 make_zero_logits(2));
-    EXPECT_EQ(drafted(request), (std::vector<int64_t>{1, 4}));
-}
-
-TEST(DFlashCBCandidateSelection, TokenOutsideTheCandidatesEndsTheBlock) {
-    // Far below 1, the repetition penalty lifts the prompt token 3 from below the candidates above them, and the
-    // lattice has no row after it.
-    const auto [edge_scores, candidate_ids] =
-        make_one_block_lattice({-50.0f, -40.0f, -50.0f, -40.0f, 0.0f, 1.0f, 0.0f, 1.0f}, {1, 4, 0, 5});
-    auto logits = make_argmax_logits({3, 3});
-    auto config = block_config();
-    config.repetition_penalty = 0.001f;
-    auto request = make_block_request(0, 2, 2, config);
-
-    draft_blocks(make_selector(make_fixed_candidate_scorer(edge_scores, candidate_ids)), {request}, logits);
-
-    EXPECT_EQ(drafted(request), (std::vector<int64_t>{3}));
+    // the best draft tokens of the rows are 2 and 0
+    EXPECT_EQ(drafted(greedy), (std::vector<int64_t>{12, 9}));
+    // a sampled request proposes the K = 2 best draft tokens of every row as target tokens
+    const auto sequence = sampled->get_running_sequences().front();
+    EXPECT_EQ(sequence->get_draft_proposal(1).token_ids, (std::vector<int64_t>{12, 0}));
+    EXPECT_EQ(sequence->get_draft_proposal(2).token_ids, (std::vector<int64_t>{9, 12}));
 }
 
 TEST(DFlashCBCandidateSelection, GatedCandidateScorerScoresTheHiddenStatesOfTheBlockRows) {
@@ -2538,6 +2492,16 @@ TEST(DFlashCBCandidateSelection, GreedyPathWalksEachBlockFromItsAnchor) {
     ASSERT_EQ(greedy_candidate_path(edge_scores, candidate_ids, 0, 2), (std::vector<int64_t>{11, 13}));
     ASSERT_EQ(greedy_candidate_path(edge_scores, candidate_ids, 2, 2), (std::vector<int64_t>{20, 22}));
     ASSERT_EQ(greedy_candidate_path(edge_scores, candidate_ids, 2, 1), (std::vector<int64_t>{20}));
+
+    // A tie goes to the smaller token id, as in a greedy scan over the vocabulary: position 0 ties tokens 3 and 1,
+    // listed in that order; token 1 then leads to token 4, token 3 to token 0.
+    ov::Tensor tied_scores(ov::element::f32, {2, 2, 2});
+    ov::Tensor tied_ids(ov::element::i64, {2, 2});
+    const std::vector<float> scores = {5.0f, 5.0f, 5.0f, 5.0f, 9.0f, 0.0f, 0.0f, 9.0f};
+    const std::vector<int64_t> ids = {3, 1, 0, 4};
+    std::copy(scores.begin(), scores.end(), tied_scores.data<float>());
+    std::copy(ids.begin(), ids.end(), tied_ids.data<int64_t>());
+    ASSERT_EQ(greedy_candidate_path(tied_scores, tied_ids, 0, 2), (std::vector<int64_t>{1, 4}));
 }
 
 TEST(DFlashCBCandidateSelection, SampledLatticePathProposesTheSoftmaxOfEveryRow) {
@@ -2561,10 +2525,11 @@ TEST(DFlashCBCandidateSelection, SampledLatticePathProposesTheSoftmaxOfEveryRow)
         ASSERT_NEAR(candidate.proposal->probabilities[0], first, 1e-6f);
         ASSERT_NEAR(candidate.proposal->probabilities[1], 1.0f - first, 1e-6f);
         ASSERT_NO_THROW(ov::genai::detail::validate_draft_proposal(*candidate.proposal));
-        const auto index = ov::genai::dflash_cb::find_candidate(candidate_ids, position, candidate.token);
-        ASSERT_TRUE(index);
-        ASSERT_NEAR(candidate.log_prob, std::log(candidate.proposal->probabilities[*index]), 1e-6f);
-        previous_index = *index;
+        const auto* row_ids = ids + position * 2;
+        const size_t index = static_cast<size_t>(std::find(row_ids, row_ids + 2, candidate.token) - row_ids);
+        ASSERT_LT(index, 2);
+        ASSERT_NEAR(candidate.log_prob, std::log(candidate.proposal->probabilities[index]), 1e-6f);
+        previous_index = index;
     }
 
     std::mt19937 same_seed(3);
@@ -2612,39 +2577,6 @@ TEST(DFlashCBCandidateSelection, LogitProcessorsKeepTheArgmaxOnlyWithoutHistoryO
         auto changed = ov::genai::utils::get_greedy_config();
         change(changed);
         ASSERT_FALSE(logit_processors_keep_argmax(changed));
-    }
-}
-
-TEST(DFlashCBCandidateSelection, LogitProcessorsOnlyApplyTheTemperatureWithoutHistoryOrFilters) {
-    using ov::genai::dflash_cb::logit_processors_only_apply_temperature;
-    static constexpr size_t num_row_candidates = 4;
-    const auto sampled = [](const std::function<void(ov::genai::GenerationConfig&)>& change) {
-        auto config = ov::genai::utils::get_greedy_config();
-        config.do_sample = true;
-        config.temperature = 0.7f;
-        change(config);
-        return logit_processors_only_apply_temperature(config, num_row_candidates);
-    };
-    for (const auto& change : std::vector<std::function<void(ov::genai::GenerationConfig&)>>{
-             [](auto&) {},
-             [](auto& c) { c.top_k = 0; },
-             [](auto& c) { c.top_k = num_row_candidates; },
-             [](auto& c) { c.logprobs = 2; },
-         }) {
-        ASSERT_TRUE(sampled(change));
-    }
-    for (const auto& change : std::vector<std::function<void(ov::genai::GenerationConfig&)>>{
-             [](auto& c) { c.top_k = num_row_candidates - 1; },
-             [](auto& c) { c.top_p = 0.9f; },
-             [](auto& c) { c.min_p = 0.1f; },
-             [](auto& c) { c.repetition_penalty = 1.1f; },
-             [](auto& c) { c.presence_penalty = 0.1f; },
-             [](auto& c) { c.frequency_penalty = 0.1f; },
-             [](auto& c) { c.min_new_tokens = 1; },
-             [](auto& c) { c.structured_output_config = ov::genai::StructuredOutputConfig(); },
-             [](auto& c) { c.do_sample = false; },
-         }) {
-        ASSERT_FALSE(sampled(change));
     }
 }
 

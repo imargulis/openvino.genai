@@ -316,8 +316,9 @@ std::shared_ptr<ov::Model> keep_markov_head_computation(const std::shared_ptr<ov
     return computation;
 }
 
-// The candidate scorer derives every K-sized shape from its TopK, so replacing the TopK's K resizes the whole scorer.
-void replace_markov_head_top_k(const std::shared_ptr<ov::Model>& candidate_scorer, size_t top_k) {
+// The TopK that keeps the K best draft logits of every row, the candidates.
+std::shared_ptr<ov::op::util::TopKBase> find_candidate_scorer_top_k(
+    const std::shared_ptr<ov::Model>& candidate_scorer) {
     std::shared_ptr<ov::op::util::TopKBase> topk;
     for (const auto& node : candidate_scorer->get_ordered_ops()) {
         if (auto candidate = ov::as_type_ptr<ov::op::util::TopKBase>(node)) {
@@ -326,6 +327,12 @@ void replace_markov_head_top_k(const std::shared_ptr<ov::Model>& candidate_score
         }
     }
     OPENVINO_ASSERT(topk, "The Markov head candidate scorer must have exactly one TopK.");
+    return topk;
+}
+
+// The candidate scorer derives every K-sized shape from its TopK, so replacing the TopK's K resizes the whole scorer.
+void replace_markov_head_top_k(const std::shared_ptr<ov::Model>& candidate_scorer, size_t top_k) {
+    const auto topk = find_candidate_scorer_top_k(candidate_scorer);
     const auto exported_k = topk->input_value(1);
     topk->input(1).replace_source_output(
         ov::op::v0::Constant::create(exported_k.get_element_type(), exported_k.get_shape(), {top_k}));
@@ -777,6 +784,10 @@ bool is_markov_step(const std::shared_ptr<ov::Model>& markov_head_computation) {
     return has_port_named(markov_head_computation->inputs(), "prev_token_ids");
 }
 
+size_t markov_head_vocab_size(const std::shared_ptr<ov::Model>& markov_head_computation) {
+    return std::stoull(read_markov_head_rt_info(markov_head_computation, "Markov head", "vocab_size"));
+}
+
 void validate_markov_step(const std::shared_ptr<ov::Model>& markov_step, const DFlashRTInfo& info) {
     constexpr const char* model_name = "Markov step";
     const size_t vocab_size = validate_markov_head_rt_info(markov_step, model_name, info);
@@ -943,19 +954,17 @@ std::optional<PrunedDraftVocabulary> extract_pruned_draft_vocabulary(const std::
     }
 
     if (info.markov_head_computation) {
-        constexpr const char* model_name = "Markov head";
-        const size_t markov_head_vocab_size =
-            std::stoull(read_markov_head_rt_info(info.markov_head_computation, model_name, "vocab_size"));
-        OPENVINO_ASSERT(markov_head_vocab_size == vocabulary.target_vocab_size,
-                        "The Markov head of a draft with a pruned vocabulary must score target-vocabulary logits, "
-                        "its vocab_size must be ",
+        const size_t head_vocab_size = markov_head_vocab_size(info.markov_head_computation);
+        OPENVINO_ASSERT(head_vocab_size == vocabulary.target_vocab_size,
+                        "The Markov head of a draft with a pruned vocabulary must be exported over the target "
+                        "vocabulary, its vocab_size must be ",
                         vocabulary.target_vocab_size,
                         ", got ",
-                        markov_head_vocab_size,
+                        head_vocab_size,
                         ".");
         if (!is_markov_step(info.markov_head_computation)) {
             const size_t top_k =
-                std::stoull(read_markov_head_rt_info(info.markov_head_computation, model_name, "top_k"));
+                std::stoull(read_markov_head_rt_info(info.markov_head_computation, "Markov head", "top_k"));
             OPENVINO_ASSERT(top_k <= draft_vocab_size,
                             MARKOV_HEAD_TOP_K,
                             " must be at most the draft vocabulary size ",
@@ -1010,6 +1019,28 @@ void widen_draft_logits_to_target_vocabulary(const std::shared_ptr<ov::Model>& d
     widened->set_friendly_name("dflash_target_vocabulary_logits");
     logits_result->input(0).replace_source_output(widened);
     draft_model->validate_nodes_and_infer_types();
+}
+
+void map_candidate_scorer_to_target_vocabulary(const std::shared_ptr<ov::Model>& candidate_scorer,
+                                               const PrunedDraftVocabulary& vocabulary) {
+    OPENVINO_ASSERT(candidate_scorer && !is_markov_step(candidate_scorer),
+                    "Only the candidate scorer of a Markov head maps its candidates to the target vocabulary.");
+    const auto draft_ids = find_candidate_scorer_top_k(candidate_scorer)->output(1);
+    const auto readers = draft_ids.get_target_inputs();
+    const size_t draft_vocab_size = vocabulary.target_token_ids.size();
+    const auto target_token_ids = ov::op::v0::Constant::create(draft_ids.get_element_type(),
+                                                               ov::Shape{draft_vocab_size},
+                                                               vocabulary.target_token_ids);
+    const auto target_ids =
+        std::make_shared<ov::op::v8::Gather>(target_token_ids,
+                                             draft_ids,
+                                             ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0}));
+    target_ids->set_friendly_name("dflash_candidate_target_token_ids");
+    for (auto reader : readers) {
+        reader.replace_source_output(target_ids);
+    }
+    candidate_scorer->reshape(std::map<std::string, ov::PartialShape>{
+        {"draft_logits", ov::PartialShape{-1, static_cast<int64_t>(draft_vocab_size)}}});
 }
 
 void attach_target_embedding_to_draft(const std::shared_ptr<ov::Model>& main_model,

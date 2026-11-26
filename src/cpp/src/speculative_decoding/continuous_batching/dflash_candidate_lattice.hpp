@@ -6,10 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
-#include <limits>
 #include <memory>
-#include <optional>
 #include <random>
 #include <vector>
 
@@ -50,6 +47,7 @@ inline void validate_subsequence_begins(const ov::Tensor& subsequence_begins, si
 //   candidate_ids [rows, K]: the backbone's K best tokens at every row;
 //   edge_scores [rows, K, K]: edge_scores[s, i, j] scores candidate j at row s after candidate i at row s - 1.
 // The first row of a block follows the block's anchor instead, so edge_scores[s, i, :] is the same for every i there.
+// The candidates are token ids below vocab_size, the vocabulary size of the Markov head.
 inline void validate_candidate_lattice(const ov::Tensor& edge_scores,
                                        const ov::Tensor& candidate_ids,
                                        size_t num_positions,
@@ -76,7 +74,9 @@ inline void validate_candidate_lattice(const ov::Tensor& edge_scores,
                                 [&](int64_t id) {
                                     return id >= 0 && static_cast<size_t>(id) < vocab_size;
                                 }),
-                    "Candidate scorer candidate_ids must be draft vocabulary ids.");
+                    "Candidate scorer candidate_ids must be token ids below the Markov head vocabulary size ",
+                    vocab_size,
+                    ".");
 }
 
 // Walks the lattice rows [first_row, first_row + num_positions) of one block greedily: at every position, the best
@@ -107,52 +107,6 @@ inline std::vector<int64_t> greedy_candidate_path(const ov::Tensor& edge_scores,
         path.push_back(ids[best]);
     }
     return path;
-}
-
-// Tokens outside the candidates are shifted at least this far below the worst candidate.
-inline constexpr float CANDIDATE_ROW_GAP = 1.0e4f;
-
-// Spreads the lattice row at `position` that follows candidate previous_index at position - 1 over the vocabulary, so
-// the request's logit processors and sampler pick the token as they do from a full logits row. Candidate j gets
-// edge_scores[position, previous_index, j]. Every other token keeps its backbone logit, shifted below the candidates
-// by at least CANDIDATE_ROW_GAP: a candidate still wins after the usual penalties unless the processors mask all K of
-// them, and then the token comes from the remaining backbone logits. A repetition_penalty far below 1 can lift a
-// non-candidate above the candidates, as it would with the dense Markov step, and the walk then ends the block at
-// that token.
-inline void fill_candidate_row(const float* backbone_logits,
-                               size_t vocab_size,
-                               const ov::Tensor& edge_scores,
-                               const ov::Tensor& candidate_ids,
-                               size_t position,
-                               size_t previous_index,
-                               float* row) {
-    const size_t top_k = candidate_ids.get_shape()[1];
-    const auto* ids = candidate_ids.data<const int64_t>() + position * top_k;
-    const auto* scores = edge_scores.data<const float>() + (position * top_k + previous_index) * top_k;
-    // The candidates are the backbone's Top-K at this position, so its best logit is among them.
-    float best_logit = -std::numeric_limits<float>::infinity();
-    float worst_score = std::numeric_limits<float>::infinity();
-    for (size_t j = 0; j < top_k; ++j) {
-        best_logit = std::max(best_logit, backbone_logits[ids[j]]);
-        worst_score = std::min(worst_score, scores[j]);
-    }
-    const float shift = worst_score - CANDIDATE_ROW_GAP - best_logit;
-    std::transform(backbone_logits, backbone_logits + vocab_size, row, [shift](float logit) {
-        return logit + shift;
-    });
-    for (size_t j = 0; j < top_k; ++j) {
-        row[ids[j]] = scores[j];
-    }
-}
-
-inline std::optional<size_t> find_candidate(const ov::Tensor& candidate_ids, size_t position, int64_t token_id) {
-    const size_t top_k = candidate_ids.get_shape()[1];
-    const auto* ids = candidate_ids.data<const int64_t>() + position * top_k;
-    const auto* found = std::find(ids, ids + top_k, token_id);
-    if (found == ids + top_k) {
-        return std::nullopt;
-    }
-    return static_cast<size_t>(std::distance(ids, found));
 }
 
 // Draws the candidates of the lattice rows [first_row, first_row + num_positions) of one block: every position from

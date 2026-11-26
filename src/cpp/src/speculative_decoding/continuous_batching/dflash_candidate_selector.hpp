@@ -19,27 +19,13 @@
 
 namespace ov::genai::dflash_cb {
 
-// True when no logit processor of this config depends on the tokens generated before: the penalties, min_new_tokens
-// and structured output.
-inline bool logit_processors_ignore_history(const GenerationConfig& config) {
-    return config.repetition_penalty == 1.0f && config.presence_penalty == 0.0f && config.frequency_penalty == 0.0f &&
-           config.min_new_tokens == 0 && !config.is_structured_output_generation();
-}
-
 // True when the logit processors of a draft sampler with this config cannot change which token has the highest logit,
 // so a greedy draft can take the best token of every row without the sampler. Follows the transforms that
-// LogitProcessor adds for greedy decoding; the log-prob transforms keep the argmax.
+// LogitProcessor adds for greedy decoding: the penalties, min_new_tokens and structured output depend on the tokens
+// generated before, and the log-prob transforms keep the argmax.
 inline bool logit_processors_keep_argmax(const GenerationConfig& config) {
-    return config.is_greedy_decoding() && logit_processors_ignore_history(config);
-}
-
-// True when the logit processors of a sampled draft request with this config only apply its temperature to a lattice
-// row of num_row_candidates candidates, so the draft can sample the candidates of every row without the sampler.
-// Follows the transforms that LogitProcessor adds for multinomial sampling: a top_k of at least num_row_candidates
-// keeps every candidate of a row.
-inline bool logit_processors_only_apply_temperature(const GenerationConfig& config, size_t num_row_candidates) {
-    return config.is_multinomial() && logit_processors_ignore_history(config) &&
-           (config.top_k == 0 || config.top_k >= num_row_candidates) && config.top_p == 1.0f && config.min_p == 0.0f;
+    return config.is_greedy_decoding() && config.repetition_penalty == 1.0f && config.presence_penalty == 0.0f &&
+           config.frequency_penalty == 0.0f && config.min_new_tokens == 0 && !config.is_structured_output_generation();
 }
 
 // The rows that the DFlash draft sampler draws its candidates from: the backbone logits scaled by output_multiplier and
@@ -47,11 +33,12 @@ inline bool logit_processors_only_apply_temperature(const GenerationConfig& conf
 // drafted before it. The Markov head runs once for the blocks of all requests: the Top-K candidate scorer scores every
 // row in one inference, the dense Markov step one position of every block per inference.
 //
-// With the candidate scorer, a sampled request whose logit processors only apply its temperature draws from the K
-// candidates of every lattice row, and a greedy request whose logit processors keep the argmax walks the lattice
-// greedily. Any other request's sampler applies the request's logit processors to the lattice rows spread over the
-// vocabulary, and a token outside a row's candidates ends its block. Without a Markov head or with
-// the dense Markov step, a greedy request whose logit processors keep the argmax takes the best token of every row.
+// With the candidate scorer, every request drafts from the K candidates of its lattice rows: a greedy request walks
+// the lattice greedily, and a sampled request draws at its temperature. The request's other logit processors work on
+// vocabulary rows, which would cost such a draft more than its candidate scorer saves, so they do not apply to it:
+// the target applies them when it validates the candidates. Without a Markov head or with the dense Markov step, a
+// greedy request whose logit processors keep the argmax takes the best token of every row, and the sampler applies
+// the logit processors of any other request to the vocabulary rows.
 class CandidateSelector final : public BlockRowSource {
 public:
     // rt_info holds the Markov head computation, if any, that read_markov_head() selected.
@@ -108,7 +95,9 @@ private:
     std::vector<SampledBlock> m_blocks;
     ov::Tensor m_logits;
     size_t m_vocab_size = 0;
-    // the candidate scorer's lattice over the rows of all blocks packed back to back
+    // the candidate scorer's lattice over the rows of all blocks packed back to back, whose candidates are token ids
+    // below the vocabulary size of the Markov head
+    size_t m_candidate_vocab_size = 0;
     ov::Tensor m_edge_scores;
     ov::Tensor m_candidate_ids;
     std::vector<size_t> m_lattice_begins;
